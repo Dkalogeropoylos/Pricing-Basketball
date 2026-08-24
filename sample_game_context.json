@@ -1,9 +1,4 @@
 {
-  "league": "WNBA",
-  "game": {
-    "away": "ATL",
-    "home": "LAS"
-  },
   "injuries": {
     "Rae Burrell": {
       "status": "OUT",
@@ -18,8 +13,10 @@
     "Ariel Atkins": {
       "usage": 1.08,
       "three_role": 1.12,
-      "creation": 1.03
+      "creation": 1.03,
+      "reb_role": 1.0,
+      "fta_role": 1.05
     }
   },
-  "notes": "No API keys belong in this file."
+  "notes": "Historical/opponent stats are automatic. Never put API keys here."
 }
