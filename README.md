@@ -1,122 +1,91 @@
-# WNBA Prop Model — Streamlit MVP
+# Basketball Pricing Engine v2
 
-## What this version does
+Deploy-ready Streamlit project for NBA/WNBA player props and WNBA team markets.
 
-- Pulls **player game logs** from the WNBA Stats surface (`LeagueID=10`)
-- Pulls **team game logs**
-- Stores local data in **DuckDB**
-- Lets you inspect:
-  - Season
-  - Last 10
-  - Last 5
-  - H2H
-- Lets you manually select **same-role games**
-- Builds the frozen pre-market projection using:
-  - minutes
-  - FGA / 3PA / FTA
-  - REB / AST rates
-  - opponent overall allowances
-  - editable positional modifiers
-  - editable injury/rotation redistribution
-  - efficiency regression
-- Runs Monte Carlo
-- Prices:
-  - PTS
-  - REB
-  - AST
-  - 3PM
-  - P+R
-  - P+A
-  - A+R
-  - PRA
-- Calculates:
-  - model probability
-  - fair odds
-  - bookmaker no-vig probability
-  - probability edge
-  - EV
-  - fractional-Kelly units
-- Saves model runs for later backtesting
+## Security
 
-## Why DuckDB
+**Never put API keys in code, JSON, or GitHub.**
 
-For the first local version DuckDB is ideal:
-- no server to install
-- one local `.duckdb` file
-- SQL + Pandas work easily
-- very fast for analytical queries
-- later we can migrate to PostgreSQL/Supabase if the app becomes cloud/multi-user
+For Streamlit Community Cloud:
+1. Deploy the GitHub repository.
+2. Open **App settings -> Secrets**.
+3. Add:
 
-## Data architecture
-
-Primary live data:
-- WNBA Stats / official Stats surface
-- LeagueID = `10`
-
-Local warehouse:
-- `data/wnba_props.duckdb`
-
-Planned additional feeds:
-1. Official WNBA injury report
-2. Player positions / roster snapshots
-3. Schedule and future-game table
-4. Rotation / starter history
-5. Historical WNBA Stats parquet backup
-6. Bookmaker market snapshots
-
-## Install
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+```toml
+BALLDONTLIE_API_KEY = "your-key"
 ```
 
-macOS/Linux:
+The app never renders the key. It only displays whether a key is configured.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+The repository `.gitignore` explicitly excludes `.streamlit/secrets.toml`.
 
-## Run
+## Data providers
 
-```bash
-streamlit run app.py
-```
+### WNBA
+Primary when a key is available:
+- BALLDONTLIE WNBA API
+  - players
+  - games
+  - player game stats
+  - team game stats
+  - player/team season advanced endpoints
 
-## MVP workflow
+Fallback:
+- `nba_api` with WNBA `LeagueID=10`
 
-1. Open **Data Sync**
-2. Sync the current WNBA season
-3. Open **Player Lab**
-4. Select player + opponent
-5. Inspect Season / L10 / L5 / H2H
-6. Tick only comparable **same-role** games
-7. Enter current injury/rotation adjustments
-8. Set matchup / positional inputs
-9. Click **Build frozen projection**
-10. Open **Market Pricing**
-11. Enter bookmaker line + both prices
-12. Run / save the market
+### NBA
+- `nba_api` with NBA `LeagueID=00`
 
-## Important modeling rule
+### EuroLeague / EuroCup
+Adapter structure already exists under `providers/euroleague.py`.
+Not enabled yet. The intended competition codes are:
+- `E` EuroLeague
+- `U` EuroCup
 
-If your `same-role` games already contain the current absence setup, do **not**
-also add the full vacated FGA / AST / REB again. That is double counting.
+## Fixed protocol encoded
 
-## Next development step
+- Old season / Games 6–10 / L5 are non-overlapping.
+- Stable rotation weights: 55 / 20 / 25.
+- Role/injury-change weights: 35 / 20 / 45.
+- H2H is context only and capped in the UI at +/-10%.
+- Pace/opportunity enters once.
+- 3PM comes from simulated attempts and regressed shooting efficiency.
+- Joint Monte Carlo provides PTS / REB / AST / 3PM and combos.
+- Team engine provides PTS / 3PA / 3PM / 2PA / 2PM / FTA / TOV / OREB / AST / STL / BLK / PF.
+- Low / central / high opportunity stress scenarios.
+- Bookmaker odds are entered after the projection is produced.
 
-Automate these fields that are manual in v0.1:
+## Manual input: what the user supplies
 
-- current injuries
-- expected starting five
-- position buckets
-- positional opponent allowances
-- same-role game tagging
-- expected minutes
-- H2H OT cleanup
-- bookmaker market import
+Historical stats should come from APIs. Manual input is only for pre-game context that no historical API can reliably infer:
+- OUT / questionable / available
+- projected minutes
+- starting/bench role
+- role redistribution due to absences
+- optional small H2H contextual modifier
+- bookmaker line and price
 
-The mathematical engine should remain separate from the AI/context layer.
+A small optional `game_context.json` is supported for this purpose.
+
+## Streamlit Cloud deployment
+
+Repository files needed:
+- `streamlit_app.py`
+- `core/`
+- `providers/`
+- `config/`
+- `requirements.txt`
+- `.streamlit/config.toml`
+
+Entry point:
+`streamlit_app.py`
+
+No local run is required for deployment.
+
+## Current v2 limitations
+
+1. Automatic opponent-by-position data is not yet normalized. The UI exposes explicit opponent multipliers so it is never silently assumed.
+2. Advanced BALLDONTLIE endpoints may depend on API tier. They fail gracefully.
+3. WNBA Team Markets currently require BALLDONTLIE basic team game logs.
+4. NBA team-market adapter and EuroLeague/EuroCup normalization are the next modules.
+5. Model-implied fair prices are not yet historically calibrated probabilities.

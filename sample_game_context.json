@@ -1,0 +1,25 @@
+{
+  "league": "WNBA",
+  "game": {
+    "away": "ATL",
+    "home": "LAS"
+  },
+  "injuries": {
+    "Rae Burrell": {
+      "status": "OUT",
+      "confidence": "confirmed"
+    }
+  },
+  "projected_minutes": {
+    "Ariel Atkins": 31.0,
+    "Erica Wheeler": 29.0
+  },
+  "role_adjustments": {
+    "Ariel Atkins": {
+      "usage": 1.08,
+      "three_role": 1.12,
+      "creation": 1.03
+    }
+  },
+  "notes": "No API keys belong in this file."
+}

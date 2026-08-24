@@ -1,5 +1,7 @@
-streamlit>=1.40
-pandas>=2.2
-numpy>=2.0
-duckdb>=1.1
-curl_cffi>=0.7
+streamlit>=1.49,<2
+pandas>=2.2,<3
+numpy>=1.26,<3
+requests>=2.32,<3
+nba_api>=1.10,<2
+# Future league adapter:
+# euroleague-api
