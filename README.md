@@ -43,3 +43,14 @@ Never commit keys or place them in context JSON.
 ## Current team-model note
 Team Markets v2.2 uses automatic opponent interaction but still simulates one team's
 distribution at a time. A fully coupled two-team latent game engine is the next major upgrade.
+
+
+## v2.3 — Cloud hang protection
+
+v2.3 makes no `stats.nba.com` request during Streamlit startup.
+
+- WNBA team names are loaded from BALLDONTLIE `/teams` only after a button click.
+- `nba_api` is invoked only after explicit user action.
+- nba_api timeouts were reduced to 8 seconds.
+- If stats.nba.com blocks or times out from Streamlit Cloud, the UI stays responsive and reports the failure.
+- This is necessary because BALLDONTLIE Free provides Teams/Players/Games, but WNBA Player Stats and Team Stats require GOAT.

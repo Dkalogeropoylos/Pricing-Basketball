@@ -40,7 +40,8 @@ bdl_key = get_secret("BALLDONTLIE_API_KEY")
 
 with st.sidebar:
     st.header("Data / Security")
-    st.write("Basic data:", "✅ nba_api")
+    st.write("Basic engine:", "✅ ready")
+    st.write("nba_api:", "⏳ lazy / on-demand")
     st.write("BALLDONTLIE advanced key:", "✅ configured" if bdl_key else "⚪ not configured")
     st.caption("Keys are never rendered and never belong in context JSON.")
     st.divider()
@@ -89,21 +90,23 @@ def cached_advanced_player(season, player_id, measure):
     return provider.player_season_advanced(int(season), int(player_id), measure)
 
 
-try:
-    player_pool, basic_source = cached_players(league, int(season))
-    player_pool = player_pool.dropna(subset=["PLAYER_ID","PLAYER_NAME"]).copy()
-    team_pool = (
-        player_pool[["TEAM_ID","TEAM_ABBR"]]
-        .dropna()
-        .drop_duplicates(subset=["TEAM_ID"])
-        .sort_values("TEAM_ABBR")
-        .reset_index(drop=True)
-    )
-except Exception as e:
-    player_pool = pd.DataFrame()
-    team_pool = pd.DataFrame()
-    basic_source = "unavailable"
-    st.error(f"Basic nba_api initialization error: {e}")
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_bdl_teams():
+    if not bdl_key:
+        return pd.DataFrame()
+    provider, _ = get_advanced_provider("WNBA", bdl_key)
+    if provider is None:
+        return pd.DataFrame()
+    return provider.teams_catalog()
+
+
+
+# IMPORTANT v2.3:
+# No stats.nba.com call is made during app startup.
+# Network-heavy catalogs/logs are loaded only after an explicit button click.
+player_pool = st.session_state.get("player_pool", pd.DataFrame())
+team_catalog = st.session_state.get("team_catalog", pd.DataFrame())
+basic_source = st.session_state.get("basic_source", "not initialized")
 
 
 tab_game, tab_team, tab_player, tab_audit = st.tabs(
@@ -118,25 +121,56 @@ with tab_game:
         "Manual context is only for pre-game information historical APIs cannot know."
     )
 
-    if team_pool.empty:
-        st.warning("Team list unavailable.")
-    else:
-        team_labels = team_pool["TEAM_ABBR"].astype(str).tolist()
-        c1,c2 = st.columns(2)
-        home_abbr = c1.selectbox("Home team", team_labels, key="setup_home")
-        away_choices = [x for x in team_labels if x != home_abbr]
-        away_abbr = c2.selectbox("Away team", away_choices, key="setup_away")
-        team_id_map = {str(r.TEAM_ABBR): int(r.TEAM_ID) for _,r in team_pool.iterrows()}
+    team_catalog = st.session_state.get("team_catalog", pd.DataFrame())
 
-        if st.button("Load matchup & opponent data", type="primary"):
+    if team_catalog.empty:
+        st.info("No network call has been made yet. Initialize the team catalog when you are ready.")
+        if league == "WNBA" and bdl_key:
+            if st.button("Load WNBA team list (BALLDONTLIE — 1 request)"):
+                try:
+                    with st.spinner("Loading WNBA teams..."):
+                        cat = cached_bdl_teams()
+                    if cat.empty:
+                        st.error("BALLDONTLIE returned an empty team list.")
+                    else:
+                        st.session_state["team_catalog"] = cat
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Team catalog failed: {e}")
+        else:
+            st.warning("WNBA team catalog needs the configured BALLDONTLIE key.")
+    else:
+        team_names = team_catalog["FULL_NAME"].dropna().astype(str).tolist()
+        c1,c2 = st.columns(2)
+        home_name = c1.selectbox("Home team", team_names, key="setup_home_name")
+        away_choices = [x for x in team_names if x != home_name]
+        away_name = c2.selectbox("Away team", away_choices, key="setup_away_name")
+
+        if st.button("Load matchup stats (nba_api — max ~8 sec)", type="primary"):
             try:
-                league_logs, src = cached_league_team_logs(league, int(season))
+                with st.spinner("Requesting league game logs from stats.nba.com..."):
+                    league_logs, src = cached_league_team_logs(league, int(season))
                 league_logs = clean_team_log(league_logs)
 
+                # Match BDL full names to nba_api TEAM_NAME; fall back to city/name text match.
+                def resolve_team(full_name):
+                    names = league_logs[["TEAM_ID","TEAM_ABBR","TEAM_NAME"]].drop_duplicates().copy()
+                    exact = names[names["TEAM_NAME"].astype(str).str.casefold() == full_name.casefold()]
+                    if exact.empty:
+                        token = full_name.split()[-1].casefold()
+                        exact = names[names["TEAM_NAME"].astype(str).str.casefold().str.contains(token, regex=False)]
+                    if exact.empty:
+                        raise ValueError(f"Could not map {full_name} to nba_api team data.")
+                    r = exact.iloc[0]
+                    return int(r["TEAM_ID"]), str(r["TEAM_ABBR"]), str(r["TEAM_NAME"])
+
+                home_id, home_abbr, home_official = resolve_team(home_name)
+                away_id, away_abbr, away_official = resolve_team(away_name)
+
                 setup = {
-                    "home_abbr": home_abbr, "home_id": team_id_map[home_abbr],
-                    "away_abbr": away_abbr, "away_id": team_id_map[away_abbr],
-                    "source": src
+                    "home_name": home_official, "home_abbr": home_abbr, "home_id": home_id,
+                    "away_name": away_official, "away_abbr": away_abbr, "away_id": away_id,
+                    "source": src,
                 }
                 st.session_state["game_setup"] = setup
                 st.session_state["league_team_logs"] = league_logs
@@ -144,7 +178,11 @@ with tab_game:
                 st.session_state["opp_profile_away"] = opponent_allowed_profile(league_logs, away_abbr)
                 st.success(f"Loaded {away_abbr} @ {home_abbr}.")
             except Exception as e:
-                st.error(f"Matchup load failed: {e}")
+                st.error(
+                    "stats.nba.com did not respond from Streamlit Cloud. "
+                    "The app is still alive; use the CSV fallback or a GOAT-capable provider. "
+                    f"Details: {e}"
+                )
 
     st.markdown("### Pre-game context")
     st.caption("Upload or paste injuries / minutes / role changes. Matching players are prefilled automatically.")
@@ -266,8 +304,24 @@ with tab_team:
 # ==================== PLAYER PROPS ====================
 with tab_player:
     st.subheader("Player Props")
+    player_pool = st.session_state.get("player_pool", pd.DataFrame())
+
     if player_pool.empty:
-        st.warning("Player pool unavailable.")
+        st.info("Player catalog is not loaded. This is intentional so startup never blocks.")
+        if st.button("Load player catalog (nba_api — max ~8 sec)", key="init_player_pool"):
+            try:
+                with st.spinner("Loading current player catalog..."):
+                    pp, src = cached_players(league, int(season))
+                pp = pp.dropna(subset=["PLAYER_ID","PLAYER_NAME"]).copy()
+                st.session_state["player_pool"] = pp
+                st.session_state["basic_source"] = src
+                st.rerun()
+            except Exception as e:
+                st.error(
+                    "nba_api player catalog timed out or was blocked. "
+                    "You can still use the CSV fallback once we add a manual player mode, "
+                    f"or use a GOAT data provider. Details: {e}"
+                )
     else:
         labels = [f"{r.PLAYER_NAME} — {r.TEAM_ABBR}" for _,r in player_pool.iterrows()]
         selected = st.selectbox("Player",labels,key="player_select")
@@ -493,7 +547,7 @@ with tab_audit:
 
     st.write({
         "league":league,
-        "basic_provider":"nba_api",
+        "basic_provider":"nba_api (on-demand, 8s timeout)",
         "BALLDONTLIE_advanced_key_configured":bool(bdl_key),
         "keys_rendered_to_UI":False
     })

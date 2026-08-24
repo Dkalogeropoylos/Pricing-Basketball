@@ -15,7 +15,7 @@ class NBAStatsProvider:
             season_type_all_star="Regular Season",
             league_id_nullable=self.league_id,
             per_mode_detailed="PerGame",
-            timeout=30,
+            timeout=8,
         )
         df = ep.get_data_frames()[0].copy()
         out = df.rename(columns={"TEAM_ABBREVIATION": "TEAM_ABBR"})
@@ -45,7 +45,7 @@ class NBAStatsProvider:
             season=str(season),
             season_type_all_star="Regular Season",
             league_id_nullable=self.league_id,
-            timeout=30,
+            timeout=8,
         )
         x = ep.get_data_frames()[0].copy()
         x = x.rename(columns={"Game_ID": "GAME_ID", "Player_ID": "PLAYER_ID"})
@@ -67,7 +67,7 @@ class NBAStatsProvider:
             season=str(season),
             season_type_all_star="Regular Season",
             sorter="DATE",
-            timeout=30,
+            timeout=8,
         )
         x = ep.get_data_frames()[0].copy()
         x = x.rename(columns={"TEAM_ABBREVIATION": "TEAM_ABBR"})
@@ -86,7 +86,7 @@ class NBAStatsProvider:
         ep = commonplayerinfo.CommonPlayerInfo(
             player_id=int(player_id),
             league_id_nullable=self.league_id,
-            timeout=30,
+            timeout=8,
         )
         df = ep.get_data_frames()[0]
         raw = ""
@@ -116,7 +116,7 @@ class NBAStatsProvider:
             opponent_team_id=int(opponent_team_id or 0),
             player_position_abbreviation_nullable=str(position),
             per_mode_detailed="Totals",
-            timeout=30,
+            timeout=8,
         )
         df = ep.get_data_frames()[0].copy()
         if df.empty:

@@ -37,6 +37,21 @@ class BDLWNBA:
                 break
         return rows
 
+
+    def teams_catalog(self):
+        """Free-tier WNBA team catalog: one request, no pagination."""
+        payload = self._get("teams")
+        rows = []
+        for t in payload.get("data", []):
+            rows.append({
+                "BDL_TEAM_ID": t.get("id"),
+                "FULL_NAME": t.get("full_name"),
+                "CITY": t.get("city"),
+                "NAME": t.get("name"),
+                "BDL_ABBR": t.get("abbreviation"),
+            })
+        return pd.DataFrame(rows).sort_values("FULL_NAME").reset_index(drop=True)
+
     def players(self, search=None):
         params={"search":search} if search else {}
         rows=self._paged("players",params,max_pages=8)
