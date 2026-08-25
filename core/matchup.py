@@ -16,7 +16,7 @@ def _rates(df: pd.DataFrame) -> dict:
     if df is None or df.empty:
         return {}
     x = df.copy()
-    for c in ["PTS","REB","AST","FG3M","FG3A","FGM","FGA","FTA","TOV","OREB","PF"]:
+    for c in ["PTS","REB","AST","FG3M","FG3A","FGM","FGA","FTA","TOV","OREB","PF","BLK"]:
         if c in x:
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0)
     poss = float(estimate_possessions(x).sum())
@@ -40,6 +40,7 @@ def _rates(df: pd.DataFrame) -> dict:
         "TOV": float(x["TOV"].sum()) / poss,
         "OREB": float(x["OREB"].sum()) / poss,
         "PF": float(x["PF"].sum()) / poss,
+        "BLK": float(x["BLK"].sum()) / poss if "BLK" in x.columns else np.nan,
         "3P_PCT": (m3/a3) if a3 > 0 else np.nan,
         "2P_PCT": (m2/a2) if a2 > 0 else np.nan,
         "3P_ATT": a3,
@@ -55,6 +56,11 @@ def _modifier_from_ratio(stat: str, ratio: float) -> float:
     if stat in {"3PA", "2PA"}:
         ratio = float(np.clip(ratio, 0.78, 1.22))
         return float(np.clip(ratio ** 0.30, 0.91, 1.09))
+    if stat == "BLK":
+        # Opponent block-susceptibility is useful but noisy. It is a correction
+        # to the team's own block rate, not a second full projection.
+        ratio = float(np.clip(ratio, 0.75, 1.25))
+        return float(np.clip(ratio ** 0.25, 0.94, 1.06))
     ratio = float(np.clip(ratio, 0.75, 1.25))
     return float(np.clip(ratio ** 0.35, 0.88, 1.12))
 
@@ -68,7 +74,7 @@ def opponent_allowed_profile(league_team_logs: pd.DataFrame, opponent_abbr: str)
     lg = _rates(all_rows)
     opp = _rates(opp_rows)
 
-    keys = ["PTS","REB","AST","3PA","2PA","FTA","TOV","OREB","PF","3P_PCT","2P_PCT"]
+    keys = ["PTS","REB","AST","3PA","2PA","FTA","TOV","OREB","PF","BLK","3P_PCT","2P_PCT"]
     rows, ratios, auto = [], {}, {}
     for k in keys:
         l = lg.get(k, np.nan)
@@ -210,5 +216,5 @@ def player_matchup_modifiers(overall_profile, position_vs_opp=None, position_lea
 
 
 def team_matchup_modifiers(overall_profile):
-    wanted = ["3PA","2PA","FTA","TOV","OREB","AST","PF","3P_PCT","2P_PCT"]
+    wanted = ["3PA","2PA","FTA","TOV","OREB","AST","PF","BLK","3P_PCT","2P_PCT"]
     return {k: overall_profile.get("modifiers", {}).get(k, 1.0) for k in wanted}

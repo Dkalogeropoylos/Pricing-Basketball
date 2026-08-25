@@ -37,6 +37,9 @@ class TeamContext:
     dreb: float = 1.0
     stl: float = 1.0
     blk: float = 1.0
+    # Tiny same-season H2H block correction. H2H games are already inside
+    # the history, so this is capped tightly to avoid double counting.
+    blk_h2h: float = 1.0
 
 
 def estimate_possessions(df: pd.DataFrame) -> pd.Series:
@@ -259,18 +262,27 @@ def build_team_profile(
     # Defensive rates need sensible bounds after weighted blending.
     p["dreb_capture"] = float(np.clip(p.get("dreb_capture", 0.94), 0.78, 0.995))
     p["stl_per_opp_tov"] = float(np.clip(p.get("stl_per_opp_tov", 0.55), 0.20, 0.90))
-    recent_blk = float(p.get("blk_per_opp_2pa", 0.075))
-    stable_blk = _shrink(
-        full.get("blk_per_opp_2pa", np.nan),
-        full.get("opp_2pa_att", 0.0),
-        0.075,
-        120.0,
-    )
-    # Blocks are high-variance. Keep some role/recency signal but anchor the rate
-    # heavily to the larger sample rather than opponent missed-shot percentage.
-    p["blk_per_opp_2pa"] = float(np.clip(
-        0.35 * recent_blk + 0.65 * stable_blk, 0.02, 0.18
+    # Blocks: keep the transparent team-level quantity the user actually wants:
+    # how many blocks this team makes per possession. Old/G6-10/L5 + current
+    # rotation similarity already live inside p["blk_pp"]. Because BLK is noisy,
+    # add only a light 15% league prior; do NOT divide by opponent misses/2PA.
+    if league_team_logs is not None and not league_team_logs.empty:
+        lg_poss = float(estimate_possessions(league_team_logs).sum())
+        lg_blk = float(pd.to_numeric(league_team_logs.get("BLK", 0), errors="coerce").fillna(0).sum())
+        league_blk_pp = _safe_div(lg_blk, lg_poss, 0.050)
+        lg_fga = float(pd.to_numeric(league_team_logs.get("FGA", 0), errors="coerce").fillna(0).sum())
+        lg_3pa = float(pd.to_numeric(league_team_logs.get("FG3A", 0), errors="coerce").fillna(0).sum())
+        league_two_pa_pp = _safe_div(max(lg_fga - lg_3pa, 0.0), lg_poss, 0.54)
+    else:
+        league_blk_pp = 0.050
+        league_two_pa_pp = 0.54
+
+    weighted_blk_pp = float(p.get("blk_pp", league_blk_pp))
+    p["blk_rate_pp"] = float(np.clip(
+        0.85 * weighted_blk_pp + 0.15 * league_blk_pp, 0.015, 0.100
     ))
+    p["league_blk_pp"] = float(league_blk_pp)
+    p["league_two_pa_pp"] = float(league_two_pa_pp)
     p["assist_per_make"] = float(np.clip(p.get("assist_per_make", 0.62), 0.25, 0.92))
 
     audit = []
@@ -342,7 +354,7 @@ def team_location_modifiers(
         "PF": "pf_pp",
         "DREB": "dreb_capture",
         "STL": "stl_per_opp_tov",
-        "BLK": "blk_per_opp_2pa",
+        "BLK": "blk_pp",
     }
     rows = []
     out = dict(neutral)
@@ -387,6 +399,51 @@ def h2h_team_audit(
         ] if c in h.columns
     ]
     return h[cols].sort_values(["GAME_DATE", "TEAM_ABBR"], ascending=[False, True]).reset_index(drop=True)
+
+
+def h2h_block_modifier(
+    league_team_logs: pd.DataFrame,
+    team_abbr: str,
+    opponent_abbr: str,
+    base_blk_pp: float,
+) -> Tuple[float, pd.DataFrame]:
+    """
+    Tiny same-season H2H correction for blocks only.
+
+    H2H is already contained in Old/G6-10/L5, so it is NOT another sample.
+    We use the H2H/base rate ratio with very small exponent and a +/-3% cap.
+    One H2H game therefore cannot meaningfully move the projection.
+    """
+    if league_team_logs is None or league_team_logs.empty:
+        return 1.0, pd.DataFrame()
+
+    x = league_team_logs.copy()
+    mask = (
+        x["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())
+        & x["OPP_ABBR"].astype(str).str.upper().eq(str(opponent_abbr).upper())
+    )
+    h = x[mask].copy()
+    if h.empty:
+        return 1.0, pd.DataFrame([{"H2H games": 0, "Applied BLK H2H modifier": 1.0}])
+
+    poss = float(estimate_possessions(h).sum())
+    blk = float(pd.to_numeric(h["BLK"], errors="coerce").fillna(0).sum())
+    h2h_rate = _safe_div(blk, poss, base_blk_pp)
+    ratio = _safe_div(h2h_rate, max(base_blk_pp, 1e-9), 1.0)
+    ratio = float(np.clip(ratio, 0.60, 1.40))
+    n_games = int(len(h))
+    confidence = float(n_games / (n_games + 3.0))
+    # Max exponent 0.08, plus hard +/-3% cap. This is intentionally tiny.
+    mod = float(np.clip(ratio ** (0.08 * confidence), 0.97, 1.03))
+    audit = pd.DataFrame([{
+        "H2H games": n_games,
+        "Base BLK/poss": float(base_blk_pp),
+        "H2H BLK/poss": float(h2h_rate),
+        "Raw H2H/base ratio": ratio,
+        "H2H confidence": confidence,
+        "Applied BLK H2H modifier": mod,
+    }])
+    return mod, audit
 
 
 def _simulate_offense(
@@ -497,7 +554,9 @@ def simulate_game(
       - OREB is sampled from OWN misses
       - DREB is sampled from OPPONENT misses not already rebounded offensively
       - STL is a subset of OPPONENT turnovers
-      - BLK rate is learned per OPPONENT 2PA, then capped by actual 2P misses
+      - BLK starts from OWN weighted BLK/poss, then uses opponent BLK-allowed,
+        tiny H2H, and a small opponent-2PA opportunity correction; actual 2P
+        misses are only a logical cap
       - REB = OREB + DREB
 
     This removes the old same-team STL/TOV and BLK/2PA direction errors and
@@ -516,6 +575,7 @@ def simulate_game(
     z_game_foul = rng.normal(size=n)
     z_game_tov = rng.normal(size=n)
     z_game_reb = rng.normal(size=n)
+    z_game_blk = rng.normal(size=n)
 
     def blend(shared, scale=0.70):
         return scale * shared + np.sqrt(max(1.0 - scale**2, 0.0)) * rng.normal(size=n)
@@ -562,19 +622,35 @@ def simulate_game(
     h_stl = rng.binomial(a["TOV"], h_stl_p)
     a_stl = rng.binomial(h["TOV"], a_stl_p)
 
-    # Blocks: estimate ability per opponent 2PA, not per opponent MISS.
-    # The old miss-denominator confounded rim protection with opponent shooting luck.
-    # Candidate blocks are generated from opponent 2PA and capped by actual misses.
-    h_blk_p = np.clip(
-        home_profile.get("blk_per_opp_2pa", 0.075) * home_ctx.blk,
-        0.01, 0.22,
+    # Blocks -- deliberately simple and transparent:
+    #   own weighted BLK/poss
+    # x opponent's tendency to ALLOW blocks (ctx.blk)
+    # x tiny same-season H2H correction (ctx.blk_h2h)
+    # x small 2PA-opportunity adjustment
+    # x pace automatically through possessions.
+    # Opponent 2PA is NOT the main denominator; it only nudges opportunity +/-4%.
+    h_lg_2pa = max(float(home_profile.get("league_two_pa_pp", 0.54)), 0.10)
+    a_lg_2pa = max(float(away_profile.get("league_two_pa_pp", 0.54)), 0.10)
+    a_2pa_rate = a["2PA"] / np.maximum(poss, 1)
+    h_2pa_rate = h["2PA"] / np.maximum(poss, 1)
+    h_2pa_mod = np.clip((a_2pa_rate / h_lg_2pa) ** 0.15, 0.96, 1.04)
+    a_2pa_mod = np.clip((h_2pa_rate / a_lg_2pa) ** 0.15, 0.96, 1.04)
+
+    h_blk_noise = np.exp(0.10 * blend(z_game_blk, 0.55) - 0.5 * 0.10**2)
+    a_blk_noise = np.exp(0.10 * blend(z_game_blk, 0.55) - 0.5 * 0.10**2)
+    h_blk_mean = np.clip(
+        poss * home_profile.get("blk_rate_pp", home_profile.get("blk_pp", 0.05))
+        * home_ctx.blk * home_ctx.blk_h2h * h_2pa_mod * h_blk_noise,
+        0.001, None,
     )
-    a_blk_p = np.clip(
-        away_profile.get("blk_per_opp_2pa", 0.075) * away_ctx.blk,
-        0.01, 0.22,
+    a_blk_mean = np.clip(
+        poss * away_profile.get("blk_rate_pp", away_profile.get("blk_pp", 0.05))
+        * away_ctx.blk * away_ctx.blk_h2h * a_2pa_mod * a_blk_noise,
+        0.001, None,
     )
-    h_blk_candidate = rng.binomial(a["2PA"], h_blk_p)
-    a_blk_candidate = rng.binomial(h["2PA"], a_blk_p)
+    h_blk_candidate = rng.poisson(h_blk_mean)
+    a_blk_candidate = rng.poisson(a_blk_mean)
+    # A block is a missed 2PA in the box score, so this is only a conservation cap.
     h_blk = np.minimum(h_blk_candidate, a["2MISS"])
     a_blk = np.minimum(a_blk_candidate, h["2MISS"])
 

@@ -213,6 +213,139 @@ def most_market(home_values, away_values):
     }
 
 
+
+
+def _team_stat_values(df: pd.DataFrame, market: str) -> pd.Series:
+    """Return one integer/counting stat from team game logs."""
+    m = str(market).upper()
+    direct = {
+        "3PM": "FG3M", "3PA": "FG3A", "FTM": "FTM", "FTA": "FTA",
+        "REB": "REB", "OREB": "OREB", "DREB": "DREB", "AST": "AST",
+        "STL": "STL", "BLK": "BLK", "TOV": "TOV", "PF": "PF",
+    }
+    if m in direct and direct[m] in df.columns:
+        return pd.to_numeric(df[direct[m]], errors="coerce")
+    if m == "2PA":
+        return pd.to_numeric(df["FGA"], errors="coerce") - pd.to_numeric(df["FG3A"], errors="coerce")
+    if m == "2PM":
+        return pd.to_numeric(df["FGM"], errors="coerce") - pd.to_numeric(df["FG3M"], errors="coerce")
+    raise KeyError(f"Unsupported team-with-most market: {market}")
+
+
+def _league_difference_calibration(team_logs: pd.DataFrame, market: str):
+    """Empirical same-game difference spread for a team-counting stat."""
+    if team_logs is None or team_logs.empty or "GAME_ID" not in team_logs.columns:
+        return None
+    rows = []
+    for gid, g in team_logs.groupby("GAME_ID", sort=False):
+        if len(g) < 2:
+            continue
+        g = g.iloc[:2].copy()
+        try:
+            vals = _team_stat_values(g, market).to_numpy(dtype=float)
+        except Exception:
+            continue
+        if len(vals) != 2 or not np.isfinite(vals).all():
+            continue
+        rows.append((float(vals[0]), float(vals[1])))
+    if len(rows) < 30:
+        return None
+    arr = np.asarray(rows, dtype=float)
+    diffs = arr[:, 0] - arr[:, 1]
+    totals = arr[:, 0] + arr[:, 1]
+    return {
+        "games": int(len(arr)),
+        "diff_sd": float(np.std(diffs, ddof=1)),
+        "mean_total": float(np.mean(totals)),
+        "tie_rate": float(np.mean(diffs == 0)),
+    }
+
+
+def _linear_discrete_side_probs(x: np.ndarray):
+    """
+    Convert a continuous adjusted difference into integer outcome probabilities
+    without Monte-Carlo rounding noise. Each value is linearly split between
+    floor(x) and ceil(x), preserving its expectation.
+    """
+    x = np.asarray(x, dtype=float)
+    lo = np.floor(x).astype(int)
+    frac = x - lo
+    hi = lo + 1
+    w_lo = 1.0 - frac
+    w_hi = frac
+    ph = float(np.mean(w_lo * (lo > 0) + w_hi * (hi > 0)))
+    pa = float(np.mean(w_lo * (lo < 0) + w_hi * (hi < 0)))
+    pt = float(np.mean(w_lo * (lo == 0) + w_hi * (hi == 0)))
+    total = ph + pa + pt
+    if total > 0:
+        ph, pa, pt = ph / total, pa / total, pt / total
+    return ph, pt, pa
+
+
+def most_market_calibrated(
+    home_values,
+    away_values,
+    team_logs: pd.DataFrame | None = None,
+    market: str | None = None,
+    calibration_strength: float = 0.60,
+):
+    """
+    Price a 3-way 'team with most' market from the coupled simulations, while
+    calibrating ONLY the spread of the team difference to actual historical
+    same-game dispersion from the league database. No bookmaker prices are used.
+
+    Why: team means can be good while independent residual noise makes the
+    difference too wide and tie probability too small. We preserve the simulated
+    expected difference, but shrink/expand its residual SD toward the empirical
+    league SD at the current scoring/stat scale.
+    """
+    h = np.asarray(home_values, dtype=float)
+    a = np.asarray(away_values, dtype=float)
+    n = min(len(h), len(a))
+    h, a = h[:n], a[:n]
+    d = h - a
+
+    raw = most_market(h, a)
+    if n < 100 or team_logs is None or market is None:
+        return {**raw, "calibrated": False, "raw_p_tie": raw["p_tie"]}
+
+    hist = _league_difference_calibration(team_logs, market)
+    if not hist or hist["mean_total"] <= 0:
+        return {**raw, "calibrated": False, "raw_p_tie": raw["p_tie"]}
+
+    mu = float(np.mean(d))
+    raw_sd = float(np.std(d, ddof=1))
+    current_total = float(np.mean(h + a))
+    target_sd = float(hist["diff_sd"] * np.sqrt(max(current_total, 1e-9) / hist["mean_total"]))
+    strength = float(np.clip(calibration_strength, 0.0, 1.0))
+    applied_sd = (1.0 - strength) * raw_sd + strength * target_sd
+
+    if not np.isfinite(raw_sd) or raw_sd <= 1e-9 or not np.isfinite(applied_sd):
+        return {**raw, "calibrated": False, "raw_p_tie": raw["p_tie"]}
+
+    # Prevent any one historical calibration from radically rewriting the model.
+    scale = float(np.clip(applied_sd / raw_sd, 0.80, 1.20))
+    d_adj = mu + (d - mu) * scale
+    ph, pt, pa = _linear_discrete_side_probs(d_adj)
+    return {
+        "p_home": ph,
+        "p_tie": pt,
+        "p_away": pa,
+        "fair_home": 1.0 / ph if ph > 0 else np.inf,
+        "fair_tie": 1.0 / pt if pt > 0 else np.inf,
+        "fair_away": 1.0 / pa if pa > 0 else np.inf,
+        "calibrated": True,
+        "raw_p_home": raw["p_home"],
+        "raw_p_tie": raw["p_tie"],
+        "raw_p_away": raw["p_away"],
+        "raw_diff_sd": raw_sd,
+        "league_target_diff_sd": target_sd,
+        "applied_diff_sd": raw_sd * scale,
+        "league_tie_rate": hist["tie_rate"],
+        "calibration_games": hist["games"],
+    }
+
+
 def market_table(sim, stress_low, stress_high, markets):
     """Legacy compact projection table."""
     rows = []
