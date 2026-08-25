@@ -184,3 +184,35 @@ attrs from temporary copies used only for concatenation.
 
 No projection, minutes, redistribution, pace, Monte Carlo, or pricing logic was
 changed.
+
+
+## v2.7.2 — team-market baseline conservation fix
+
+Two team simulation bugs were fixed without changing the established pricing
+protocol.
+
+### 1. Turnovers were counted twice
+
+Historical `3PA/poss` and `2PA/poss` were rates per TOTAL possession.
+The simulator then removed turnovers and applied those total-possession rates
+to the remaining live possessions. This reduced field-goal attempts by roughly
+another `(1 - TOV%)`.
+
+v2.7.2 derives conditional `3PA/live possession` and `2PA/live possession`
+rates from the same historical sample. Therefore the sequence remains:
+
+`possessions -> turnovers -> live possessions -> 3PA / 2PA`
+
+but a neutral simulation now reproduces the historical FGA-per-possession
+baseline rather than shrinking it a second time.
+
+### 2. OREB denominator was wrong for the simulation stage
+
+The simulator samples offensive rebounds from missed field goals. The previous
+conversion approximated OREB/FGA and applied that percentage to misses, which
+materially understated offensive rebounds.
+
+v2.7.2 stores and uses historical `OREB / missed FG`.
+
+No opponent modifiers, Old/G6-10/L5 weights, pace engine, minutes engine,
+Monte Carlo philosophy, or pricing logic were changed.

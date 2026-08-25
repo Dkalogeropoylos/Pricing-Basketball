@@ -1,0 +1,9 @@
+version: '3'
+services:
+  maze_server:
+    build: .
+    restart: always
+    environment:
+      TIMEOUT: 5
+    ports:
+      - "8080:5050"

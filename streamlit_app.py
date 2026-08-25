@@ -31,7 +31,7 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.7.1")
+st.title("🏀 Basketball Pricing Engine v2.7.2")
 st.caption(
     "Trader overrides • Learned role-aware redistribution • Rotation-similarity minutes • Shared fitted pace • "
     "No L5/L10 overlap • Existing value model preserved"

@@ -38,14 +38,26 @@ def _feat(df):
     a2 = max(fga-a3, 0)
     m2 = max(float(df.FGM.sum())-m3, 0)
     fta = float(df.FTA.sum())
+    tov = float(df.TOV.sum())
+    oreb = float(df.OREB.sum())
+    misses = max(fga - float(df.FGM.sum()), 0.0)
+
+    # Historical attempt rates are stored per TOTAL possession.
+    # For the simulation sequence possessions -> turnovers -> live possessions
+    # we also need the equivalent conditional rate per non-turnover possession.
+    live_poss = max(poss - tov, 1e-9)
+
     return {
         "games": len(df),
         "poss_pg": float(estimate_possessions(df).mean()),
         "three_pa_pp": a3/poss if poss else 0,
         "two_pa_pp": a2/poss if poss else 0,
+        "three_pa_live": a3/live_poss if live_poss else 0,
+        "two_pa_live": a2/live_poss if live_poss else 0,
         "fta_pp": fta/poss if poss else 0,
-        "tov_pp": float(df.TOV.sum())/poss if poss else 0,
-        "oreb_pp": float(df.OREB.sum())/poss if poss else 0,
+        "tov_pp": tov/poss if poss else 0,
+        "oreb_pp": oreb/poss if poss else 0,
+        "oreb_per_miss": oreb/misses if misses else 0,
         "ast_pp": float(df.AST.sum())/poss if poss else 0,
         "stl_pp": float(df.STL.sum())/poss if poss else 0,
         "blk_pp": float(df.BLK.sum())/poss if poss else 0,
@@ -62,7 +74,14 @@ def build_team_profile(df, cfg: WeightConfig):
     feats = {k:_feat(v) for k,v in buckets.items()}
 
     p = {}
-    for k in ["poss_pg","three_pa_pp","two_pa_pp","fta_pp","tov_pp","oreb_pp","ast_pp","stl_pp","blk_pp","pf_pp"]:
+    for k in [
+        "poss_pg",
+        "three_pa_pp","two_pa_pp",
+        "three_pa_live","two_pa_live",
+        "fta_pp","tov_pp",
+        "oreb_pp","oreb_per_miss",
+        "ast_pp","stl_pp","blk_pp","pf_pp"
+    ]:
         p[k] = weighted_average_feature(feats, weights, k)
 
     full = _feat(df)
@@ -95,8 +114,23 @@ def simulate_team(profile, ctx: TeamContext, n=100_000, seed=3, opportunity_mult
     live=np.maximum(poss-tov, 1)
 
     perimeter=np.exp(.08*z_style-.5*.08**2)
-    a3=rng.poisson(np.clip(live*profile["three_pa_pp"]*ctx.three_pa*perimeter, .001, None))
-    a2=rng.poisson(np.clip(live*profile["two_pa_pp"]*ctx.two_pa/perimeter**0.35, .001, None))
+
+    # IMPORTANT:
+    # three_pa_pp / two_pa_pp are historical attempts per TOTAL possession.
+    # Once turnovers have already been removed, applying those same rates to
+    # `live` would count turnovers twice. Use the historically equivalent
+    # conditional rate per non-turnover possession instead.
+    three_live = profile.get(
+        "three_pa_live",
+        profile["three_pa_pp"] / max(1.0-profile["tov_pp"], .55)
+    )
+    two_live = profile.get(
+        "two_pa_live",
+        profile["two_pa_pp"] / max(1.0-profile["tov_pp"], .55)
+    )
+
+    a3=rng.poisson(np.clip(live*three_live*ctx.three_pa*perimeter, .001, None))
+    a2=rng.poisson(np.clip(live*two_live*ctx.two_pa/perimeter**0.35, .001, None))
     fta=rng.poisson(np.clip(poss*profile["fta_pp"]*ctx.fta*np.exp(.12*z_foul-.5*.12**2), .001, None))
 
     p3=np.clip(profile["three_pct"]*ctx.three_pct + .03*z_shoot, .10, .60)
@@ -110,9 +144,22 @@ def simulate_team(profile, ctx: TeamContext, n=100_000, seed=3, opportunity_mult
     pts=3*m3+2*m2+ftm
 
     misses=np.maximum((a3-m3)+(a2-m2),0)
-    # OREB conditional on misses, capped.
+
+    # OREB is conditional on MISSED field goals. The old implementation used
+    # OREB/FGA and then applied it to misses, which materially understated OREB.
+    historical_oreb_per_miss = profile.get("oreb_per_miss", np.nan)
+    if not np.isfinite(historical_oreb_per_miss):
+        historical_oreb_per_miss = (
+            profile["oreb_pp"]
+            / max(
+                profile["three_pa_pp"]*(1-profile["three_pct"])
+                + profile["two_pa_pp"]*(1-profile["two_pct"]),
+                .05
+            )
+        )
+
     oreb_share=np.clip(
-        (profile["oreb_pp"] / max(profile["three_pa_pp"]+profile["two_pa_pp"], .1))
+        historical_oreb_per_miss
         * ctx.oreb * np.exp(.10*z_reb-.5*.10**2),
         .08,.45
     )
