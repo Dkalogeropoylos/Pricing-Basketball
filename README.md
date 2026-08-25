@@ -1,56 +1,98 @@
-# Basketball Pricing Engine v2.2
+# Basketball Pricing Engine v2.4
 
-## New in v2.2
-- Real Home/Away team selection from nba_api.
-- Automatic opponent-allowed profiles normalized per possession vs league average.
-- Automatic G/F/C opponent-by-position modifiers using OpponentTeamID + PlayerPosition.
-- Position adjusts only the deviation from overall defense, avoiding double counting.
-- Game-context JSON now auto-prefills projected minutes and role multipliers.
-- Same-season H2H is shown automatically and receives 0% extra weight by default.
+WNBA core data no longer depends on `stats.nba.com`.
 
-## Providers
-Core/basic:
-- WNBA: nba_api, LeagueID 10
-- NBA: nba_api, LeagueID 00
+## Historical data
 
-Optional:
-- BALLDONTLIE WNBA advanced endpoints, tier/rate-limit dependent.
+Primary WNBA historical provider:
+**SportsDataverse GitHub Releases**
 
-Future:
-- EuroLeague (E)
-- EuroCup (U)
+The app downloads and caches:
 
-## Security
-Use Streamlit Community Cloud Secrets only:
+- `espn_wnba_player_boxscores/player_box_{season}.parquet`
+- `espn_wnba_team_boxscores/team_box_{season}.parquet`
 
-```toml
-BALLDONTLIE_API_KEY = "your-key"
+If parquet is unavailable, it automatically tries the corresponding CSV.
+
+The source datasets are published by SportsDataverse/wehoop and are refreshed
+during the WNBA season.
+
+## What the two files provide
+
+Player boxscores:
+- game/date/team/opponent
+- minutes
+- FGM/FGA
+- 3PM/3PA
+- FTM/FTA
+- OREB/DREB/REB
+- AST/STL/BLK/TOV/PF/PTS
+- starter
+- position
+- home/away
+
+Team boxscores:
+- team/opponent/game/date
+- FGM/FGA
+- 3PM/3PA
+- FTM/FTA
+- OREB/DREB/REB
+- AST/STL/BLK/TOV/PF/PTS
+
+## Automatic calculations
+
+From those files the app calculates:
+- current team and player lists
+- Old season / Games 6-10 / L5
+- team pace / possession profiles
+- opponent allowed per possession vs league average
+- G/F/C opponent-by-position per-36 vs league positional baseline
+- same-season H2H
+- OT flag when a game contains any player above 40 minutes
+
+No extra H2H weight is applied automatically.
+
+## Pregame manual context
+
+Only information a historical database cannot know should be manual:
+
+```json
+{
+  "injuries": {
+    "Rae Burrell": {"status": "OUT"}
+  },
+  "projected_minutes": {
+    "Ariel Atkins": 31
+  },
+  "role_adjustments": {
+    "Ariel Atkins": {
+      "usage": 1.08,
+      "three_role": 1.12,
+      "creation": 1.03
+    }
+  }
+}
 ```
 
-Never commit keys or place them in context JSON.
+## Providers retained for later
 
-## Protocol
-- Stable weights: 55 / 20 / 25
-- Role-change weights: 35 / 20 / 45
-- Old / Games 6–10 / L5 are non-overlapping
+- BALLDONTLIE: optional advanced / injuries depending on tier.
+- nba_api: retained in the repository as an optional local/fallback adapter,
+  but v2.4 WNBA Streamlit core does not call stats.nba.com.
+- NBA, EuroLeague and EuroCup adapters can use the same normalized model layer.
+
+## Model protocol
+
+- Stable weighting: 55 / 20 / 25
+- Role-change weighting: 35 / 20 / 45
+- Old / Games 6-10 / L5 never overlap
 - H2H is context only
-- Pace/opportunity enters once
-- 3PM = 3PA x regressed shooting ability
-- Joint player MC for PTS/REB/AST/3PM + PRA/PR/PA/AR
-- Stress scenarios before qualification
-- Bookmaker price entered after projection
+- 3PM generated from projected 3PA and regressed 3P%
+- player joint MC: PTS / REB / AST / 3PM and combos
+- team MC: PTS / 3PA / 3PM / 2PA / 2PM / FTA / TOV / OREB / AST / STL / BLK / PF
+- bear / central / bull opportunity stress
+- bookmaker odds entered after projection
 
-## Current team-model note
-Team Markets v2.2 uses automatic opponent interaction but still simulates one team's
-distribution at a time. A fully coupled two-team latent game engine is the next major upgrade.
+## Important
 
-
-## v2.3 — Cloud hang protection
-
-v2.3 makes no `stats.nba.com` request during Streamlit startup.
-
-- WNBA team names are loaded from BALLDONTLIE `/teams` only after a button click.
-- `nba_api` is invoked only after explicit user action.
-- nba_api timeouts were reduced to 8 seconds.
-- If stats.nba.com blocks or times out from Streamlit Cloud, the UI stays responsive and reports the failure.
-- This is necessary because BALLDONTLIE Free provides Teams/Players/Games, but WNBA Player Stats and Team Stats require GOAT.
+Model-implied fair odds are not yet historically calibrated probabilities.
