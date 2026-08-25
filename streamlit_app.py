@@ -16,11 +16,15 @@ from core.team_model import (
     TeamContext, build_team_profile, simulate_game,
     team_location_modifiers, h2h_team_audit,
 )
-from core.pricing import price, auto_market_table, model_line, most_market
+from core.pricing import (
+    price, auto_market_table, model_line, most_market, line_ladder,
+    required_odds_for_ev,
+)
 from core.matchup import (
     opponent_allowed_profile,
     player_matchup_modifiers,
     team_matchup_modifiers,
+    position_environment,
 )
 from core.minutes_engine import (
     project_team_minutes, rotation_regime_for_team, rotation_similarity_weights,
@@ -29,6 +33,7 @@ from core.pace_engine import (
     project_game_pace,
     player_historical_pace_environment,
 )
+from core.role_splits import current_out_teammates, same_role_game_weights
 
 
 st.set_page_config(
@@ -36,10 +41,10 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.8.0")
+st.title("🏀 Basketball Pricing Engine v2.9.0")
 st.caption(
-    "Trader overrides • Rotation-aware minutes • Coupled two-team markets • Auto model lines/fair prices • "
-    "Shared fitted pace • No overlapping recent samples"
+    "Trader overrides • Rotation-aware minutes • Coupled two-team markets • Auto line ladders/play-from prices • "
+    "Same-role absence weighting • Position-aware matchup • No overlapping recent samples"
 )
 
 
@@ -123,6 +128,23 @@ with st.sidebar:
     st.write(
         "BALLDONTLIE advanced:",
         "✅ configured" if bdl_key else "⚪ optional"
+    )
+    st.divider()
+    st.subheader("Pricing discipline")
+    target_ev_pct = st.select_slider(
+        "Minimum model EV before calling a price playable",
+        options=[4,5,6,7,8,10],
+        value=6,
+        help="Fair odds are break-even. Play-from odds include this extra EV buffer.",
+    )
+    reference_odds = st.selectbox(
+        "Reference price for automatic line thresholds",
+        [1.80,1.85,1.90,1.95,2.00],
+        index=2,
+    )
+    target_ev = float(target_ev_pct) / 100.0
+    st.caption(
+        f"Example: fair 1.70 becomes play-from {1.70*(1+target_ev):.2f} at {target_ev:.0%} target EV."
     )
     st.divider()
     league = st.selectbox(
@@ -487,9 +509,18 @@ with tab_team:
         )
 
         def combined_mods(auto, loc):
+            # Attempt mix is already encoded in the team's own weighted profile.
+            # Opponent + location are contextual corrections, not another full sample.
+            # Cap the combined attempt correction to avoid systematic 3PA/2PA overreaction.
+            three_mod = float(np.clip(
+                auto.get("3PA", 1.0) * loc.get("3PA", 1.0), 0.92, 1.08
+            ))
+            two_mod = float(np.clip(
+                auto.get("2PA", 1.0) * loc.get("2PA", 1.0), 0.92, 1.08
+            ))
             return {
-                "3PA": float(auto.get("3PA", 1.0) * loc.get("3PA", 1.0)),
-                "2PA": float(auto.get("2PA", 1.0) * loc.get("2PA", 1.0)),
+                "3PA": three_mod,
+                "2PA": two_mod,
                 "FTA": float(auto.get("FTA", 1.0) * loc.get("FTA", 1.0)),
                 "TOV": float(auto.get("TOV", 1.0) * loc.get("TOV", 1.0)),
                 "OREB": float(auto.get("OREB", 1.0) * loc.get("OREB", 1.0)),
@@ -498,6 +529,8 @@ with tab_team:
                 "DREB": float(loc.get("DREB", 1.0)),
                 "STL": float(loc.get("STL", 1.0)),
                 "BLK": float(loc.get("BLK", 1.0)),
+                "3P_PCT": float(auto.get("3P_PCT", 1.0)),
+                "2P_PCT": float(auto.get("2P_PCT", 1.0)),
             }
 
         home_mod = combined_mods(home_auto, home_loc)
@@ -512,7 +545,7 @@ with tab_team:
             def modifier_editor(prefix, team_abbr, mods):
                 cols = st.columns(5)
                 out = {}
-                keys = ["3PA","2PA","FTA","TOV","OREB","AST","PF","DREB","STL","BLK"]
+                keys = ["3PA","2PA","FTA","TOV","OREB","AST","PF","DREB","STL","BLK","3P_PCT","2P_PCT"]
                 for i, key in enumerate(keys):
                     out[key] = cols[i % 5].number_input(
                         f"{team_abbr} {key}",
@@ -547,7 +580,9 @@ with tab_team:
                 projected_possessions=float(shared_pace),
                 possessions_sd=float(poss_sd),
                 three_pa=float(mod["3PA"]),
+                three_pct=float(mod.get("3P_PCT", 1.0)),
                 two_pa=float(mod["2PA"]),
+                two_pct=float(mod.get("2P_PCT", 1.0)),
                 fta=float(mod["FTA"]),
                 tov=float(mod["TOV"]),
                 oreb=float(mod["OREB"]),
@@ -624,23 +659,24 @@ with tab_team:
             ])
             with subtabs[0]:
                 st.dataframe(
-                    auto_market_table(away_sim, markets, away_low, away_high).round(3),
+                    auto_market_table(away_sim, markets, away_low, away_high, target_ev=target_ev, reference_odds=reference_odds).round(3),
                     use_container_width=True, hide_index=True,
                 )
             with subtabs[1]:
                 st.dataframe(
-                    auto_market_table(home_sim, markets, home_low, home_high).round(3),
+                    auto_market_table(home_sim, markets, home_low, home_high, target_ev=target_ev, reference_odds=reference_odds).round(3),
                     use_container_width=True, hide_index=True,
                 )
             with subtabs[2]:
                 st.dataframe(
-                    auto_market_table(total_sim, markets, total_low, total_high).round(3),
+                    auto_market_table(total_sim, markets, total_low, total_high, target_ev=target_ev, reference_odds=reference_odds).round(3),
                     use_container_width=True, hide_index=True,
                 )
             with subtabs[3]:
                 most_rows = []
+                st.caption("PTS / match-winner is intentionally omitted here until the score/win layer is separately backtested.")
                 for m in [
-                    "PTS","3PM","3PA","2PM","2PA","FTM","FTA",
+                    "3PM","3PA","2PM","2PA","FTM","FTA",
                     "REB","OREB","DREB","AST","STL","BLK","TOV","PF",
                 ]:
                     pr = most_market(home_sim[m], away_sim[m])
@@ -648,58 +684,19 @@ with tab_team:
                         "Market": m,
                         f"P {setup['home_abbr']}": pr["p_home"],
                         f"Fair {setup['home_abbr']}": pr["fair_home"],
+                        f"Play {setup['home_abbr']} from": required_odds_for_ev(pr["p_home"], 0.0, target_ev),
                         "P Tie": pr["p_tie"],
                         "Fair Tie": pr["fair_tie"],
                         f"P {setup['away_abbr']}": pr["p_away"],
                         f"Fair {setup['away_abbr']}": pr["fair_away"],
+                        f"Play {setup['away_abbr']} from": required_odds_for_ev(pr["p_away"], 0.0, target_ev),
                     })
                 st.dataframe(
                     pd.DataFrame(most_rows).round(3),
                     use_container_width=True, hide_index=True,
                 )
 
-            st.markdown("### Compare one bookmaker line")
-            c0, c1, c2, c3, c4 = st.columns(5)
-            scope = c0.selectbox(
-                "Scope", [setup["away_abbr"], setup["home_abbr"], "TOTAL"],
-                key="team_price_scope",
-            )
-            market = c1.selectbox("Market", markets, key="team_price_market")
-
-            if scope == setup["away_abbr"]:
-                target, low_target, high_target = away_sim, away_low, away_high
-            elif scope == setup["home_abbr"]:
-                target, low_target, high_target = home_sim, home_low, home_high
-            else:
-                target, low_target, high_target = total_sim, total_low, total_high
-
-            ml = model_line(target[market])
-            line = c2.number_input(
-                "Book line",
-                value=float(ml["line"]), step=0.5,
-                key=f"team_book_line_{scope}_{market}",
-            )
-            oo = c3.number_input(
-                "Over odds", 1.01, 20.0, 1.90, 0.01,
-                key=f"team_book_oo_{scope}_{market}",
-            )
-            uo = c4.number_input(
-                "Under odds", 1.01, 20.0, 1.90, 0.01,
-                key=f"team_book_uo_{scope}_{market}",
-            )
-
-            p = price(target[market], line, oo, uo)
-            pl = price(low_target[market], line, oo, uo)
-            ph = price(high_target[market], line, oo, uo)
-            st.dataframe(pd.DataFrame([{
-                "Projection": float(target[market].mean()),
-                "Model line": ml["line"],
-                **p,
-                "Low p_over": pl["p_over"],
-                "High p_over": ph["p_over"],
-                "Low p_under": pl["p_under"],
-                "High p_under": ph["p_under"],
-            }]).round(4), use_container_width=True, hide_index=True)
+            st.caption("No bookmaker input is required. Compare the market later against Model line / Fair / Play-from columns above.")
 
             with st.expander("Model audit: buckets / location / H2H / conservation"):
                 st.markdown(f"**{setup['away_abbr']} buckets — {away_regime}**")
@@ -951,6 +948,15 @@ with tab_player:
                 50_000,
                 key="selected_sims",
             )
+            same_role_enabled = st.toggle(
+                "AUTO: weight historical games toward the current teammate-absence state",
+                value=True,
+                help=(
+                    "Example: if Fudd is confirmed OUT, Bueckers games in which Fudd did not play "
+                    "receive a regularized inner weight. This does NOT create a fourth sample."
+                ),
+                key="same_role_absence_toggle",
+            )
 
             if st.button(
                 "Run selected players",
@@ -997,12 +1003,21 @@ with tab_player:
                         if regime == "role_change" or role
                         else WeightConfig.stable()
                     )
-                    profile,audit = build_player_profile(plog,cfg)
+                    out_teammates = current_out_teammates(
+                        manual_context, pool, team_abbr, pname
+                    )
+                    role_game_weights, same_role_audit = same_role_game_weights(
+                        plog, player_db, team_abbr, out_teammates,
+                        enabled=same_role_enabled,
+                    )
+                    profile,audit = build_player_profile(
+                        plog,cfg,game_weights=role_game_weights
+                    )
 
                     pos_group = prow.get("POSITION_GROUP")
                     pvo,plg = {},{}
                     if pos_group:
-                        pvo,plg = provider.position_environment(
+                        pvo,plg = position_environment(
                             player_db,opp_abbr,pos_group
                         )
                     matchup_mods, matchup_audit = player_matchup_modifiers(
@@ -1025,6 +1040,8 @@ with tab_player:
                         opp_ast=float(matchup_mods["AST"]),
                         opp_3pa=float(matchup_mods["3PA"]),
                         opp_fta=float(matchup_mods["FTA"]),
+                        opp_three_pct=float(matchup_mods.get("3P_PCT",1.0)),
+                        opp_two_pct=float(matchup_mods.get("2P_PCT",1.0)),
                         usage=float(role.get("usage",1.0)),
                         creation=float(role.get("creation",1.0)),
                         reb_role=float(
@@ -1055,6 +1072,8 @@ with tab_player:
                         "REB":float(sim["REB"].mean()),
                         "AST":float(sim["AST"].mean()),
                         "3PM":float(sim["3PM"].mean()),
+                        "3PA":float(sim["3PA"].mean()),
+                        "FTA":float(sim["FTA"].mean()),
                         "PRA":float(sim["PRA"].mean()),
                         "PR":float(sim["PR"].mean()),
                         "PA":float(sim["PA"].mean()),
@@ -1065,6 +1084,7 @@ with tab_player:
                         "sim":sim,
                         "profile_audit":audit,
                         "matchup_audit":matchup_audit,
+                        "same_role_audit":same_role_audit,
                         "ctx":ctx,
                         "plog":plog,
                         "opp_abbr":opp_abbr,
@@ -1082,7 +1102,7 @@ with tab_player:
                     board.round({
                         "Min":1,"Min Low":1,"Min High":1,
                         "Hist Pace":2,"Game Pace":2,"Pace Mult":3,
-                        "PTS":2,"REB":2,"AST":2,"3PM":2,
+                        "PTS":2,"REB":2,"AST":2,"3PM":2,"3PA":2,"FTA":2,
                         "PRA":2,"PR":2,"PA":2,"AR":2,
                     }),
                     use_container_width=True,
@@ -1097,11 +1117,11 @@ with tab_player:
                 )
                 detail = st.session_state["selected_player_details"][pname]
                 sim = detail["sim"]
-                markets = ["PTS","REB","AST","3PM","PRA","PR","PA","AR"]
+                markets = ["PTS","REB","AST","3PM","3PA","FTA","PRA","PR","PA","AR"]
 
                 st.markdown("#### Automatic model lines + fair prices")
                 st.dataframe(
-                    auto_market_table(sim, markets).round(3),
+                    auto_market_table(sim, markets, target_ev=target_ev, reference_odds=reference_odds).round(3),
                     use_container_width=True, hide_index=True,
                 )
 
@@ -1125,6 +1145,12 @@ with tab_player:
                         detail["matchup_audit"].round(4),
                         use_container_width=True,
                     )
+                    st.markdown("**Current teammate-absence / same-role audit**")
+                    st.dataframe(
+                        detail["same_role_audit"].round(3),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
                     h2h = detail["plog"][
                         detail["plog"]["OPP_ABBR"].astype(str).str.upper()
@@ -1147,103 +1173,28 @@ with tab_player:
                             use_container_width=True,
                         )
 
-                rows = []
-                for m in markets:
-                    with st.expander(m, expanded=m in ["PTS","REB","AST","3PM"]):
-                        c1,c2,c3 = st.columns(3)
-                        line = c1.number_input(
-                            f"{pname} {m} book line",
-                            value=float(model_line(sim[m])["line"]),
-                            step=.5,
-                            key=f"deep_line_{pname}_{m}",
-                        )
-                        oo = c2.number_input(
-                            f"{m} Over odds",
-                            1.01,20.0,1.90,.01,
-                            key=f"deep_oo_{pname}_{m}",
-                        )
-                        uo = c3.number_input(
-                            f"{m} Under odds",
-                            1.01,20.0,1.90,.01,
-                            key=f"deep_uo_{pname}_{m}",
-                        )
-                        p = price(sim[m],line,oo,uo)
-
-                        # Stress minutes and game opportunity around the same
-                        # core projection rather than changing the model thesis.
-                        ctx0 = detail["ctx"]
-                        low_ctx = PlayerContext(**{
-                            **ctx0.__dict__,
-                            "projected_minutes": max(
-                                float(ctx0.projected_minutes)
-                                - float(ctx0.minutes_sd),
-                                1.0
-                            ),
-                        })
-                        high_ctx = PlayerContext(**{
-                            **ctx0.__dict__,
-                            "projected_minutes": min(
-                                float(ctx0.projected_minutes)
-                                + float(ctx0.minutes_sd),
-                                40.0
-                            ),
-                        })
-                        sn = min(35_000,max(10_000,int(n)//3))
-                        low_sim = simulate_player(
-                            build_player_profile(
-                                detail["plog"],
-                                WeightConfig.role_change()
-                                if str(final_minutes[
-                                    final_minutes["Player"] == pname
-                                ].iloc[0]["Regime"]) == "role_change"
-                                else WeightConfig.stable()
-                            )[0],
-                            low_ctx,
-                            sn,
-                            seed=3101,
-                            opportunity_mult=.97,
-                        )
-                        high_sim = simulate_player(
-                            build_player_profile(
-                                detail["plog"],
-                                WeightConfig.role_change()
-                                if str(final_minutes[
-                                    final_minutes["Player"] == pname
-                                ].iloc[0]["Regime"]) == "role_change"
-                                else WeightConfig.stable()
-                            )[0],
-                            high_ctx,
-                            sn,
-                            seed=3102,
-                            opportunity_mult=1.03,
-                        )
-                        pl = price(low_sim[m],line,oo,uo)
-                        ph = price(high_sim[m],line,oo,uo)
-
-                        rows.append({
-                            "Market":m,"Line":line,
-                            "P(O)":p["p_over"],
-                            "Fair O":p["fair_over"],
-                            "Odds O":oo,
-                            "EV O":p["ev_over"],
-                            "Bear P(O)":pl["p_over"],
-                            "Bull P(O)":ph["p_over"],
-                            "P(U)":p["p_under"],
-                            "Fair U":p["fair_under"],
-                            "Odds U":uo,
-                            "EV U":p["ev_under"],
-                            "Bear P(U)":pl["p_under"],
-                            "Bull P(U)":ph["p_under"],
-                        })
-
-                st.dataframe(
-                    pd.DataFrame(rows).round(4),
-                    use_container_width=True,
+                st.markdown("#### Price ladder — no bookmaker input required")
+                ladder_market = st.selectbox(
+                    "Market ladder", markets, key="player_ladder_market"
                 )
-                st.warning(
-                    "Projection/model structure is unchanged. v2.6 only improves "
-                    "minutes and pace feeding. Central EV alone still does not "
-                    "qualify a bet."
+                st.caption(
+                    f"Play-from price = the minimum decimal price that gives at least "
+                    f"{target_ev:.0%} model EV. Fair price alone is NOT labeled value. "
+                    f"The {reference_odds:.2f} columns above also show the line needed at a common market price."
+                )
+                st.dataframe(
+                    line_ladder(
+                        sim[ladder_market],
+                        center_line=model_line(sim[ladder_market])["line"],
+                        radius=3,
+                        target_ev=target_ev,
+                    ).round(3),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.info(
+                    "Use the sportsbook only as a comparison after the model is frozen: "
+                    "match its offered line to this ladder, then require at least the displayed play-from price."
                 )
         else:
             st.info("Select at least one player.")
@@ -1261,7 +1212,10 @@ with tab_audit:
 - Stable = 55/20/25; role-change = 35/20/45.
 - H2H receives 0% extra weight by default.
 - Opponent overall + opponent-by-position avoid double counting.
-- 3PM is generated from volume and regressed efficiency.
+- Position matchup is applied to PTS/REB/AST/3PA/FTA; 3P%/2P% position effects are heavily shrinked.
+- 3PM is generated from 3PA volume and regressed efficiency, never raw L5 makes.
+- Confirmed teammate absences can reweight historical same-role games INSIDE the existing buckets.
+- Fair price is break-even only; Play-from price adds the selected target-EV buffer.
 - Joint Monte Carlo / stress logic remains intact.
 
 **New feeding layer**
@@ -1275,6 +1229,7 @@ with tab_audit:
 - Pace control is fitted from completed WNBA games, with a mild ridge prior
   rather than fixed 50/50.
 - The exact same projected possessions feed Team Markets and Player Props.
+- Team BLK ability is learned per opponent 2PA and regularized; misses are only a logical cap, not the denominator.
 - Player pace adjustment is today's game pace / that player's historical
   pace environment, so pace is applied once rather than double-counted.
 - Market total/handicap are audit-only in v2.6.
