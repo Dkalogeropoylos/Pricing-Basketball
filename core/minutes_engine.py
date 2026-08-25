@@ -533,3 +533,41 @@ def project_team_minutes(
         "Projected Min", ascending=False
     ).reset_index(drop=True)
 
+
+
+# ---------------------------------------------------------------------
+# Public team-context helpers used by Team Markets
+# ---------------------------------------------------------------------
+def rotation_regime_for_team(
+    manual_context: dict,
+    team_name: str,
+    team_abbr: str,
+) -> str:
+    """Public wrapper so Team Markets and Player Props use the same regime parser."""
+    return _rotation_regime(manual_context, team_name, team_abbr)
+
+
+def rotation_similarity_weights(
+    player_db: pd.DataFrame,
+    current_pool: pd.DataFrame,
+    team_abbr: str,
+    manual_context: dict,
+) -> Dict[str, float]:
+    """
+    Current-rotation similarity modifier by historical GAME_ID.
+
+    This is an INNER-bucket modifier only. It does not create another sample
+    and therefore does not double count Old/G6-10/L5 outer weights.
+    The same 0.55 + 0.45*Jaccard structure used by the minutes engine is reused
+    here so team-market history is softly tilted toward games with a more
+    comparable rotation, especially after fresh OUT/IN changes.
+    """
+    current = _current_rotation_set(
+        player_db, current_pool, team_abbr, manual_context
+    )
+    historical = _historical_rotation_sets(player_db, team_abbr)
+    out: Dict[str, float] = {}
+    for gid, hist in historical.items():
+        sim = _jaccard(current, hist)
+        out[str(gid)] = 0.55 + 0.45 * sim
+    return out

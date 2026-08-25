@@ -12,14 +12,19 @@ from providers.router import get_advanced_provider
 from core.cleaning import clean_player_log, clean_team_log
 from core.buckets import WeightConfig
 from core.player_model import PlayerContext, build_player_profile, simulate_player
-from core.team_model import TeamContext, build_team_profile, simulate_team
-from core.pricing import price, market_table
+from core.team_model import (
+    TeamContext, build_team_profile, simulate_game,
+    team_location_modifiers, h2h_team_audit,
+)
+from core.pricing import price, auto_market_table, model_line, most_market
 from core.matchup import (
     opponent_allowed_profile,
     player_matchup_modifiers,
     team_matchup_modifiers,
 )
-from core.minutes_engine import project_team_minutes
+from core.minutes_engine import (
+    project_team_minutes, rotation_regime_for_team, rotation_similarity_weights,
+)
 from core.pace_engine import (
     project_game_pace,
     player_historical_pace_environment,
@@ -31,10 +36,10 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.7.2")
+st.title("🏀 Basketball Pricing Engine v2.8.0")
 st.caption(
-    "Trader overrides • Learned role-aware redistribution • Rotation-similarity minutes • Shared fitted pace • "
-    "No L5/L10 overlap • Existing value model preserved"
+    "Trader overrides • Rotation-aware minutes • Coupled two-team markets • Auto model lines/fair prices • "
+    "Shared fitted pace • No overlapping recent samples"
 )
 
 
@@ -64,11 +69,16 @@ def reset_context_widgets():
         "3role_",
         "ftarole_",
         "sel_override_",
+        "home_team_mod_",
+        "away_team_mod_",
     )
     for key in list(st.session_state.keys()):
         if any(str(key).startswith(p) for p in prefixes):
             del st.session_state[key]
     st.session_state.pop("selected_player_board", None)
+    st.session_state.pop("team_game_sim", None)
+    st.session_state.pop("home_team_weighting_mode", None)
+    st.session_state.pop("away_team_weighting_mode", None)
 
 
 def context_role(manual_context, player_name):
@@ -169,7 +179,7 @@ with tab_game:
                 st.session_state["sdv_data"] = pack
                 for k in [
                     "game_setup", "opp_profile_home", "opp_profile_away",
-                    "pace_projection", "team_sim", "player_sim",
+                    "pace_projection", "team_sim", "team_game_sim", "player_sim",
                     "selected_player_board",
                 ]:
                     st.session_state.pop(k, None)
@@ -215,6 +225,7 @@ with tab_game:
                 "season": int(season),
             }
             st.session_state["game_setup"] = setup
+            reset_context_widgets()
             st.session_state["opp_profile_home"] = opponent_allowed_profile(
                 team_db, setup["home_abbr"]
             )
@@ -229,6 +240,7 @@ with tab_game:
             )
             st.session_state["pace_mode"] = "AUTO"
             st.session_state.pop("team_sim", None)
+            st.session_state.pop("team_game_sim", None)
             st.session_state.pop("selected_player_board", None)
             st.success(
                 f"Loaded {setup['away_abbr']} @ {setup['home_abbr']}"
@@ -368,7 +380,7 @@ with tab_game:
 # TEAM MARKETS
 # =====================================================================
 with tab_team:
-    st.subheader("Team Markets")
+    st.subheader("Team Markets — coupled game engine")
 
     setup = st.session_state.get("game_setup")
     shared_pace = current_game_pace()
@@ -378,154 +390,347 @@ with tab_team:
     elif not setup or shared_pace is None:
         st.info("Set the matchup in Game Setup first.")
     else:
-        side = st.radio(
-            "Team to price",
-            ["Away", "Home"],
-            horizontal=True,
-            key="team_side",
+        manual_context = st.session_state.get("game_context", {})
+        provider = SportsDataverseWNBA()
+        pool = provider.current_player_pool(player_db)
+
+        home_log = clean_team_log(
+            team_db[team_db["TEAM_ID"] == setup["home_id"]].copy()
+        )
+        away_log = clean_team_log(
+            team_db[team_db["TEAM_ID"] == setup["away_id"]].copy()
         )
 
-        if side == "Away":
-            team_abbr, team_id = setup["away_abbr"], setup["away_id"]
-            opp_abbr = setup["home_abbr"]
-            opp_profile = st.session_state["opp_profile_home"]
-        else:
-            team_abbr, team_id = setup["home_abbr"], setup["home_id"]
-            opp_abbr = setup["away_abbr"]
-            opp_profile = st.session_state["opp_profile_away"]
-
-        team_log = clean_team_log(
-            team_db[team_db["TEAM_ID"] == team_id].copy()
+        # AUTO regime comes from the same JSON parser as the Minutes Engine.
+        home_regime_auto = rotation_regime_for_team(
+            manual_context, setup["home_name"], setup["home_abbr"]
+        )
+        away_regime_auto = rotation_regime_for_team(
+            manual_context, setup["away_name"], setup["away_abbr"]
         )
 
-        regime = st.radio(
-            "Team sample weighting",
-            ["Stable 55/20/25", "Role change 35/20/45"],
-            horizontal=True,
-            key="team_regime",
+        st.markdown(
+            f"### {setup['away_abbr']} @ {setup['home_abbr']}"
         )
-        cfg = (
-            WeightConfig.stable()
-            if regime.startswith("Stable")
-            else WeightConfig.role_change()
-        )
-
-        profile, audit = build_team_profile(team_log, cfg)
-        auto = team_matchup_modifiers(opp_profile)
-
-        st.markdown(f"### {team_abbr} vs {opp_abbr}")
         st.info(
-            f"Projected possessions = **{shared_pace:.2f}** "
-            "(shared with Player Props)"
+            f"Shared projected possessions: **{shared_pace:.2f}**. "
+            "Both teams are simulated in the SAME game state, so totals, "
+            "rebounds, steals, blocks and 'team with most' markets are coherent."
         )
 
-        c1,c2 = st.columns(2)
+        with st.expander("Team sample weighting / trader override", expanded=False):
+            st.caption(
+                "AUTO reads rotation_regime from game_context.json. Stable = "
+                "55/20/25; role_change = 35/20/45. Rotation similarity then "
+                "acts only INSIDE each non-overlapping bucket, not as a second sample."
+            )
+            c1, c2 = st.columns(2)
+            home_mode = c1.selectbox(
+                f"{setup['home_abbr']} weighting",
+                ["AUTO", "Stable 55/20/25", "Role change 35/20/45"],
+                key="home_team_weighting_mode",
+            )
+            away_mode = c2.selectbox(
+                f"{setup['away_abbr']} weighting",
+                ["AUTO", "Stable 55/20/25", "Role change 35/20/45"],
+                key="away_team_weighting_mode",
+            )
+
+        def resolve_cfg(mode, auto_regime):
+            if mode.startswith("Stable"):
+                return WeightConfig.stable(), "stable"
+            if mode.startswith("Role"):
+                return WeightConfig.role_change(), "role_change"
+            return (
+                (WeightConfig.role_change(), "role_change")
+                if auto_regime == "role_change"
+                else (WeightConfig.stable(), "stable")
+            )
+
+        home_cfg, home_regime = resolve_cfg(home_mode, home_regime_auto)
+        away_cfg, away_regime = resolve_cfg(away_mode, away_regime_auto)
+
+        # Current-rotation similarity is learned from player participation and
+        # applied as an inner historical-game modifier. OUT players are already
+        # removed from today's rotation signature, so no second injury penalty.
+        home_game_weights = rotation_similarity_weights(
+            player_db, pool, setup["home_abbr"], manual_context
+        )
+        away_game_weights = rotation_similarity_weights(
+            player_db, pool, setup["away_abbr"], manual_context
+        )
+
+        home_profile, home_audit = build_team_profile(
+            home_log, home_cfg,
+            league_team_logs=team_db,
+            game_weights=home_game_weights,
+        )
+        away_profile, away_audit = build_team_profile(
+            away_log, away_cfg,
+            league_team_logs=team_db,
+            game_weights=away_game_weights,
+        )
+
+        # Opponent overall allowance is the matchup base. Team Markets do not
+        # add a positional sample on top, avoiding the player-model style double count.
+        home_opp = st.session_state["opp_profile_away"]
+        away_opp = st.session_state["opp_profile_home"]
+        home_auto = team_matchup_modifiers(home_opp)
+        away_auto = team_matchup_modifiers(away_opp)
+
+        # Small shrinked location correction, never a second full sample.
+        home_loc, home_loc_audit = team_location_modifiers(
+            home_log, True, league_team_logs=team_db
+        )
+        away_loc, away_loc_audit = team_location_modifiers(
+            away_log, False, league_team_logs=team_db
+        )
+
+        def combined_mods(auto, loc):
+            return {
+                "3PA": float(auto.get("3PA", 1.0) * loc.get("3PA", 1.0)),
+                "2PA": float(auto.get("2PA", 1.0) * loc.get("2PA", 1.0)),
+                "FTA": float(auto.get("FTA", 1.0) * loc.get("FTA", 1.0)),
+                "TOV": float(auto.get("TOV", 1.0) * loc.get("TOV", 1.0)),
+                "OREB": float(auto.get("OREB", 1.0) * loc.get("OREB", 1.0)),
+                "AST": float(auto.get("AST", 1.0) * loc.get("AST", 1.0)),
+                "PF": float(auto.get("PF", 1.0) * loc.get("PF", 1.0)),
+                "DREB": float(loc.get("DREB", 1.0)),
+                "STL": float(loc.get("STL", 1.0)),
+                "BLK": float(loc.get("BLK", 1.0)),
+            }
+
+        home_mod = combined_mods(home_auto, home_loc)
+        away_mod = combined_mods(away_auto, away_loc)
+
+        with st.expander("Automatic matchup/location modifiers — optional trader override", expanded=False):
+            st.caption(
+                "Leave these untouched for full AUTO. Opponent allowance is shrinked; "
+                "home/away is a small correction. Shooting percentage is NOT set by L5 hot/cold results."
+            )
+
+            def modifier_editor(prefix, team_abbr, mods):
+                cols = st.columns(5)
+                out = {}
+                keys = ["3PA","2PA","FTA","TOV","OREB","AST","PF","DREB","STL","BLK"]
+                for i, key in enumerate(keys):
+                    out[key] = cols[i % 5].number_input(
+                        f"{team_abbr} {key}",
+                        min_value=0.70, max_value=1.30,
+                        value=float(mods[key]), step=0.01,
+                        key=f"{prefix}_{key}",
+                    )
+                return out
+
+            st.markdown(f"**{setup['away_abbr']}**")
+            away_mod = modifier_editor("away_team_mod", setup["away_abbr"], away_mod)
+            st.markdown(f"**{setup['home_abbr']}**")
+            home_mod = modifier_editor("home_team_mod", setup["home_abbr"], home_mod)
+
+        pace_obj = st.session_state["pace_projection"]
+        c1, c2 = st.columns(2)
         poss_sd = c1.number_input(
             "Possession SD",
-            1.0,8.0,
-            float(st.session_state["pace_projection"].sd),
-            0.25,
-            key=f"poss_sd_{team_abbr}",
+            min_value=1.0, max_value=8.0,
+            value=float(pace_obj.sd), step=0.25,
+            key="game_team_poss_sd",
         )
         n = c2.select_slider(
-            "Simulations",
-            [25_000,50_000,100_000,250_000,500_000],
+            "Game simulations",
+            [25_000, 50_000, 100_000, 250_000, 500_000],
             100_000,
-            key=f"team_n_{team_abbr}",
+            key="game_team_sims",
         )
 
-        cols = st.columns(7)
-        three_pa = cols[0].number_input("3PA",.70,1.30,float(auto["3PA"]),.01,key=f"t3pa_{team_abbr}")
-        two_pa = cols[1].number_input("2PA",.70,1.30,float(auto["2PA"]),.01,key=f"t2pa_{team_abbr}")
-        fta = cols[2].number_input("FTA",.70,1.30,float(auto["FTA"]),.01,key=f"tfta_{team_abbr}")
-        tov = cols[3].number_input("TOV",.70,1.30,float(auto["TOV"]),.01,key=f"ttov_{team_abbr}")
-        oreb = cols[4].number_input("OREB",.70,1.30,float(auto["OREB"]),.01,key=f"toreb_{team_abbr}")
-        ast = cols[5].number_input("AST",.70,1.30,float(auto["AST"]),.01,key=f"tast_{team_abbr}")
-        pf = cols[6].number_input("PF",.70,1.30,float(auto["PF"]),.01,key=f"tpf_{team_abbr}")
-
-        with st.expander("Opponent modifier audit"):
-            st.dataframe(
-                opp_profile["audit"].round(4),
-                use_container_width=True,
+        def make_ctx(mod):
+            return TeamContext(
+                projected_possessions=float(shared_pace),
+                possessions_sd=float(poss_sd),
+                three_pa=float(mod["3PA"]),
+                two_pa=float(mod["2PA"]),
+                fta=float(mod["FTA"]),
+                tov=float(mod["TOV"]),
+                oreb=float(mod["OREB"]),
+                ast=float(mod["AST"]),
+                pf=float(mod["PF"]),
+                dreb=float(mod["DREB"]),
+                stl=float(mod["STL"]),
+                blk=float(mod["BLK"]),
             )
 
-        ctx = TeamContext(
-            projected_possessions=shared_pace,
-            possessions_sd=poss_sd,
-            three_pa=three_pa,
-            two_pa=two_pa,
-            fta=fta,
-            tov=tov,
-            oreb=oreb,
-            ast=ast,
-            pf=pf,
-        )
+        home_ctx = make_ctx(home_mod)
+        away_ctx = make_ctx(away_mod)
 
         fingerprint = (
-            team_abbr, shared_pace, poss_sd, regime,
-            three_pa,two_pa,fta,tov,oreb,ast,pf,int(n)
+            setup["home_abbr"], setup["away_abbr"], float(shared_pace),
+            float(poss_sd), home_regime, away_regime,
+            tuple(round(home_mod[k], 4) for k in sorted(home_mod)),
+            tuple(round(away_mod[k], 4) for k in sorted(away_mod)),
+            int(n),
         )
 
-        if st.button(
-            "Run team Monte Carlo",
-            type="primary",
-            key=f"run_team_{team_abbr}",
-        ):
-            sim = simulate_team(profile,ctx,int(n),seed=101)
-            sn = min(60_000,max(20_000,int(n)//4))
-            low = simulate_team(
-                profile,ctx,sn,seed=102,opportunity_mult=.95
+        if st.button("Run full-game Monte Carlo", type="primary", key="run_full_team_game"):
+            home_sim, away_sim = simulate_game(
+                home_profile, away_profile, home_ctx, away_ctx,
+                int(n), seed=801,
             )
-            high = simulate_team(
-                profile,ctx,sn,seed=103,opportunity_mult=1.05
+            sn = min(80_000, max(25_000, int(n)//4))
+            low_mult = float(pace_obj.low / shared_pace) if shared_pace else 0.96
+            high_mult = float(pace_obj.high / shared_pace) if shared_pace else 1.04
+            home_low, away_low = simulate_game(
+                home_profile, away_profile, home_ctx, away_ctx,
+                sn, seed=802, opportunity_mult=low_mult,
             )
-            st.session_state["team_sim"] = (
-                fingerprint,sim,low,high
+            home_high, away_high = simulate_game(
+                home_profile, away_profile, home_ctx, away_ctx,
+                sn, seed=803, opportunity_mult=high_mult,
             )
-            st.session_state["team_audit"] = audit
+            st.session_state["team_game_sim"] = {
+                "fingerprint": fingerprint,
+                "home": home_sim, "away": away_sim,
+                "home_low": home_low, "away_low": away_low,
+                "home_high": home_high, "away_high": away_high,
+            }
 
-        pack = st.session_state.get("team_sim")
-        if pack and pack[0] == fingerprint:
-            _,sim,low,high = pack
+        pack = st.session_state.get("team_game_sim")
+        if pack and pack.get("fingerprint") == fingerprint:
+            home_sim = pack["home"]
+            away_sim = pack["away"]
+            home_low = pack["home_low"]
+            away_low = pack["away_low"]
+            home_high = pack["home_high"]
+            away_high = pack["away_high"]
+
             markets = [
-                "PTS","3PA","3PM","2PA","2PM","FTA",
-                "TOV","OREB","AST","STL","BLK","PF"
+                "PTS","FGA","FGM","3PA","3PM","2PA","2PM",
+                "FTA","FTM","REB","OREB","DREB","AST","STL",
+                "BLK","TOV","PF",
             ]
-            st.dataframe(
-                market_table(sim,low,high,markets).round(2),
-                use_container_width=True,
+
+            total_sim = home_sim[markets].add(away_sim[markets], fill_value=0)
+            total_low = home_low[markets].add(away_low[markets], fill_value=0)
+            total_high = home_high[markets].add(away_high[markets], fill_value=0)
+
+            st.markdown("### Automatic model lines + fair prices")
+            st.caption(
+                "Example: a projection such as 30.7 is converted from the full "
+                "simulated distribution to the half-point line that is closest "
+                "to a 50/50 model market. Fair prices come from the simulation, "
+                "not from rounding 1 / mean."
             )
 
-            a,b,c,d = st.columns(4)
-            market = a.selectbox(
-                "Market", markets, key=f"team_market_{team_abbr}"
+            subtabs = st.tabs([
+                setup["away_abbr"], setup["home_abbr"], "GAME TOTALS", "TEAM WITH MOST"
+            ])
+            with subtabs[0]:
+                st.dataframe(
+                    auto_market_table(away_sim, markets, away_low, away_high).round(3),
+                    use_container_width=True, hide_index=True,
+                )
+            with subtabs[1]:
+                st.dataframe(
+                    auto_market_table(home_sim, markets, home_low, home_high).round(3),
+                    use_container_width=True, hide_index=True,
+                )
+            with subtabs[2]:
+                st.dataframe(
+                    auto_market_table(total_sim, markets, total_low, total_high).round(3),
+                    use_container_width=True, hide_index=True,
+                )
+            with subtabs[3]:
+                most_rows = []
+                for m in [
+                    "PTS","3PM","3PA","2PM","2PA","FTM","FTA",
+                    "REB","OREB","DREB","AST","STL","BLK","TOV","PF",
+                ]:
+                    pr = most_market(home_sim[m], away_sim[m])
+                    most_rows.append({
+                        "Market": m,
+                        f"P {setup['home_abbr']}": pr["p_home"],
+                        f"Fair {setup['home_abbr']}": pr["fair_home"],
+                        "P Tie": pr["p_tie"],
+                        "Fair Tie": pr["fair_tie"],
+                        f"P {setup['away_abbr']}": pr["p_away"],
+                        f"Fair {setup['away_abbr']}": pr["fair_away"],
+                    })
+                st.dataframe(
+                    pd.DataFrame(most_rows).round(3),
+                    use_container_width=True, hide_index=True,
+                )
+
+            st.markdown("### Compare one bookmaker line")
+            c0, c1, c2, c3, c4 = st.columns(5)
+            scope = c0.selectbox(
+                "Scope", [setup["away_abbr"], setup["home_abbr"], "TOTAL"],
+                key="team_price_scope",
             )
-            line = b.number_input(
+            market = c1.selectbox("Market", markets, key="team_price_market")
+
+            if scope == setup["away_abbr"]:
+                target, low_target, high_target = away_sim, away_low, away_high
+            elif scope == setup["home_abbr"]:
+                target, low_target, high_target = home_sim, home_low, home_high
+            else:
+                target, low_target, high_target = total_sim, total_low, total_high
+
+            ml = model_line(target[market])
+            line = c2.number_input(
                 "Book line",
-                value=float(round(sim[market].mean() - 0.5, 1)),
-                step=.5,
-                key=f"team_line_{team_abbr}_{market}"
+                value=float(ml["line"]), step=0.5,
+                key=f"team_book_line_{scope}_{market}",
             )
-            oo = c.number_input(
-                "Over odds",1.01,20.0,1.90,.01,
-                key=f"team_oo_{team_abbr}_{market}"
+            oo = c3.number_input(
+                "Over odds", 1.01, 20.0, 1.90, 0.01,
+                key=f"team_book_oo_{scope}_{market}",
             )
-            uo = d.number_input(
-                "Under odds",1.01,20.0,1.90,.01,
-                key=f"team_uo_{team_abbr}_{market}"
+            uo = c4.number_input(
+                "Under odds", 1.01, 20.0, 1.90, 0.01,
+                key=f"team_book_uo_{scope}_{market}",
             )
 
-            p = price(sim[market],line,oo,uo)
-            pl = price(low[market],line,oo,uo)
-            ph = price(high[market],line,oo,uo)
-
+            p = price(target[market], line, oo, uo)
+            pl = price(low_target[market], line, oo, uo)
+            ph = price(high_target[market], line, oo, uo)
             st.dataframe(pd.DataFrame([{
+                "Projection": float(target[market].mean()),
+                "Model line": ml["line"],
                 **p,
-                "bear_p_over":pl["p_over"],
-                "bull_p_over":ph["p_over"],
-                "bear_p_under":pl["p_under"],
-                "bull_p_under":ph["p_under"],
-            }]).round(4), use_container_width=True)
+                "Low p_over": pl["p_over"],
+                "High p_over": ph["p_over"],
+                "Low p_under": pl["p_under"],
+                "High p_under": ph["p_under"],
+            }]).round(4), use_container_width=True, hide_index=True)
+
+            with st.expander("Model audit: buckets / location / H2H / conservation"):
+                st.markdown(f"**{setup['away_abbr']} buckets — {away_regime}**")
+                st.dataframe(away_audit.round(4), use_container_width=True, hide_index=True)
+                st.markdown(f"**{setup['home_abbr']} buckets — {home_regime}**")
+                st.dataframe(home_audit.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown("**Location correction (small shrink only)**")
+                ca, ch = st.columns(2)
+                ca.dataframe(away_loc_audit.round(4), use_container_width=True, hide_index=True)
+                ch.dataframe(home_loc_audit.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown("**H2H — audit only, ZERO extra numerical weight**")
+                h2h = h2h_team_audit(team_db, setup["home_abbr"], setup["away_abbr"])
+                if h2h.empty:
+                    st.caption("No same-season H2H rows found.")
+                else:
+                    st.dataframe(h2h, use_container_width=True, hide_index=True)
+
+                # Explicit conservation checks from the actual simulations.
+                checks = {
+                    "Away FGA = 2PA + 3PA": bool(((away_sim["FGA"] - away_sim["2PA"] - away_sim["3PA"]) == 0).all()),
+                    "Home FGA = 2PA + 3PA": bool(((home_sim["FGA"] - home_sim["2PA"] - home_sim["3PA"]) == 0).all()),
+                    "Away REB = OREB + DREB": bool(((away_sim["REB"] - away_sim["OREB"] - away_sim["DREB"]) == 0).all()),
+                    "Home REB = OREB + DREB": bool(((home_sim["REB"] - home_sim["OREB"] - home_sim["DREB"]) == 0).all()),
+                    "Away STL <= Home TOV": bool((away_sim["STL"] <= home_sim["TOV"]).all()),
+                    "Home STL <= Away TOV": bool((home_sim["STL"] <= away_sim["TOV"]).all()),
+                    "Away BLK <= Home missed 2PA": bool((away_sim["BLK"] <= (home_sim["2PA"]-home_sim["2PM"])).all()),
+                    "Home BLK <= Away missed 2PA": bool((home_sim["BLK"] <= (away_sim["2PA"]-away_sim["2PM"])).all()),
+                }
+                st.json(checks)
 
 
 # =====================================================================
@@ -892,6 +1097,13 @@ with tab_player:
                 )
                 detail = st.session_state["selected_player_details"][pname]
                 sim = detail["sim"]
+                markets = ["PTS","REB","AST","3PM","PRA","PR","PA","AR"]
+
+                st.markdown("#### Automatic model lines + fair prices")
+                st.dataframe(
+                    auto_market_table(sim, markets).round(3),
+                    use_container_width=True, hide_index=True,
+                )
 
                 with st.expander("Model audit", expanded=False):
                     st.write({
@@ -935,14 +1147,13 @@ with tab_player:
                             use_container_width=True,
                         )
 
-                markets = ["PTS","REB","AST","3PM","PRA","PR","PA","AR"]
                 rows = []
                 for m in markets:
                     with st.expander(m, expanded=m in ["PTS","REB","AST","3PM"]):
                         c1,c2,c3 = st.columns(3)
                         line = c1.number_input(
                             f"{pname} {m} book line",
-                            value=float(round(sim[m].mean() - .5, 1)),
+                            value=float(model_line(sim[m])["line"]),
                             step=.5,
                             key=f"deep_line_{pname}_{m}",
                         )

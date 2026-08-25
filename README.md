@@ -1,218 +1,99 @@
-# Basketball Pricing Engine v2.6
+# Basketball Pricing Engine v2.8.0 — Coupled Team Markets + Auto Fair Lines
 
-v2.6 preserves the existing value model and upgrades the **feeding layer**.
+Apply this cumulative patch **on top of the working v2.7.2 project** (the project that already contains `providers/sportsdataverse_wnba.py`).
 
-## Core model intentionally unchanged
+## What v2.8 fixes
 
-The following remain fixed:
-- Old / Games 6-10 / L5 non-overlap
-- Stable 55/20/25
-- Role-change 35/20/45
-- H2H = zero extra weight by default
-- opponent overall + positional normalization
-- efficiency regression
-- joint Monte Carlo
-- stress testing
-- model-implied fair odds / EV
+### 1. Team Markets are now a coupled two-team game simulation
 
-## Trader layer
+The previous engine simulated one team at a time. That was acceptable for basic offensive counts, but it was structurally wrong for defensive/rebound and relative markets.
 
-The model does **not** guess injuries.
+v2.8 simulates HOME and AWAY inside the same game state and enforces:
 
-Trader context can declare:
-- OUT / GTD
-- projected starters
-- projected minute overrides
-- role redistribution
-- rotation regime (`stable` or `role_change`)
+- `FGA = 2PA + 3PA`
+- `PTS = 2*2PM + 3*3PM + FTM`
+- `REB = OREB + DREB`
+- OREB comes from the team's own missed FGs
+- DREB comes from opponent misses not recovered by opponent OREB
+- STL is a subset of opponent TOV
+- BLK is a subset of opponent missed 2PA
 
-If no minute override is supplied, AUTO minutes are used.
+This fixes the v2.7.2 direction errors where STL was linked to the same team's TOV and BLK to the same team's 2PA.
 
-## Minutes Engine
+### 2. No new recent-sample overlap
 
-AUTO player minutes use:
-1. The same non-overlapping Old / G6-10 / L5 buckets.
-2. Rotation similarity **inside** each bucket.
-3. Historical starter match.
-4. OT downweighting.
-5. Large-blowout downweighting.
-6. Recent median stabilization.
-7. Low / central / high minute uncertainty.
+The outer protocol remains:
 
-The full team rotation is then constrained to:
+- Stable: Old / G6-10 / L5 = `55 / 20 / 25`
+- Role change: Old / G6-10 / L5 = `35 / 20 / 45`
 
-`5 players × 40 regulation minutes = 200 team-minutes`
+Current-rotation Jaccard similarity is now an **inner weight inside each existing bucket**. It does not create a second sample and does not change the outer bucket weights.
 
-OUT players are fixed at zero.
-Trader or metadata overrides are fixed first.
-The remaining AUTO players absorb the remaining team minutes proportionally.
+OUT players are already removed from today's rotation signature, so v2.8 does not add a second full injury penalty.
 
-This means a trader can override one player's minutes without creating an
-impossible 215-minute team rotation.
+### 3. Shooting efficiency is regressed, not copied from L5
 
-## Selected players UI
+Team 3P%, 2P% and FT% use larger-sample attempt-based shrinkage, matching the player-engine philosophy. Recent hot/cold shooting is not treated as future true shooting ability.
 
-The app projects the entire rotation in the background but lets the trader
-multiselect only the players they want to simulate.
+### 4. Small automatic home/away correction
 
-For selected players:
-- 0 minute override = AUTO
-- any positive override = TRADER
-- metadata projected minutes are used if no UI override exists
+If location metadata exists (`IS_HOME`, `HOME_AWAY`, `LOCATION`, or `MATCHUP`), a small shrinked home/away modifier is applied. Only 20% of the split deviation is used and the modifier is capped at +/-6%, so the location split cannot dominate the main sample.
 
-## Pace Engine
+If location metadata is unavailable or the split has fewer than five games, the modifier stays neutral.
 
-Team pace is first estimated using the existing non-overlapping weighting.
+### 5. Automatic model line + fair price
 
-Historical WNBA games are then used to fit relative **fast-side vs slow-side**
-pace control. The fit is ridge-shrunk toward a mild fast-side prior, instead of
-hardcoding a 50/50 midpoint or a fixed 60/40 rule.
+For every simulated market the app now reports:
 
-The output is:
-- home pace
-- away pace
-- fitted fast/slow weights
-- central possessions
-- low/high band
-- empirical fit RMSE
+- Projection mean
+- Median
+- **Model line** (half-point sportsbook line chosen from the simulated distribution, not by blindly rounding the mean)
+- P(Over) / fair Over
+- P(Under) / fair Under
+- low/high pace stress projections
 
-The exact same central possessions feed:
-- Team Markets
-- Player Props
+So a projection such as `30.7` is automatically translated into a practical `x.5` line and fair prices from the full distribution.
 
-### Player pace adjustment
+The same automatic line/fair table is shown for selected PLAYER props, including PTS, using the existing minutes engine.
 
-Player history is per-minute, so each player receives:
+### 6. Push-aware fair pricing fixed
 
-`today projected possessions / player's historical possession environment`
+For integer bookmaker lines, fair odds now correctly account for pushes:
 
-This applies matchup pace once. It avoids adding a second pace modifier on top
-of historical rates that already came from fast or slow games.
+`fair odds = (1 - p_push) / p_win`
 
-## Total / handicap
+The old `1 / p_win` formula was only correct when push probability was zero.
 
-Sportsbook total and spread are **audit-only** in v2.6.
+### 7. New automatically priced team scopes
 
-Why:
-- a high total can come from pace, efficiency, or both;
-- our team projections already create their own scoring expectation;
-- feeding the sportsbook total directly back into the same model would be circular.
+One Monte Carlo run now creates:
 
-A separate calibrated market-prior / blowout layer can be added later without
-contaminating the core projection.
+- Away team markets
+- Home team markets
+- Game totals
+- Team-with-most 3-way probabilities/fair odds
 
-## Historical provider
+Supported team outputs include:
 
-WNBA historical data remains SportsDataverse GitHub release data.
-No stats.nba.com call is required from Streamlit Cloud.
+`PTS, FGA, FGM, 3PA, 3PM, 2PA, 2PM, FTA, FTM, REB, OREB, DREB, AST, STL, BLK, TOV, PF`
 
+### 8. H2H remains audit-only
 
-## v2.7 — historically learned role-aware minute redistribution
+Same-season H2H is displayed in the model audit but receives **zero extra numerical weight**, so those games are not counted again on top of the historical buckets.
 
-v2.7 removes proportional roster-wide scaling for explicit minute overrides.
+## Files changed
 
-### Learned replacement matrix
+- `streamlit_app.py`
+- `core/team_model.py`
+- `core/pricing.py`
+- `core/minutes_engine.py`
 
-For every current-roster teammate pair A -> B, the engine learns whether B
-historically gains minutes when A loses minutes.
+Optional offline check:
 
-The score combines:
+```bash
+python tests/team_engine_smoke.py
+```
 
-1. Negative continuous minute slope between A and B.
-2. On/off-like lift: how much B gains when A is at the low end of A's minute
-   distribution versus A's normal/high-minute games.
-3. Sample-size confidence.
-4. A small G/F/C positional prior only as a shrinkage fallback when history is
-   thin.
+## Important
 
-Each focal player's teammate scores are normalized to a row that sums to 1.
-
-Example interpretation:
-
-`Canada -> Backup Guard = 0.48`
-
-means that, among eligible non-fixed teammates, the historical rotation model
-expects roughly 48% of a Canada minute override to be absorbed by that player,
-subject to 0-40 minute constraints.
-
-### Explicit override flow
-
-1. Build the context-aware AUTO rotation.
-2. Apply the 200-minute team constraint.
-3. Treat trader/metadata projected-minute targets as deviations from AUTO.
-4. Transfer the delta through the learned replacement row.
-5. Only if the learned recipients hit 0/40 minute bounds does the engine use a
-   broader constraint fallback.
-6. Team minutes remain exactly 200.
-
-### Avoiding injury double counting
-
-OUT availability is already part of the current-rotation similarity engine:
-OUT players are removed from today's rotation signature, and historical games
-with similar rotations receive more weight.
-
-Therefore v2.7 does **not** apply a second full pairwise redistribution on top
-of the same OUT absence. That would double count the injury effect.
-
-The learned matrix is used primarily for explicit trader/metadata minute
-targets relative to the context-aware AUTO rotation.
-
-### Audit
-
-The Streamlit UI now shows:
-- Auto Baseline Min
-- final Projected Min
-- Override Delta
-- exact teammate minute impact of each override
-- learned replacement weights
-- negative-slope signal
-- on/off signal
-- sample confidence
-- positional fallback prior
-
-The underlying prop/value model is unchanged.
-
-
-## v2.7.1 — pandas attrs concat fix
-
-v2.7 stores minute-redistribution audit tables in `DataFrame.attrs`.
-Recent pandas versions attempt to compare attrs during `pd.concat`, and nested
-DataFrames make that comparison ambiguous (`ValueError`).
-
-v2.7.1 preserves the audit attrs on the original team minute frames, but strips
-attrs from temporary copies used only for concatenation.
-
-No projection, minutes, redistribution, pace, Monte Carlo, or pricing logic was
-changed.
-
-
-## v2.7.2 — team-market baseline conservation fix
-
-Two team simulation bugs were fixed without changing the established pricing
-protocol.
-
-### 1. Turnovers were counted twice
-
-Historical `3PA/poss` and `2PA/poss` were rates per TOTAL possession.
-The simulator then removed turnovers and applied those total-possession rates
-to the remaining live possessions. This reduced field-goal attempts by roughly
-another `(1 - TOV%)`.
-
-v2.7.2 derives conditional `3PA/live possession` and `2PA/live possession`
-rates from the same historical sample. Therefore the sequence remains:
-
-`possessions -> turnovers -> live possessions -> 3PA / 2PA`
-
-but a neutral simulation now reproduces the historical FGA-per-possession
-baseline rather than shrinking it a second time.
-
-### 2. OREB denominator was wrong for the simulation stage
-
-The simulator samples offensive rebounds from missed field goals. The previous
-conversion approximated OREB/FGA and applied that percentage to misses, which
-materially understated offensive rebounds.
-
-v2.7.2 stores and uses historical `OREB / missed FG`.
-
-No opponent modifiers, Old/G6-10/L5 weights, pace engine, minutes engine,
-Monte Carlo philosophy, or pricing logic were changed.
+Sportsbook total/spread remain audit-only. They are not fed back into the projection, so the model does not circularly reproduce the market it is trying to price.
