@@ -184,16 +184,16 @@ def _feat(
         # A steal is a subset of opponent turnovers.
         out["stl_per_opp_tov"] = _safe_div(own_stl, opp_tov, 0.55)
 
-        # A block is modeled as a subset of opponent missed 2PA. This keeps
-        # BLK tied to the correct side of the matchup and guarantees BLK does
-        # not exceed the relevant missed-shot opportunity.
-        out["blk_per_opp_2miss"] = _safe_div(own_blk, opp_2miss, 0.12)
+        # Learn block ability per opponent 2PA. Using opponent misses in the
+        # denominator confounds rim protection with opponent shooting luck.
+        out["blk_per_opp_2pa"] = _safe_div(own_blk, opp_a2, 0.075)
+        out["opp_2pa_att"] = opp_a2
     else:
         # Conservative fallbacks only if paired game rows are unavailable.
         out["dreb_capture"] = 0.94
         out["stl_per_opp_tov"] = 0.55
-        own_2miss_pp = out["two_pa_pp"] * (1.0 - (out["two_pct"] if np.isfinite(out["two_pct"]) else 0.51))
-        out["blk_per_opp_2miss"] = _safe_div(out["blk_pp"], max(own_2miss_pp, 0.05), 0.12)
+        out["blk_per_opp_2pa"] = _safe_div(out["blk_pp"], max(out["two_pa_pp"], 0.05), 0.075)
+        out["opp_2pa_att"] = out["two_att"]
 
     # Useful structural conversion rate for AST simulation.
     made_fg_pp = out["three_pa_pp"] * (out["three_pct"] if np.isfinite(out["three_pct"]) else 0.34) \
@@ -238,7 +238,7 @@ def build_team_profile(
         "fta_pp", "tov_pp", "oreb_pp", "dreb_pp", "oreb_per_miss",
         "ast_pp", "stl_pp", "blk_pp", "pf_pp",
         "assist_per_make", "dreb_capture", "stl_per_opp_tov",
-        "blk_per_opp_2miss",
+        "blk_per_opp_2pa",
     ]:
         p[key] = weighted_average_feature(feats, weights, key)
 
@@ -259,7 +259,18 @@ def build_team_profile(
     # Defensive rates need sensible bounds after weighted blending.
     p["dreb_capture"] = float(np.clip(p.get("dreb_capture", 0.94), 0.78, 0.995))
     p["stl_per_opp_tov"] = float(np.clip(p.get("stl_per_opp_tov", 0.55), 0.20, 0.90))
-    p["blk_per_opp_2miss"] = float(np.clip(p.get("blk_per_opp_2miss", 0.12), 0.02, 0.45))
+    recent_blk = float(p.get("blk_per_opp_2pa", 0.075))
+    stable_blk = _shrink(
+        full.get("blk_per_opp_2pa", np.nan),
+        full.get("opp_2pa_att", 0.0),
+        0.075,
+        120.0,
+    )
+    # Blocks are high-variance. Keep some role/recency signal but anchor the rate
+    # heavily to the larger sample rather than opponent missed-shot percentage.
+    p["blk_per_opp_2pa"] = float(np.clip(
+        0.35 * recent_blk + 0.65 * stable_blk, 0.02, 0.18
+    ))
     p["assist_per_make"] = float(np.clip(p.get("assist_per_make", 0.62), 0.25, 0.92))
 
     audit = []
@@ -331,7 +342,7 @@ def team_location_modifiers(
         "PF": "pf_pp",
         "DREB": "dreb_capture",
         "STL": "stl_per_opp_tov",
-        "BLK": "blk_per_opp_2miss",
+        "BLK": "blk_per_opp_2pa",
     }
     rows = []
     out = dict(neutral)
@@ -486,7 +497,7 @@ def simulate_game(
       - OREB is sampled from OWN misses
       - DREB is sampled from OPPONENT misses not already rebounded offensively
       - STL is a subset of OPPONENT turnovers
-      - BLK is a subset of OPPONENT missed 2PA
+      - BLK rate is learned per OPPONENT 2PA, then capped by actual 2P misses
       - REB = OREB + DREB
 
     This removes the old same-team STL/TOV and BLK/2PA direction errors and
@@ -551,17 +562,21 @@ def simulate_game(
     h_stl = rng.binomial(a["TOV"], h_stl_p)
     a_stl = rng.binomial(h["TOV"], a_stl_p)
 
-    # Blocks are a subset of OPPONENT missed 2PA.
+    # Blocks: estimate ability per opponent 2PA, not per opponent MISS.
+    # The old miss-denominator confounded rim protection with opponent shooting luck.
+    # Candidate blocks are generated from opponent 2PA and capped by actual misses.
     h_blk_p = np.clip(
-        home_profile.get("blk_per_opp_2miss", 0.12) * home_ctx.blk,
-        0.01, 0.60,
+        home_profile.get("blk_per_opp_2pa", 0.075) * home_ctx.blk,
+        0.01, 0.22,
     )
     a_blk_p = np.clip(
-        away_profile.get("blk_per_opp_2miss", 0.12) * away_ctx.blk,
-        0.01, 0.60,
+        away_profile.get("blk_per_opp_2pa", 0.075) * away_ctx.blk,
+        0.01, 0.22,
     )
-    h_blk = rng.binomial(a["2MISS"], h_blk_p)
-    a_blk = rng.binomial(h["2MISS"], a_blk_p)
+    h_blk_candidate = rng.binomial(a["2PA"], h_blk_p)
+    a_blk_candidate = rng.binomial(h["2PA"], a_blk_p)
+    h_blk = np.minimum(h_blk_candidate, a["2MISS"])
+    a_blk = np.minimum(a_blk_candidate, h["2MISS"])
 
     h["DREB"] = h_dreb
     a["DREB"] = a_dreb

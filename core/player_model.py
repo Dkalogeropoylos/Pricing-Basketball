@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import numpy as np
 import pandas as pd
 from core.buckets import WeightConfig, split_non_overlapping, active_weights, weighted_average_feature
@@ -11,26 +11,27 @@ class PlayerContext:
     projected_minutes: float
     minutes_sd: float = 2.0
 
-    # Central matchup pace relative to the pace already embedded in the
-    # player's historical per-minute rates. Random pace shock still sits
-    # around this central multiplier.
+    # Central matchup pace relative to historical pace already embedded in rates.
     pace_multiplier: float = 1.00
 
-    # opponent environment, 1.00 = neutral
+    # Opponent environment, already shrinked; 1.00 = neutral.
     opp_pts: float = 1.00
     opp_reb: float = 1.00
     opp_ast: float = 1.00
     opp_3pa: float = 1.00
     opp_fta: float = 1.00
+    # Shooting-efficiency context is deliberately much weaker than volume context.
+    opp_three_pct: float = 1.00
+    opp_two_pct: float = 1.00
 
-    # role redistribution
+    # Role redistribution / trader override.
     usage: float = 1.00
     creation: float = 1.00
     reb_role: float = 1.00
     three_role: float = 1.00
     fta_role: float = 1.00
 
-    # H2H context only: recommended range 0.90 - 1.10
+    # H2H context only: recommended range 0.90 - 1.10.
     h2h_pts: float = 1.00
     h2h_reb: float = 1.00
     h2h_ast: float = 1.00
@@ -41,27 +42,44 @@ def _safe_div(a, b, default=0.0):
     return float(a) / float(b) if b and np.isfinite(b) and b > 0 else default
 
 
-def _features(df: pd.DataFrame) -> Dict[str, float]:
+def _row_weights(df: pd.DataFrame, game_weights: Optional[Dict[str, float]]) -> np.ndarray:
+    if not game_weights or "GAME_ID" not in df.columns:
+        return np.ones(len(df), dtype=float)
+    return np.asarray(
+        [float(game_weights.get(str(gid), 1.0)) for gid in df["GAME_ID"]],
+        dtype=float,
+    )
+
+
+def _weighted_sum(series: pd.Series, weights: np.ndarray) -> float:
+    vals = pd.to_numeric(series, errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    return float(np.sum(vals * weights))
+
+
+def _features(df: pd.DataFrame, game_weights: Optional[Dict[str, float]] = None) -> Dict[str, float]:
     if df.empty:
         return {}
-    mins = float(df["MIN"].sum())
-    fga = float(df["FGA"].sum())
-    a3 = float(df["FG3A"].sum())
-    m3 = float(df["FG3M"].sum())
-    fgm = float(df["FGM"].sum())
-    fta = float(df["FTA"].sum())
-    ftm = float(df["FTM"].sum())
+    w = _row_weights(df, game_weights)
+    mins_arr = pd.to_numeric(df["MIN"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    mins = float(np.sum(mins_arr * w))
+    fga = _weighted_sum(df["FGA"], w)
+    a3 = _weighted_sum(df["FG3A"], w)
+    m3 = _weighted_sum(df["FG3M"], w)
+    fgm = _weighted_sum(df["FGM"], w)
+    fta = _weighted_sum(df["FTA"], w)
+    ftm = _weighted_sum(df["FTM"], w)
     a2 = max(fga - a3, 0.0)
     m2 = max(fgm - m3, 0.0)
     return {
         "games": len(df),
-        "min_pg": float(df["MIN"].mean()),
+        "effective_games": float(np.sum(w)),
+        "min_pg": float(np.average(mins_arr, weights=w)) if len(w) and np.sum(w) > 0 else np.nan,
         "two_pa_pm": _safe_div(a2, mins),
         "three_pa_pm": _safe_div(a3, mins),
         "fta_pm": _safe_div(fta, mins),
-        "reb_pm": _safe_div(df["REB"].sum(), mins),
-        "ast_pm": _safe_div(df["AST"].sum(), mins),
-        "pts_pm": _safe_div(df["PTS"].sum(), mins),
+        "reb_pm": _safe_div(_weighted_sum(df["REB"], w), mins),
+        "ast_pm": _safe_div(_weighted_sum(df["AST"], w), mins),
+        "pts_pm": _safe_div(_weighted_sum(df["PTS"], w), mins),
         "three_pct": _safe_div(m3, a3, np.nan),
         "two_pct": _safe_div(m2, a2, np.nan),
         "ft_pct": _safe_div(ftm, fta, np.nan),
@@ -77,19 +95,30 @@ def _shrink(obs, attempts, prior, prior_attempts):
     return float((obs * attempts + prior * prior_attempts) / (attempts + prior_attempts))
 
 
-def build_player_profile(df: pd.DataFrame, cfg: WeightConfig) -> Tuple[dict, pd.DataFrame]:
+def build_player_profile(
+    df: pd.DataFrame,
+    cfg: WeightConfig,
+    game_weights: Optional[Dict[str, float]] = None,
+) -> Tuple[dict, pd.DataFrame]:
+    """
+    Outer Old/G6-10/L5 weights remain non-overlapping. Optional teammate-absence
+    similarity is an INNER weight only, so it cannot become a fourth sample.
+    """
     x = df.sort_values("GAME_DATE").copy()
     buckets = split_non_overlapping(x)
     weights = active_weights(buckets, cfg)
-    feats = {k: _features(v) for k, v in buckets.items()}
+    feats = {k: _features(v, game_weights=game_weights) for k, v in buckets.items()}
 
     profile = {}
     for key in ["min_pg", "two_pa_pm", "three_pa_pm", "fta_pm", "reb_pm", "ast_pm", "pts_pm"]:
         profile[key] = weighted_average_feature(feats, weights, key)
 
-    full = _features(x)
-    # Larger-sample ability + league priors; no raw L5 shooting truth.
-    profile["three_pct"] = _shrink(full.get("three_pct", np.nan), full.get("three_att", 0), 0.340, 45)
+    # Shooting ability intentionally uses the larger unweighted sample. A same-role
+    # split changes opportunities/role first; it does not declare a hot L5 as true skill.
+    full = _features(x, game_weights=None)
+    # Slightly lighter 3P prior than before: elite/high-volume shooters are no longer
+    # pulled toward 34% as aggressively, while small samples remain regularized.
+    profile["three_pct"] = _shrink(full.get("three_pct", np.nan), full.get("three_att", 0), 0.340, 32)
     profile["two_pct"] = _shrink(full.get("two_pct", np.nan), full.get("two_att", 0), 0.510, 70)
     profile["ft_pct"] = _shrink(full.get("ft_pct", np.nan), full.get("ft_att", 0), 0.785, 40)
 
@@ -133,8 +162,10 @@ def simulate_player(profile: dict, ctx: PlayerContext, n=100_000, seed=1, opport
     a2 = rng.poisson(np.clip(lam2, 0.001, None))
     fta = rng.poisson(np.clip(lamft, 0.001, None))
 
-    p3 = np.clip(profile["three_pct"] + 0.035 * z_shoot, 0.02, 0.98)
-    p2 = np.clip(profile["two_pct"] + 0.026 * z_shoot, 0.02, 0.98)
+    p3_central = np.clip(profile["three_pct"] * ctx.opp_three_pct, 0.05, 0.70)
+    p2_central = np.clip(profile["two_pct"] * ctx.opp_two_pct, 0.15, 0.80)
+    p3 = np.clip(p3_central + 0.035 * z_shoot, 0.02, 0.98)
+    p2 = np.clip(p2_central + 0.026 * z_shoot, 0.02, 0.98)
     pft = np.clip(profile["ft_pct"] + 0.010 * z_shoot, 0.02, 0.98)
 
     m3 = rng.binomial(a3, p3)
@@ -152,7 +183,10 @@ def simulate_player(profile: dict, ctx: PlayerContext, n=100_000, seed=1, opport
     ast = rng.poisson(np.clip(lam_ast, 0.001, None))
     reb = rng.poisson(np.clip(lam_reb, 0.001, None))
 
-    out = pd.DataFrame({"MIN": mins, "PTS": pts, "REB": reb, "AST": ast, "3PM": m3, "3PA": a3, "FTA": fta})
+    out = pd.DataFrame({
+        "MIN": mins, "PTS": pts, "REB": reb, "AST": ast,
+        "3PM": m3, "3PA": a3, "FTA": fta,
+    })
     out["PRA"] = out.PTS + out.REB + out.AST
     out["PR"] = out.PTS + out.REB
     out["PA"] = out.PTS + out.AST
