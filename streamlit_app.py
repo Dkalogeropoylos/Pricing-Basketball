@@ -14,10 +14,10 @@ from core.buckets import WeightConfig
 from core.player_model import PlayerContext, build_player_profile, simulate_player
 from core.team_model import (
     TeamContext, build_team_profile, simulate_game,
-    team_location_modifiers, h2h_team_audit,
+    team_location_modifiers, h2h_team_audit, h2h_block_modifier,
 )
 from core.pricing import (
-    price, auto_market_table, model_line, most_market, line_ladder,
+    price, auto_market_table, model_line, most_market, most_market_calibrated, line_ladder,
     required_odds_for_ev,
 )
 from core.matchup import (
@@ -41,10 +41,10 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.9.0")
+st.title("🏀 Basketball Pricing Engine v2.10.0")
 st.caption(
     "Trader overrides • Rotation-aware minutes • Coupled two-team markets • Auto line ladders/play-from prices • "
-    "Same-role absence weighting • Position-aware matchup • No overlapping recent samples"
+    "Visible IN/OUT weighting • Calibrated team-with-most • Transparent BLK model • No overlapping recent samples"
 )
 
 
@@ -457,6 +457,15 @@ with tab_team:
                 ["AUTO", "Stable 55/20/25", "Role change 35/20/45"],
                 key="away_team_weighting_mode",
             )
+            rotation_similarity_enabled = st.toggle(
+                "AUTO: weight team history toward the current IN/OUT rotation",
+                value=True,
+                help=(
+                    "Historical games with a player-participation pattern closer to today's available rotation "
+                    "receive a soft inner weight. This never creates a fourth sample and can be switched off for audit."
+                ),
+                key="team_rotation_similarity_toggle",
+            )
 
         def resolve_cfg(mode, auto_regime):
             if mode.startswith("Stable"):
@@ -475,11 +484,15 @@ with tab_team:
         # Current-rotation similarity is learned from player participation and
         # applied as an inner historical-game modifier. OUT players are already
         # removed from today's rotation signature, so no second injury penalty.
-        home_game_weights = rotation_similarity_weights(
-            player_db, pool, setup["home_abbr"], manual_context
+        home_game_weights = (
+            rotation_similarity_weights(
+                player_db, pool, setup["home_abbr"], manual_context
+            ) if rotation_similarity_enabled else {}
         )
-        away_game_weights = rotation_similarity_weights(
-            player_db, pool, setup["away_abbr"], manual_context
+        away_game_weights = (
+            rotation_similarity_weights(
+                player_db, pool, setup["away_abbr"], manual_context
+            ) if rotation_similarity_enabled else {}
         )
 
         home_profile, home_audit = build_team_profile(
@@ -528,7 +541,7 @@ with tab_team:
                 "PF": float(auto.get("PF", 1.0) * loc.get("PF", 1.0)),
                 "DREB": float(loc.get("DREB", 1.0)),
                 "STL": float(loc.get("STL", 1.0)),
-                "BLK": float(loc.get("BLK", 1.0)),
+                "BLK": float(np.clip(auto.get("BLK", 1.0) * loc.get("BLK", 1.0), 0.90, 1.10)),
                 "3P_PCT": float(auto.get("3P_PCT", 1.0)),
                 "2P_PCT": float(auto.get("2P_PCT", 1.0)),
             }
@@ -560,6 +573,18 @@ with tab_team:
             st.markdown(f"**{setup['home_abbr']}**")
             home_mod = modifier_editor("home_team_mod", setup["home_abbr"], home_mod)
 
+        # H2H is already in the historical buckets. For BLK only, allow a TINY
+        # same-season correction (max +/-3%) because the user explicitly wants H2H
+        # considered, without double-counting it as another sample.
+        home_blk_h2h, home_blk_h2h_audit = h2h_block_modifier(
+            team_db, setup["home_abbr"], setup["away_abbr"],
+            home_profile.get("blk_rate_pp", home_profile.get("blk_pp", 0.05)),
+        )
+        away_blk_h2h, away_blk_h2h_audit = h2h_block_modifier(
+            team_db, setup["away_abbr"], setup["home_abbr"],
+            away_profile.get("blk_rate_pp", away_profile.get("blk_pp", 0.05)),
+        )
+
         pace_obj = st.session_state["pace_projection"]
         c1, c2 = st.columns(2)
         poss_sd = c1.number_input(
@@ -575,7 +600,7 @@ with tab_team:
             key="game_team_sims",
         )
 
-        def make_ctx(mod):
+        def make_ctx(mod, blk_h2h=1.0):
             return TeamContext(
                 projected_possessions=float(shared_pace),
                 possessions_sd=float(poss_sd),
@@ -591,14 +616,16 @@ with tab_team:
                 dreb=float(mod["DREB"]),
                 stl=float(mod["STL"]),
                 blk=float(mod["BLK"]),
+                blk_h2h=float(blk_h2h),
             )
 
-        home_ctx = make_ctx(home_mod)
-        away_ctx = make_ctx(away_mod)
+        home_ctx = make_ctx(home_mod, home_blk_h2h)
+        away_ctx = make_ctx(away_mod, away_blk_h2h)
 
         fingerprint = (
             setup["home_abbr"], setup["away_abbr"], float(shared_pace),
-            float(poss_sd), home_regime, away_regime,
+            float(poss_sd), home_regime, away_regime, bool(rotation_similarity_enabled),
+            round(home_blk_h2h, 4), round(away_blk_h2h, 4),
             tuple(round(home_mod[k], 4) for k in sorted(home_mod)),
             tuple(round(away_mod[k], 4) for k in sorted(away_mod)),
             int(n),
@@ -674,12 +701,19 @@ with tab_team:
                 )
             with subtabs[3]:
                 most_rows = []
-                st.caption("PTS / match-winner is intentionally omitted here until the score/win layer is separately backtested.")
+                most_audit_rows = []
+                st.caption(
+                    "PTS / match-winner is intentionally omitted. Team-with-most keeps the simulated mean difference, "
+                    "but calibrates the DIFFERENCE spread to actual same-game league history; bookmaker prices are never used."
+                )
                 for m in [
                     "3PM","3PA","2PM","2PA","FTM","FTA",
                     "REB","OREB","DREB","AST","STL","BLK","TOV","PF",
                 ]:
-                    pr = most_market(home_sim[m], away_sim[m])
+                    pr = most_market_calibrated(
+                        home_sim[m], away_sim[m], team_logs=team_db, market=m,
+                        calibration_strength=0.60,
+                    )
                     most_rows.append({
                         "Market": m,
                         f"P {setup['home_abbr']}": pr["p_home"],
@@ -691,10 +725,25 @@ with tab_team:
                         f"Fair {setup['away_abbr']}": pr["fair_away"],
                         f"Play {setup['away_abbr']} from": required_odds_for_ev(pr["p_away"], 0.0, target_ev),
                     })
+                    most_audit_rows.append({
+                        "Market": m,
+                        "Raw tie": pr.get("raw_p_tie", pr["p_tie"]),
+                        "Calibrated tie": pr["p_tie"],
+                        "League tie": pr.get("league_tie_rate", np.nan),
+                        "Raw diff SD": pr.get("raw_diff_sd", np.nan),
+                        "League target diff SD": pr.get("league_target_diff_sd", np.nan),
+                        "Applied diff SD": pr.get("applied_diff_sd", np.nan),
+                        "Calibration games": pr.get("calibration_games", 0),
+                    })
                 st.dataframe(
                     pd.DataFrame(most_rows).round(3),
                     use_container_width=True, hide_index=True,
                 )
+                with st.expander("Team-with-most calibration audit", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame(most_audit_rows).round(3),
+                        use_container_width=True, hide_index=True,
+                    )
 
             st.caption("No bookmaker input is required. Compare the market later against Model line / Fair / Play-from columns above.")
 
@@ -703,6 +752,69 @@ with tab_team:
                 st.dataframe(away_audit.round(4), use_container_width=True, hide_index=True)
                 st.markdown(f"**{setup['home_abbr']} buckets — {home_regime}**")
                 st.dataframe(home_audit.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown("**Current IN/OUT + rotation-similarity weighting**")
+
+                def _team_availability_row(team_abbr, team_name, game_weights, regime):
+                    injuries = (manual_context or {}).get("injuries", {})
+                    out_names, gtd_names = [], []
+                    for nm, info in injuries.items():
+                        if not isinstance(info, dict):
+                            continue
+                        info_team = str(info.get("team", "")).strip().upper()
+                        # Resolve team either from JSON or current player pool.
+                        pool_hit = pool[pool["PLAYER_NAME"].astype(str).str.casefold() == str(nm).casefold()]
+                        pool_team = str(pool_hit.iloc[0]["TEAM_ABBR"]).upper() if not pool_hit.empty else ""
+                        belongs = info_team in {str(team_abbr).upper(), str(team_name).upper()} or pool_team == str(team_abbr).upper()
+                        if not belongs:
+                            continue
+                        status = str(info.get("status", "")).upper()
+                        if status == "OUT":
+                            out_names.append(str(nm))
+                        elif status in {"GTD", "QUESTIONABLE", "DOUBTFUL"}:
+                            gtd_names.append(f"{nm} ({status})")
+                    ws = np.asarray(list(game_weights.values()), dtype=float) if game_weights else np.asarray([])
+                    return {
+                        "Team": team_abbr,
+                        "Regime": regime,
+                        "Rotation weighting": "ON" if rotation_similarity_enabled else "OFF",
+                        "OUT": ", ".join(out_names) if out_names else "—",
+                        "GTD/Q": ", ".join(gtd_names) if gtd_names else "—",
+                        "Historical games weighted": int(len(ws)),
+                        "Min inner weight": float(ws.min()) if ws.size else 1.0,
+                        "Mean inner weight": float(ws.mean()) if ws.size else 1.0,
+                        "Max inner weight": float(ws.max()) if ws.size else 1.0,
+                    }
+
+                st.dataframe(pd.DataFrame([
+                    _team_availability_row(setup["away_abbr"], setup["away_name"], away_game_weights, away_regime),
+                    _team_availability_row(setup["home_abbr"], setup["home_name"], home_game_weights, home_regime),
+                ]).round(3), use_container_width=True, hide_index=True)
+
+                st.markdown("**BLK model audit — own rate / opponent allowed / H2H**")
+                blk_audit = pd.DataFrame([
+                    {
+                        "Team": setup["away_abbr"],
+                        "Own weighted BLK/poss": away_profile.get("blk_pp", np.nan),
+                        "Own stabilized BLK/poss": away_profile.get("blk_rate_pp", np.nan),
+                        "Opponent BLK-allowed modifier": away_auto.get("BLK", 1.0),
+                        "Location BLK modifier": away_loc.get("BLK", 1.0),
+                        "H2H BLK modifier": away_blk_h2h,
+                    },
+                    {
+                        "Team": setup["home_abbr"],
+                        "Own weighted BLK/poss": home_profile.get("blk_pp", np.nan),
+                        "Own stabilized BLK/poss": home_profile.get("blk_rate_pp", np.nan),
+                        "Opponent BLK-allowed modifier": home_auto.get("BLK", 1.0),
+                        "Location BLK modifier": home_loc.get("BLK", 1.0),
+                        "H2H BLK modifier": home_blk_h2h,
+                    },
+                ])
+                st.dataframe(blk_audit.round(4), use_container_width=True, hide_index=True)
+                if not away_blk_h2h_audit.empty or not home_blk_h2h_audit.empty:
+                    cb1, cb2 = st.columns(2)
+                    cb1.dataframe(away_blk_h2h_audit.round(4), use_container_width=True, hide_index=True)
+                    cb2.dataframe(home_blk_h2h_audit.round(4), use_container_width=True, hide_index=True)
 
                 st.markdown("**Location correction (small shrink only)**")
                 ca, ch = st.columns(2)
@@ -1229,7 +1341,7 @@ with tab_audit:
 - Pace control is fitted from completed WNBA games, with a mild ridge prior
   rather than fixed 50/50.
 - The exact same projected possessions feed Team Markets and Player Props.
-- Team BLK ability is learned per opponent 2PA and regularized; misses are only a logical cap, not the denominator.
+- Team BLK starts from own weighted BLK/poss, corrected by opponent BLK allowed, tiny capped H2H, and only a small 2PA opportunity nudge; misses are only a conservation cap.
 - Player pace adjustment is today's game pace / that player's historical
   pace environment, so pace is applied once rather than double-counted.
 - Market total/handicap are audit-only in v2.6.
