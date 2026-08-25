@@ -171,3 +171,16 @@ The Streamlit UI now shows:
 - positional fallback prior
 
 The underlying prop/value model is unchanged.
+
+
+## v2.7.1 — pandas attrs concat fix
+
+v2.7 stores minute-redistribution audit tables in `DataFrame.attrs`.
+Recent pandas versions attempt to compare attrs during `pd.concat`, and nested
+DataFrames make that comparison ambiguous (`ValueError`).
+
+v2.7.1 preserves the audit attrs on the original team minute frames, but strips
+attrs from temporary copies used only for concatenation.
+
+No projection, minutes, redistribution, pace, Monte Carlo, or pricing logic was
+changed.

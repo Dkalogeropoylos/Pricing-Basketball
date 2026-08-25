@@ -31,7 +31,7 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.7")
+st.title("🏀 Basketball Pricing Engine v2.7.1")
 st.caption(
     "Trader overrides • Learned role-aware redistribution • Rotation-similarity minutes • Shared fitted pace • "
     "No L5/L10 overlap • Existing value model preserved"
@@ -77,6 +77,21 @@ def context_role(manual_context, player_name):
         player_name,
         {},
     ) or {}
+
+
+def concat_without_attrs(frames, **kwargs):
+    """
+    pandas propagates/compares DataFrame.attrs during concat. v2.7 stores
+    audit DataFrames in attrs, and pandas 2.x/3.x can raise ValueError while
+    comparing those nested objects. Strip attrs only on temporary concat
+    copies; the original frames keep their audit metadata.
+    """
+    clean = []
+    for frame in frames:
+        tmp = frame.copy()
+        tmp.attrs = {}
+        clean.append(tmp)
+    return pd.concat(clean, **kwargs)
 
 
 def current_game_pace():
@@ -543,7 +558,7 @@ with tab_player:
             setup["home_abbr"], setup["home_name"],
             manual_context,
         )
-        base_minutes = pd.concat(
+        base_minutes = concat_without_attrs(
             [base_away, base_home], ignore_index=True
         )
 
@@ -620,7 +635,7 @@ with tab_player:
                 setup["home_abbr"], setup["home_name"],
                 manual_context, home_overrides,
             )
-            final_minutes = pd.concat(
+            final_minutes = concat_without_attrs(
                 [away_min, home_min], ignore_index=True
             )
 
@@ -675,7 +690,7 @@ with tab_player:
                         impacts.append(imp)
                 if impacts:
                     st.dataframe(
-                        pd.concat(impacts, ignore_index=True).round(3),
+                        concat_without_attrs(impacts, ignore_index=True).round(3),
                         use_container_width=True,
                         hide_index=True,
                     )
@@ -700,7 +715,7 @@ with tab_player:
                         if not part.empty:
                             matrix_parts.append(part)
                 if matrix_parts:
-                    matrix_view = pd.concat(
+                    matrix_view = concat_without_attrs(
                         matrix_parts, ignore_index=True
                     ).sort_values("Weight", ascending=False)
                     st.dataframe(
