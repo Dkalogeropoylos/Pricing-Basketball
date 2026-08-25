@@ -11,6 +11,11 @@ class PlayerContext:
     projected_minutes: float
     minutes_sd: float = 2.0
 
+    # Central matchup pace relative to the pace already embedded in the
+    # player's historical per-minute rates. Random pace shock still sits
+    # around this central multiplier.
+    pace_multiplier: float = 1.00
+
     # opponent environment, 1.00 = neutral
     opp_pts: float = 1.00
     opp_reb: float = 1.00
@@ -111,7 +116,7 @@ def simulate_player(profile: dict, ctx: PlayerContext, n=100_000, seed=1, opport
         max(4.0, ctx.projected_minutes - 8.0),
         ctx.projected_minutes + 8.0,
     )
-    pace = np.exp(0.035 * z_pace - 0.5 * 0.035**2)
+    pace = ctx.pace_multiplier * np.exp(0.035 * z_pace - 0.5 * 0.035**2)
     role = np.exp(0.05 * z_role - 0.5 * 0.05**2)
     perim = np.exp(0.07 * z_perim - 0.5 * 0.07**2)
     foul = np.exp(0.10 * z_foul - 0.5 * 0.10**2)
