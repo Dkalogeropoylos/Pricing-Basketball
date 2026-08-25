@@ -96,3 +96,14 @@ Only information a historical database cannot know should be manual:
 ## Important
 
 Model-implied fair odds are not yet historically calibrated probabilities.
+
+
+## v2.4.1 metadata prefill fix
+
+Streamlit widgets retain their previous state even when a new default is supplied.
+v2.4.1 clears only the context-driven player controls whenever a new context JSON
+is uploaded or explicitly applied. Projected minutes and role multipliers therefore
+refresh correctly from metadata.
+
+The Player Props tab also shows a visible "Metadata applied to this player" audit
+with the exact injury, projected minutes, and role adjustments read from the JSON.

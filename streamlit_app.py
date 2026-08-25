@@ -25,7 +25,7 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide"
 )
-st.title("🏀 Basketball Pricing Engine v2.4")
+st.title("🏀 Basketball Pricing Engine v2.4.1")
 st.caption(
     "SportsDataverse historical database • No stats.nba.com dependency • "
     "No L5/L10 overlap • Automatic opponent context • Joint Monte Carlo"
@@ -47,6 +47,25 @@ def ci_lookup(d, name, default=None):
         if str(k).strip().casefold() == target:
             return v
     return default
+
+
+def reset_context_driven_player_widgets():
+    """
+    Streamlit number_input widgets keep their old state even when a new default
+    is supplied. Clear only context-driven player inputs so uploaded/applied
+    metadata can prefill them on the next rerun.
+    """
+    prefixes = (
+        "pmin_",
+        "usage_",
+        "creation_",
+        "rebrole_",
+        "3role_",
+        "ftarole_",
+    )
+    for key in list(st.session_state.keys()):
+        if any(str(key).startswith(prefix) for prefix in prefixes):
+            del st.session_state[key]
 
 
 bdl_key = get_secret("BALLDONTLIE_API_KEY")
@@ -191,20 +210,42 @@ with tab_game:
         "projected minutes and role redistribution."
     )
 
-    upload = st.file_uploader("Upload game_context.json", type=["json"])
+    upload = st.file_uploader(
+        "Upload game_context.json",
+        type=["json"],
+        key="context_uploader"
+    )
+
+    # Process a newly uploaded file only once; otherwise Streamlit would
+    # re-apply it on every rerun while the uploader remains populated.
     if upload is not None:
         try:
-            st.session_state["game_context"] = json.load(upload)
-            st.success("Context JSON loaded.")
+            raw_bytes = upload.getvalue()
+            upload_sig = (upload.name, len(raw_bytes), hash(raw_bytes))
+            if st.session_state.get("_context_upload_sig") != upload_sig:
+                parsed = json.loads(raw_bytes.decode("utf-8"))
+                st.session_state["game_context"] = parsed
+                st.session_state["context_editor"] = json.dumps(
+                    parsed, indent=2, ensure_ascii=False
+                )
+                st.session_state["_context_upload_sig"] = upload_sig
+                reset_context_driven_player_widgets()
+                st.success("Context JSON loaded and player inputs reset.")
+                st.rerun()
         except Exception as e:
             st.error(f"Invalid JSON file: {e}")
 
-    current_context = st.session_state.get("game_context", {})
-    context_text = st.text_area(
+    if "context_editor" not in st.session_state:
+        current_context = st.session_state.get("game_context", {})
+        st.session_state["context_editor"] = (
+            json.dumps(current_context, indent=2, ensure_ascii=False)
+            if current_context else ""
+        )
+
+    st.text_area(
         "Paste / edit context JSON",
-        value=json.dumps(current_context, indent=2)
-        if current_context else "",
         height=230,
+        key="context_editor",
         placeholder=(
             '{"injuries":{"Rae Burrell":{"status":"OUT"}},'
             '"projected_minutes":{"Ariel Atkins":31},'
@@ -215,10 +256,13 @@ with tab_game:
 
     if st.button("Apply context JSON"):
         try:
+            context_text = st.session_state.get("context_editor", "")
             st.session_state["game_context"] = (
                 json.loads(context_text) if context_text.strip() else {}
             )
-            st.success("Context applied.")
+            reset_context_driven_player_widgets()
+            st.success("Context applied. Player inputs will now refresh from metadata.")
+            st.rerun()
         except Exception as e:
             st.error(f"JSON error: {e}")
 
@@ -517,6 +561,18 @@ with tab_player:
                     player_name,{}
                 ) or {}
             )
+
+            # Explicit audit: show exactly what the context file contributed.
+            if context_minutes is not None or injury_info or role:
+                with st.expander("✅ Metadata applied to this player", expanded=True):
+                    st.json({
+                        "player": player_name,
+                        "injury": injury_info or None,
+                        "projected_minutes_from_context": context_minutes,
+                        "role_adjustments_from_context": role or {},
+                    })
+            else:
+                st.caption("No player-specific metadata found in the applied context JSON.")
 
             recent_min = float(plog.tail(10)["MIN"].mean())
             default_minutes = (
