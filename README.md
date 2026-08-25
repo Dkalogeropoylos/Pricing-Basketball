@@ -1,109 +1,173 @@
-# Basketball Pricing Engine v2.4
+# Basketball Pricing Engine v2.6
 
-WNBA core data no longer depends on `stats.nba.com`.
+v2.6 preserves the existing value model and upgrades the **feeding layer**.
 
-## Historical data
+## Core model intentionally unchanged
 
-Primary WNBA historical provider:
-**SportsDataverse GitHub Releases**
+The following remain fixed:
+- Old / Games 6-10 / L5 non-overlap
+- Stable 55/20/25
+- Role-change 35/20/45
+- H2H = zero extra weight by default
+- opponent overall + positional normalization
+- efficiency regression
+- joint Monte Carlo
+- stress testing
+- model-implied fair odds / EV
 
-The app downloads and caches:
+## Trader layer
 
-- `espn_wnba_player_boxscores/player_box_{season}.parquet`
-- `espn_wnba_team_boxscores/team_box_{season}.parquet`
+The model does **not** guess injuries.
 
-If parquet is unavailable, it automatically tries the corresponding CSV.
+Trader context can declare:
+- OUT / GTD
+- projected starters
+- projected minute overrides
+- role redistribution
+- rotation regime (`stable` or `role_change`)
 
-The source datasets are published by SportsDataverse/wehoop and are refreshed
-during the WNBA season.
+If no minute override is supplied, AUTO minutes are used.
 
-## What the two files provide
+## Minutes Engine
 
-Player boxscores:
-- game/date/team/opponent
-- minutes
-- FGM/FGA
-- 3PM/3PA
-- FTM/FTA
-- OREB/DREB/REB
-- AST/STL/BLK/TOV/PF/PTS
-- starter
-- position
-- home/away
+AUTO player minutes use:
+1. The same non-overlapping Old / G6-10 / L5 buckets.
+2. Rotation similarity **inside** each bucket.
+3. Historical starter match.
+4. OT downweighting.
+5. Large-blowout downweighting.
+6. Recent median stabilization.
+7. Low / central / high minute uncertainty.
 
-Team boxscores:
-- team/opponent/game/date
-- FGM/FGA
-- 3PM/3PA
-- FTM/FTA
-- OREB/DREB/REB
-- AST/STL/BLK/TOV/PF/PTS
+The full team rotation is then constrained to:
 
-## Automatic calculations
+`5 players × 40 regulation minutes = 200 team-minutes`
 
-From those files the app calculates:
-- current team and player lists
-- Old season / Games 6-10 / L5
-- team pace / possession profiles
-- opponent allowed per possession vs league average
-- G/F/C opponent-by-position per-36 vs league positional baseline
-- same-season H2H
-- OT flag when a game contains any player above 40 minutes
+OUT players are fixed at zero.
+Trader or metadata overrides are fixed first.
+The remaining AUTO players absorb the remaining team minutes proportionally.
 
-No extra H2H weight is applied automatically.
+This means a trader can override one player's minutes without creating an
+impossible 215-minute team rotation.
 
-## Pregame manual context
+## Selected players UI
 
-Only information a historical database cannot know should be manual:
+The app projects the entire rotation in the background but lets the trader
+multiselect only the players they want to simulate.
 
-```json
-{
-  "injuries": {
-    "Rae Burrell": {"status": "OUT"}
-  },
-  "projected_minutes": {
-    "Ariel Atkins": 31
-  },
-  "role_adjustments": {
-    "Ariel Atkins": {
-      "usage": 1.08,
-      "three_role": 1.12,
-      "creation": 1.03
-    }
-  }
-}
-```
+For selected players:
+- 0 minute override = AUTO
+- any positive override = TRADER
+- metadata projected minutes are used if no UI override exists
 
-## Providers retained for later
+## Pace Engine
 
-- BALLDONTLIE: optional advanced / injuries depending on tier.
-- nba_api: retained in the repository as an optional local/fallback adapter,
-  but v2.4 WNBA Streamlit core does not call stats.nba.com.
-- NBA, EuroLeague and EuroCup adapters can use the same normalized model layer.
+Team pace is first estimated using the existing non-overlapping weighting.
 
-## Model protocol
+Historical WNBA games are then used to fit relative **fast-side vs slow-side**
+pace control. The fit is ridge-shrunk toward a mild fast-side prior, instead of
+hardcoding a 50/50 midpoint or a fixed 60/40 rule.
 
-- Stable weighting: 55 / 20 / 25
-- Role-change weighting: 35 / 20 / 45
-- Old / Games 6-10 / L5 never overlap
-- H2H is context only
-- 3PM generated from projected 3PA and regressed 3P%
-- player joint MC: PTS / REB / AST / 3PM and combos
-- team MC: PTS / 3PA / 3PM / 2PA / 2PM / FTA / TOV / OREB / AST / STL / BLK / PF
-- bear / central / bull opportunity stress
-- bookmaker odds entered after projection
+The output is:
+- home pace
+- away pace
+- fitted fast/slow weights
+- central possessions
+- low/high band
+- empirical fit RMSE
 
-## Important
+The exact same central possessions feed:
+- Team Markets
+- Player Props
 
-Model-implied fair odds are not yet historically calibrated probabilities.
+### Player pace adjustment
+
+Player history is per-minute, so each player receives:
+
+`today projected possessions / player's historical possession environment`
+
+This applies matchup pace once. It avoids adding a second pace modifier on top
+of historical rates that already came from fast or slow games.
+
+## Total / handicap
+
+Sportsbook total and spread are **audit-only** in v2.6.
+
+Why:
+- a high total can come from pace, efficiency, or both;
+- our team projections already create their own scoring expectation;
+- feeding the sportsbook total directly back into the same model would be circular.
+
+A separate calibrated market-prior / blowout layer can be added later without
+contaminating the core projection.
+
+## Historical provider
+
+WNBA historical data remains SportsDataverse GitHub release data.
+No stats.nba.com call is required from Streamlit Cloud.
 
 
-## v2.4.1 metadata prefill fix
+## v2.7 — historically learned role-aware minute redistribution
 
-Streamlit widgets retain their previous state even when a new default is supplied.
-v2.4.1 clears only the context-driven player controls whenever a new context JSON
-is uploaded or explicitly applied. Projected minutes and role multipliers therefore
-refresh correctly from metadata.
+v2.7 removes proportional roster-wide scaling for explicit minute overrides.
 
-The Player Props tab also shows a visible "Metadata applied to this player" audit
-with the exact injury, projected minutes, and role adjustments read from the JSON.
+### Learned replacement matrix
+
+For every current-roster teammate pair A -> B, the engine learns whether B
+historically gains minutes when A loses minutes.
+
+The score combines:
+
+1. Negative continuous minute slope between A and B.
+2. On/off-like lift: how much B gains when A is at the low end of A's minute
+   distribution versus A's normal/high-minute games.
+3. Sample-size confidence.
+4. A small G/F/C positional prior only as a shrinkage fallback when history is
+   thin.
+
+Each focal player's teammate scores are normalized to a row that sums to 1.
+
+Example interpretation:
+
+`Canada -> Backup Guard = 0.48`
+
+means that, among eligible non-fixed teammates, the historical rotation model
+expects roughly 48% of a Canada minute override to be absorbed by that player,
+subject to 0-40 minute constraints.
+
+### Explicit override flow
+
+1. Build the context-aware AUTO rotation.
+2. Apply the 200-minute team constraint.
+3. Treat trader/metadata projected-minute targets as deviations from AUTO.
+4. Transfer the delta through the learned replacement row.
+5. Only if the learned recipients hit 0/40 minute bounds does the engine use a
+   broader constraint fallback.
+6. Team minutes remain exactly 200.
+
+### Avoiding injury double counting
+
+OUT availability is already part of the current-rotation similarity engine:
+OUT players are removed from today's rotation signature, and historical games
+with similar rotations receive more weight.
+
+Therefore v2.7 does **not** apply a second full pairwise redistribution on top
+of the same OUT absence. That would double count the injury effect.
+
+The learned matrix is used primarily for explicit trader/metadata minute
+targets relative to the context-aware AUTO rotation.
+
+### Audit
+
+The Streamlit UI now shows:
+- Auto Baseline Min
+- final Projected Min
+- Override Delta
+- exact teammate minute impact of each override
+- learned replacement weights
+- negative-slope signal
+- on/off signal
+- sample confidence
+- positional fallback prior
+
+The underlying prop/value model is unchanged.
