@@ -52,7 +52,7 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.15.0")
+st.title("🏀 Basketball Pricing Engine v2.15.1")
 st.caption(
     "Single-score near-state availability + stat-specific absence relevance • 50k cached sims • "
     "role-aware minute/event redistribution • non-overlap Old/G6–10/L5 • team/player state consistency"
@@ -1027,6 +1027,33 @@ with tab_team:
         home_mod = combined_mods(home_auto, home_loc, home_roster_mod)
         away_mod = combined_mods(away_auto, away_loc, away_roster_mod)
 
+        # v2.15.1: Streamlit widgets keep their session_state value after first
+        # creation, so changing confirmed OUT / shared minutes / shrink K could
+        # leave the visible trader modifier inputs (and therefore the simulator)
+        # stuck on the PREVIOUS context. Re-seed AUTO values only when the
+        # underlying model context changes. Manual edits remain sticky while the
+        # context itself is unchanged.
+        _team_auto_mod_sig = (
+            setup["home_abbr"], setup["away_abbr"],
+            tuple(sorted(str(x) for x in home_out)),
+            tuple(sorted(str(x) for x in away_out)),
+            round(float(availability_k), 4),
+            tuple(sorted((str(k), round(float(v), 4)) for k, v in (manual_context.get("projected_minutes", {}) or {}).items())),
+            tuple((k, round(float(home_roster_mod.get(k, 1.0)), 5)) for k in sorted(home_roster_mod)),
+            tuple((k, round(float(away_roster_mod.get(k, 1.0)), 5)) for k in sorted(away_roster_mod)),
+            tuple((k, round(float(home_mod.get(k, 1.0)), 5)) for k in sorted(home_mod)),
+            tuple((k, round(float(away_mod.get(k, 1.0)), 5)) for k in sorted(away_mod)),
+        )
+        if st.session_state.get("_team_auto_mod_sig") != _team_auto_mod_sig:
+            for _k, _v in home_mod.items():
+                st.session_state[f"home_team_mod_{_k}"] = float(_v)
+            for _k, _v in away_mod.items():
+                st.session_state[f"away_team_mod_{_k}"] = float(_v)
+            st.session_state["_team_auto_mod_sig"] = _team_auto_mod_sig
+            # Any previous simulation belongs to the old context.
+            st.session_state.pop("team_game_sim", None)
+            st.session_state.pop("selected_player_board", None)
+
         # Optional positional BLK susceptibility. It is neutral unless the
         # loaded player data contains an actual blocked-attempt field.
         home_blk_pos, home_blk_pos_audit = block_position_susceptibility_modifier(
@@ -1981,5 +2008,5 @@ with tab_audit:
 
 st.caption(
     "Model-implied fair odds are not yet historically calibrated true odds. "
-    "v2.15 adds single-score stat-specific near-state availability, maturity-weighted sparse-sample shrinkage, role-aware event redistribution and 50k cached simulations; re-backtest before treating model fair odds as calibrated true probabilities."
+    "v2.15.1 keeps v2.15 near-state/redistribution logic and fixes stale Streamlit AUTO team modifiers after OUT/minute/context changes; 50k cached simulations remain default. Re-backtest before treating model fair odds as calibrated true probabilities."
 )
