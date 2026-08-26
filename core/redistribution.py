@@ -5,21 +5,41 @@ import numpy as np
 import pandas as pd
 
 
+def _broad_position(position_group=None, position_abbr=None) -> str:
+    """Return G/F/C even when the provider only supplies combo positions."""
+    raw = str(position_group or "").strip().upper()
+    if raw in {"G", "F", "C"}:
+        return raw
+    raw = str(position_abbr or raw or "").strip().upper().replace(" ", "")
+    if not raw or raw == "NAN":
+        return ""
+    # Combo positions use the frontcourt/primary replacement family rather than
+    # becoming 'unknown'.  This is only a fallback prior; empirical replacement
+    # evidence can still override it.
+    if "C" in raw:
+        return "C" if raw in {"C", "C-F", "C/F"} else "F"
+    if "F" in raw:
+        return "F"
+    if "G" in raw:
+        return "G"
+    return ""
+
+
 def _position_prior(a, b) -> float:
-    a = str(a or "").upper()
-    b = str(b or "").upper()
-    if not a or a == "NAN" or not b or b == "NAN":
-        return 0.30
+    a = _broad_position(a)
+    b = _broad_position(b)
+    if not a or not b:
+        return 0.25
     if a == b:
         return 1.00
     pair = {a, b}
     if pair == {"G", "F"}:
-        return 0.55
+        return 0.50
     if pair == {"F", "C"}:
-        return 0.60
+        return 0.65
     if pair == {"G", "C"}:
-        return 0.15
-    return 0.30
+        return 0.08
+    return 0.25
 
 
 def _team_game_frame(team_db: pd.DataFrame, team_abbr: str) -> pd.DataFrame:
@@ -149,7 +169,7 @@ def _pair_score(
     score = (
         confidence * empirical
         + (1.0 - confidence) * 0.18 * role_prior
-        + 0.05 * role_prior
+        + 0.08 * role_prior
     )
     score = float(max(score, 0.001))
 
@@ -198,7 +218,9 @@ def learn_redistribution_matrix(
             continue
         players.append(pname)
         series[pname] = s
-        positions[pname] = row.get("POSITION_GROUP")
+        positions[pname] = _broad_position(
+            row.get("POSITION_GROUP"), row.get("POSITION_ABBR")
+        )
 
     matrix: Dict[str, Dict[str, float]] = {}
     audit_rows = []
@@ -488,3 +510,92 @@ def apply_role_aware_overrides(
 
     impact = pd.DataFrame(impact_rows)
     return minutes, impact
+
+
+def apply_confirmed_outs(
+    healthy_minutes: Dict[str, float],
+    matrix: Dict[str, Dict[str, float]],
+    out_players: set[str] | None = None,
+    total_minutes: float = 200.0,
+) -> Tuple[Dict[str, float], pd.DataFrame]:
+    """Set confirmed OUT players to zero and redistribute their healthy minutes.
+
+    Redistribution uses the learned teammate replacement matrix. Position enters
+    only as a fallback prior inside that matrix, so real historical substitution
+    evidence wins when it exists. Multiple OUTs are processed largest-vacated-
+    minutes first and can never receive one another's minutes.
+    """
+    outs = {str(x) for x in (out_players or set())}
+    minutes = {
+        p: float(np.clip(v, 0.0, 40.0))
+        for p, v in healthy_minutes.items()
+    }
+    impact_rows = []
+
+    ordered = sorted(
+        [p for p in outs if p in minutes],
+        key=lambda p: minutes.get(p, 0.0),
+        reverse=True,
+    )
+
+    for focal in ordered:
+        released = float(max(minutes.get(focal, 0.0), 0.0))
+        minutes[focal] = 0.0
+        if released <= 1e-9:
+            impact_rows.append({
+                "Focal": focal,
+                "Healthy Min": 0.0,
+                "Released Min": 0.0,
+                "Unallocated Min": 0.0,
+                "Mode": "confirmed OUT",
+            })
+            continue
+
+        row = {
+            p: float(w)
+            for p, w in (matrix.get(focal, {}) or {}).items()
+            if p in minutes and p not in outs and p != focal
+        }
+        if not row:
+            # Last-resort fallback is current healthy minute capacity, not equal
+            # random sharing. This path should be rare because matrix rows also
+            # contain a position prior when empirical history is sparse.
+            row = {
+                p: max(float(minutes[p]), 0.1)
+                for p in minutes
+                if p not in outs and p != focal
+            }
+
+        before = dict(minutes)
+        residual = _weighted_capacity_transfer(
+            minutes,
+            released,
+            row,
+            direction="add",
+            excluded=outs | {focal},
+            cap=40.0,
+        )
+
+        moved = []
+        for p in minutes:
+            delta = float(minutes[p] - before.get(p, 0.0))
+            if delta > 1e-8:
+                moved.append((p, delta))
+        moved.sort(key=lambda kv: kv[1], reverse=True)
+
+        impact_rows.append({
+            "Focal": focal,
+            "Healthy Min": released,
+            "Released Min": released - residual,
+            "Unallocated Min": residual,
+            "Top replacements": ", ".join(f"{p} +{d:.1f}" for p, d in moved[:5]),
+            "Mode": "learned matrix + position fallback",
+        })
+
+    # Keep OUTs fixed at zero and reconcile any tiny numerical residual.
+    for p in outs:
+        if p in minutes:
+            minutes[p] = 0.0
+    _reconcile_total(minutes, total_minutes, fixed_names=outs, cap=40.0)
+
+    return minutes, pd.DataFrame(impact_rows)

@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from core.buckets import WeightConfig, split_non_overlapping, active_weights
-from core.redistribution import learn_redistribution_matrix, apply_role_aware_overrides
+from core.redistribution import learn_redistribution_matrix, apply_role_aware_overrides, apply_confirmed_outs
 
 
 @dataclass
@@ -346,6 +346,154 @@ def _allocate_capped(
 
 
 
+def _context_without_outs(manual_context: dict, out_players: set[str]) -> dict:
+    """Return a shallow-safe copy where selected OUT players are treated healthy.
+
+    Used only to estimate the pre-injury rotation baseline before the learned
+    replacement matrix redistributes the vacated minutes.
+    """
+    import copy
+    ctx = copy.deepcopy(manual_context or {})
+    injuries = ctx.setdefault("injuries", {})
+    out_norm = {str(x).strip().casefold() for x in out_players}
+    for key in list(injuries):
+        if str(key).strip().casefold() in out_norm:
+            info = injuries.get(key)
+            if isinstance(info, dict):
+                info = dict(info)
+                info["status"] = "ACTIVE"
+                injuries[key] = info
+            else:
+                injuries[key] = {"status": "ACTIVE"}
+    return ctx
+
+
+def _recent_team_minutes_summary(
+    player_db: pd.DataFrame,
+    team_db: pd.DataFrame,
+    team_abbr: str,
+    player_id,
+    n5: int = 5,
+    n10: int = 10,
+) -> dict:
+    """Pregame rotation evidence including DNPs as zero team-game minutes."""
+    tg = team_db[
+        team_db["TEAM_ABBR"].astype(str).str.upper() == str(team_abbr).upper()
+    ].copy()
+    if tg.empty:
+        return {"l5": 0.0, "l10": 0.0, "apps5": 0, "apps10": 0}
+    tg["GAME_DATE"] = pd.to_datetime(tg["GAME_DATE"], errors="coerce")
+    tg["GAME_ID"] = tg["GAME_ID"].astype(str)
+    tg = tg.sort_values("GAME_DATE").drop_duplicates("GAME_ID")
+    recent10 = tg.tail(n10)
+
+    pl = player_db[
+        (player_db["PLAYER_ID"] == player_id)
+        & (player_db["TEAM_ABBR"].astype(str).str.upper() == str(team_abbr).upper())
+    ].copy()
+    if pl.empty:
+        vals = pd.Series(0.0, index=recent10["GAME_ID"].astype(str))
+    else:
+        pl["GAME_ID"] = pl["GAME_ID"].astype(str)
+        minute_map = (
+            pl.groupby("GAME_ID")["MIN"].sum().pipe(pd.to_numeric, errors="coerce").fillna(0.0).to_dict()
+        )
+        vals = recent10["GAME_ID"].astype(str).map(lambda gid: float(minute_map.get(gid, 0.0)))
+        vals.index = recent10["GAME_ID"].astype(str).values
+    vals10 = pd.to_numeric(vals, errors="coerce").fillna(0.0)
+    vals5 = vals10.tail(n5)
+    return {
+        "l5": float(vals5.mean()) if len(vals5) else 0.0,
+        "l10": float(vals10.mean()) if len(vals10) else 0.0,
+        "apps5": int((vals5 >= 4.0).sum()),
+        "apps10": int((vals10 >= 4.0).sum()),
+    }
+
+
+def _recent_rotation_size(
+    player_db: pd.DataFrame,
+    team_db: pd.DataFrame,
+    team_abbr: str,
+) -> int:
+    """Median recent count of players with >=4 minutes, clipped to 8-10."""
+    tg = team_db[
+        team_db["TEAM_ABBR"].astype(str).str.upper() == str(team_abbr).upper()
+    ].copy()
+    if tg.empty:
+        return 9
+    tg["GAME_DATE"] = pd.to_datetime(tg["GAME_DATE"], errors="coerce")
+    gids = tg.sort_values("GAME_DATE").drop_duplicates("GAME_ID").tail(10)["GAME_ID"].astype(str).tolist()
+    p = player_db[
+        (player_db["TEAM_ABBR"].astype(str).str.upper() == str(team_abbr).upper())
+        & player_db["GAME_ID"].astype(str).isin(gids)
+    ].copy()
+    if p.empty:
+        return 9
+    p["MIN"] = pd.to_numeric(p["MIN"], errors="coerce").fillna(0.0)
+    counts = p[p["MIN"] >= 4.0].groupby(p["GAME_ID"].astype(str)).size()
+    if counts.empty:
+        return 9
+    return int(np.clip(round(float(counts.median())), 8, 10))
+
+
+def _select_rotation_names(
+    rows: list[dict],
+    raw_scores: Dict[str, float],
+    recent_info: Dict[str, dict],
+    manual_context: dict,
+    team_name: str,
+    team_abbr: str,
+    target_size: int,
+    out_players: set[str],
+) -> set[str]:
+    """Choose today's meaningful rotation before enforcing 200 minutes."""
+    starters = _projected_starters(manual_context, team_name, team_abbr)
+    explicit = {str(k).strip().casefold() for k in (manual_context.get("projected_minutes", {}) or {})}
+    candidates = []
+    forced = set()
+    for r in rows:
+        name = str(r["Player"])
+        if name in out_players:
+            continue
+        ri = recent_info.get(name, {})
+        starter = name.casefold() in starters or float(r.get("Starter P", 0.0)) >= 0.60
+        has_override = name.casefold() in explicit
+        score = (
+            0.50 * float(ri.get("l5", 0.0))
+            + 0.25 * float(ri.get("l10", 0.0))
+            + 0.25 * float(raw_scores.get(name, 0.0))
+            + (4.0 if starter else 0.0)
+        )
+        active_evidence = (
+            ri.get("apps5", 0) >= 2
+            or ri.get("apps10", 0) >= 4
+            or float(raw_scores.get(name, 0.0)) >= 10.0
+        )
+        if starter or has_override:
+            forced.add(name)
+        if active_evidence or starter or has_override:
+            candidates.append((name, score))
+
+    candidates.sort(key=lambda kv: kv[1], reverse=True)
+    chosen = list(forced)
+    for name, _ in candidates:
+        if name not in chosen:
+            chosen.append(name)
+        if len(chosen) >= target_size:
+            break
+    # Safety fallback if recent data are sparse.
+    if len(chosen) < min(target_size, 8):
+        extras = sorted(
+            [(n, v) for n, v in raw_scores.items() if n not in out_players and n not in chosen],
+            key=lambda kv: kv[1], reverse=True,
+        )
+        for name, _ in extras:
+            chosen.append(name)
+            if len(chosen) >= target_size:
+                break
+    return set(chosen[:max(target_size, len(forced))])
+
+
 def project_team_minutes(
     player_db: pd.DataFrame,
     team_db: pd.DataFrame,
@@ -355,14 +503,20 @@ def project_team_minutes(
     manual_context: dict,
     ui_overrides: Optional[Dict[str, float]] = None,
 ) -> pd.DataFrame:
-    """
-    Context-aware AUTO rotation + 200-minute constraint.
+    """Project a realistic current rotation and enforce the 200-minute constraint.
 
-    Important separation:
-    - OUT availability is handled inside the AUTO rotation-similarity engine.
-      We do not apply a second full pairwise redistribution for the same OUT.
-    - Explicit metadata/trader minute targets are deviations from AUTO and use
-      the historically learned role-aware redistribution matrix.
+    v2.13 separates three layers:
+      1) HEALTHY current rotation: recent team-game minutes (including DNP zeros)
+         + the existing non-overlap minutes model identify the likely 8-10 player
+         rotation before any proportional normalization.
+      2) CONFIRMED OUT: vacated healthy minutes are redistributed through the
+         learned teammate replacement matrix. Position is only a fallback prior.
+      3) Explicit minute restrictions/overrides: applied around the post-OUT
+         baseline through the same matrix.
+
+    This prevents a deep roster from scaling every star down simply because all
+    current-roster players have historical minutes, and prevents OUT minutes from
+    being shared indiscriminately across positions.
     """
     ui_overrides = ui_overrides or {}
 
@@ -371,12 +525,21 @@ def project_team_minutes(
         == str(team_abbr).upper()
     ].copy()
 
-    rows = []
-    raw = {}
-    out_players = set()
+    out_players = {
+        str(r["PLAYER_NAME"])
+        for _, r in team_pool.iterrows()
+        if _status(manual_context, str(r["PLAYER_NAME"])) == "OUT"
+    }
+    healthy_context = _context_without_outs(manual_context, out_players)
 
-    # First create context-aware AUTO raw minutes. Status OUT is fixed at zero
-    # and excluded from current rotation similarity.
+    rows = []
+    raw_model = {}
+    recent_info = {}
+
+    # Estimate the pre-injury current role for every roster player. Confirmed
+    # OUTs are deliberately treated healthy in this stage so their true vacated
+    # minutes can be measured and redistributed rather than disappearing before
+    # the replacement layer sees them.
     for _, prow in team_pool.iterrows():
         pname = str(prow["PLAYER_NAME"])
         pid = prow["PLAYER_ID"]
@@ -388,25 +551,28 @@ def project_team_minutes(
 
         proj = project_player_minutes_raw(
             log, player_db, team_db, current_pool,
-            team_abbr, team_name, pname, pid, manual_context
+            team_abbr, team_name, pname, pid, healthy_context
         )
+        ri = _recent_team_minutes_summary(
+            player_db, team_db, team_abbr, pid
+        )
+        recent_info[pname] = ri
 
-        recent = pd.to_numeric(
-            log.sort_values("GAME_DATE").tail(5)["MIN"],
-            errors="coerce"
-        ).dropna()
-        recent_avg = float(recent.mean()) if len(recent) else 0.0
-
-        if status == "OUT":
-            out_players.add(pname)
-            raw[pname] = 0.0
-            source = "OUT"
+        # DNP-aware team-game averages are the main guard against inflated bench
+        # roles. The older per-player history still supplies role/starter context.
+        if pname in out_players:
+            # Vacated minutes should reflect the player's healthy role, not be
+            # diluted by the zero-DNPs created by the very absence we are
+            # trying to model. project_player_minutes_raw uses appearance
+            # history and the healthy counterfactual rotation here.
+            auto_raw = max(float(proj.central_raw), 0.0)
         else:
-            auto_raw = max(proj.central_raw, 0.0)
-            if recent_avg < 2.5 and proj.central_raw < 3.0:
-                auto_raw = min(auto_raw, 0.75)
-            raw[pname] = auto_raw
-            source = "AUTO"
+            auto_raw = (
+                0.35 * max(float(proj.central_raw), 0.0)
+                + 0.45 * float(ri["l5"])
+                + 0.20 * float(ri["l10"])
+            )
+        raw_model[pname] = float(np.clip(auto_raw, 0.0, 40.0))
 
         rows.append({
             "PLAYER_ID": pid,
@@ -415,47 +581,67 @@ def project_team_minutes(
             "Pos": prow.get("POSITION_ABBR"),
             "Status": status or "ACTIVE/UNK",
             "Raw Auto Min": proj.central_raw,
+            "DNP-aware L5 Min": ri["l5"],
+            "DNP-aware L10 Min": ri["l10"],
             "Raw SD": proj.sd_raw,
             "Raw Low": proj.low_raw,
             "Raw High": proj.high_raw,
             "Starter P": proj.starter_probability,
             "Rotation Similarity": proj.rotation_similarity,
             "Regime": proj.regime,
-            "Source": source,
+            "Source": "OUT" if status == "OUT" else "AUTO",
         })
 
-    # Context-aware AUTO baseline constrained to 200, with OUT fixed at zero.
-    non_out_raw = {
-        p: v for p, v in raw.items()
-        if p not in out_players
-    }
-    base_alloc = _allocate_capped(
-        non_out_raw,
-        {p: 0.0 for p in out_players},
-        total_minutes=200.0,
-        cap=40.0,
+    if not rows:
+        return pd.DataFrame()
+
+    target_size = _recent_rotation_size(player_db, team_db, team_abbr)
+    chosen = _select_rotation_names(
+        rows, raw_model, recent_info, healthy_context,
+        team_name, team_abbr, target_size, out_players=set(),
     )
+    # A confirmed OUT who was part of the healthy rotation must remain in the
+    # healthy baseline so their minutes can be released. Force them in if their
+    # healthy raw role was meaningful.
+    for p in out_players:
+        if raw_model.get(p, 0.0) >= 6.0:
+            chosen.add(p)
 
-    # Explicit minute targets are trader-like deviations from AUTO.
-    metadata = manual_context.get("projected_minutes", {}) or {}
-    metadata_targets = {}
-    for pname in base_alloc:
-        v = _case_lookup(metadata, pname, None)
-        if v is not None and pname not in out_players:
-            metadata_targets[pname] = float(v)
-
-    # UI override supersedes metadata.
-    explicit_targets = dict(metadata_targets)
-    for pname, val in ui_overrides.items():
-        if pname in base_alloc and pname not in out_players:
-            explicit_targets[pname] = float(val)
+    healthy_raw = {
+        p: (raw_model[p] if p in chosen else 0.0)
+        for p in raw_model
+    }
+    healthy_alloc = _allocate_capped(
+        healthy_raw, {}, total_minutes=200.0, cap=40.0
+    )
 
     matrix, matrix_audit = learn_redistribution_matrix(
         player_db, team_db, current_pool, team_abbr
     )
 
-    final_alloc, impact = apply_role_aware_overrides(
-        base_alloc,
+    # Confirmed OUT redistribution is learned/role-aware, not proportional.
+    post_out_alloc, out_impact = apply_confirmed_outs(
+        healthy_alloc,
+        matrix,
+        out_players=out_players,
+        total_minutes=200.0,
+    )
+
+    # Explicit minute targets are separate current-state restrictions/returns.
+    metadata = manual_context.get("projected_minutes", {}) or {}
+    metadata_targets = {}
+    for pname in post_out_alloc:
+        v = _case_lookup(metadata, pname, None)
+        if v is not None and pname not in out_players:
+            metadata_targets[pname] = float(v)
+
+    explicit_targets = dict(metadata_targets)
+    for pname, val in ui_overrides.items():
+        if pname in post_out_alloc and pname not in out_players:
+            explicit_targets[pname] = float(val)
+
+    final_alloc, override_impact = apply_role_aware_overrides(
+        post_out_alloc,
         explicit_targets,
         matrix,
         out_players=out_players,
@@ -463,14 +649,13 @@ def project_team_minutes(
     )
 
     out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-
-    out["Auto Baseline Min"] = out["Player"].map(base_alloc).fillna(0.0)
+    out["In Active Rotation"] = out["Player"].isin(chosen)
+    out["Healthy Baseline Min"] = out["Player"].map(healthy_alloc).fillna(0.0)
+    out["Auto Baseline Min"] = out["Player"].map(post_out_alloc).fillna(0.0)
     out["Projected Min"] = out["Player"].map(final_alloc).fillna(0.0)
+    out["OUT Replacement Delta"] = out["Auto Baseline Min"] - out["Healthy Baseline Min"]
     out["Override Delta"] = out["Projected Min"] - out["Auto Baseline Min"]
 
-    # Source labels
     def source_for(name):
         if name in out_players:
             return "OUT"
@@ -478,61 +663,54 @@ def project_team_minutes(
             return "TRADER"
         if name in metadata_targets:
             return "METADATA"
+        if name not in chosen:
+            return "OUTSIDE ROTATION"
         return "AUTO"
 
     out["Source"] = out["Player"].map(source_for)
 
-    # Preserve AUTO uncertainty shape around the final constrained central.
     ratio = np.where(
-        pd.to_numeric(out["Raw Auto Min"], errors="coerce")
-        .fillna(0).to_numpy() > 0.5,
-        out["Projected Min"].to_numpy()
-        / np.maximum(out["Raw Auto Min"].to_numpy(), 0.5),
+        pd.to_numeric(out["Raw Auto Min"], errors="coerce").fillna(0).to_numpy() > 0.5,
+        out["Projected Min"].to_numpy() /
+        np.maximum(out["Raw Auto Min"].to_numpy(), 0.5),
         1.0,
     )
     out["Minutes SD"] = np.clip(
-        out["Raw SD"].to_numpy()
-        * np.sqrt(np.clip(ratio, 0.6, 1.6)),
+        out["Raw SD"].to_numpy() * np.sqrt(np.clip(ratio, 0.6, 1.6)),
         1.0, 5.5
     )
     out["Low Min"] = np.clip(
-        out["Projected Min"] - 1.20 * out["Minutes SD"],
-        0, 40
+        out["Projected Min"] - 1.20 * out["Minutes SD"], 0, 40
     )
     out["High Min"] = np.clip(
-        out["Projected Min"] + 1.20 * out["Minutes SD"],
-        0, 40
+        out["Projected Min"] + 1.20 * out["Minutes SD"], 0, 40
     )
 
     fixed_mask = out["Source"].isin(["TRADER", "METADATA"])
     out.loc[fixed_mask, "Minutes SD"] = np.minimum(
-        out.loc[fixed_mask, "Minutes SD"],
-        2.25
+        out.loc[fixed_mask, "Minutes SD"], 2.25
     )
     out.loc[fixed_mask, "Low Min"] = np.clip(
         out.loc[fixed_mask, "Projected Min"]
-        - 1.20 * out.loc[fixed_mask, "Minutes SD"],
-        0, 40
+        - 1.20 * out.loc[fixed_mask, "Minutes SD"], 0, 40
     )
     out.loc[fixed_mask, "High Min"] = np.clip(
         out.loc[fixed_mask, "Projected Min"]
-        + 1.20 * out.loc[fixed_mask, "Minutes SD"],
-        0, 40
+        + 1.20 * out.loc[fixed_mask, "Minutes SD"], 0, 40
     )
     out.loc[
-        out["Source"] == "OUT",
+        out["Source"].isin(["OUT", "OUTSIDE ROTATION"]),
         ["Minutes SD", "Low Min", "High Min"]
     ] = 0.0
 
-    # Store compact audit objects in dataframe attrs so the Streamlit layer can
-    # expose them without changing the model interface.
     out.attrs["redistribution_matrix_audit"] = matrix_audit
-    out.attrs["override_impact"] = impact
+    out.attrs["out_redistribution_impact"] = out_impact
+    out.attrs["override_impact"] = override_impact
+    out.attrs["target_rotation_size"] = target_size
 
     return out.sort_values(
         "Projected Min", ascending=False
     ).reset_index(drop=True)
-
 
 
 # ---------------------------------------------------------------------

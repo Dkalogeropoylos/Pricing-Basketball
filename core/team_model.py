@@ -275,15 +275,30 @@ def build_team_profile(
 
     # Same philosophy as the player engine: recent shooting is NOT accepted as
     # raw future truth. Use the larger sample and regress by actual attempts.
+    # Use the CURRENT loaded league as the shooting prior instead of fixed
+    # constants. This avoids baking an NBA/WNBA-era assumption into 3PM/2PM.
+    # The team still owns most of its shooting ability; the league prior only
+    # regularizes finite-attempt noise.
+    if league_team_logs is not None and not league_team_logs.empty:
+        lg_full = _feat(league_team_logs, league_team_logs=league_team_logs, game_weights=None)
+        lg_three = float(lg_full.get("three_pct", 0.340))
+        lg_two = float(lg_full.get("two_pct", 0.510))
+        lg_ft = float(lg_full.get("ft_pct", 0.785))
+    else:
+        lg_three, lg_two, lg_ft = 0.340, 0.510, 0.785
+
     p["three_pct"] = _shrink(
-        full.get("three_pct", np.nan), full.get("three_att", 0.0), 0.340, 45.0
+        full.get("three_pct", np.nan), full.get("three_att", 0.0), lg_three, 45.0
     )
     p["two_pct"] = _shrink(
-        full.get("two_pct", np.nan), full.get("two_att", 0.0), 0.510, 70.0
+        full.get("two_pct", np.nan), full.get("two_att", 0.0), lg_two, 70.0
     )
     p["ft_pct"] = _shrink(
-        full.get("ft_pct", np.nan), full.get("ft_att", 0.0), 0.785, 40.0
+        full.get("ft_pct", np.nan), full.get("ft_att", 0.0), lg_ft, 40.0
     )
+    p["league_three_pct"] = lg_three
+    p["league_two_pct"] = lg_two
+    p["league_ft_pct"] = lg_ft
 
     # Defensive rates need sensible bounds after weighted blending.
     p["dreb_capture"] = float(np.clip(p.get("dreb_capture", 0.94), 0.78, 0.995))
@@ -350,16 +365,24 @@ def team_location_modifiers(
     min_games: int = 5,
     exclude_opponent_abbr: Optional[str] = None,
 ) -> Tuple[Dict[str, float], pd.DataFrame]:
-    """
-    Small home/away correction, explicitly shrinked so the location split does
-    not become a second full sample. The non-overlapping profile remains the
-    primary signal.
+    """Small, data-driven home/away correction -- never a generic away penalty.
+
+    Research on basketball home advantage is much more consistent for scoring
+    efficiency than for tactical opportunity counts such as possessions and
+    2PA/3PA attempts.  v2.14 therefore does NOT assume "away teams shoot worse".
+
+    For each stat we estimate the team's location-vs-overall deviation and shrink
+    it heavily toward the WNBA-wide location-vs-overall deviation in the loaded
+    data.  If the data show almost no effect, the modifier is almost exactly 1.
+    Tactical opportunity variables are capped more tightly than shooting
+    efficiency / foul-related variables.
     """
     neutral = {
         "FGA": 1.0, "3P_SHARE": 1.0,
         "3PA": 1.0, "2PA": 1.0, "FTA": 1.0, "TOV": 1.0,
         "OREB": 1.0, "AST": 1.0, "PF": 1.0,
         "DREB": 1.0, "STL": 1.0, "BLK": 1.0,
+        "3P_PCT": 1.0, "2P_PCT": 1.0,
     }
     mask = _home_mask(team_log)
     if mask is None:
@@ -380,13 +403,23 @@ def team_location_modifiers(
 
     base = _feat(base_log, league_team_logs=league_team_logs)
     loc = _feat(split, league_team_logs=league_team_logs)
+
+    # League-wide empirical location prior.  This is the only direction prior;
+    # there is no hard-coded home boost or away shooting penalty.
+    lg_base = lg_loc = {}
+    if league_team_logs is not None and not league_team_logs.empty:
+        lgmask = _home_mask(league_team_logs)
+        if lgmask is not None:
+            lg_base = _feat(league_team_logs, league_team_logs=league_team_logs)
+            lg_split = league_team_logs[lgmask if is_home else ~lgmask].copy()
+            if len(lg_split) >= 20:
+                lg_loc = _feat(lg_split, league_team_logs=league_team_logs)
+
     mapping = {
         "FGA": "fga_live",
         "3P_SHARE": "three_share",
-        # Legacy audit rows retained but Team Markets no longer multiply
-        # independent 3PA and 2PA opportunity rates.
-        "3PA": "three_pa_live",
-        "2PA": "two_pa_live",
+        "3PA": "three_pa_live",   # audit compatibility only
+        "2PA": "two_pa_live",     # audit compatibility only
         "FTA": "fta_pp",
         "TOV": "tov_pp",
         "OREB": "oreb_per_miss",
@@ -395,27 +428,73 @@ def team_location_modifiers(
         "DREB": "dreb_capture",
         "STL": "stl_per_opp_tov",
         "BLK": "blk_pp",
+        "3P_PCT": "three_pct",
+        "2P_PCT": "two_pct",
     }
+    prob_keys = {"3P_SHARE", "3P_PCT", "2P_PCT", "DREB", "STL"}
+    # Tactical choices receive minimal location weight; effectiveness can move a
+    # little more if the actual WNBA/team split supports it.
+    caps = {
+        "FGA": 0.015, "3P_SHARE": 0.015, "3PA": 0.015, "2PA": 0.015,
+        "FTA": 0.025, "TOV": 0.020, "OREB": 0.020, "AST": 0.020,
+        "PF": 0.025, "DREB": 0.020, "STL": 0.020, "BLK": 0.025,
+        "3P_PCT": 0.030, "2P_PCT": 0.030,
+    }
+
+    def tlog(v, prob=False):
+        if prob:
+            v = float(np.clip(v, 1e-5, 1 - 1e-5))
+            return float(np.log(v / (1 - v)))
+        return float(np.log(max(float(v), 1e-5)))
+
     rows = []
     out = dict(neutral)
+    n = int(len(split))
+    team_conf = float(np.clip(n / (n + 24.0), 0.0, 1.0))
+
     for market, key in mapping.items():
-        b = base.get(key, np.nan)
-        l = loc.get(key, np.nan)
-        raw_ratio = l / b if np.isfinite(b) and b > 0 and np.isfinite(l) else 1.0
-        raw_ratio = float(np.clip(raw_ratio, 0.75, 1.25))
-        # Only 20% of the split deviation is used, capped at +/-6%.
-        mod = float(np.clip(raw_ratio ** 0.20, 0.94, 1.06))
+        b = float(base.get(key, np.nan))
+        l = float(loc.get(key, np.nan))
+        lb = float(lg_base.get(key, np.nan)) if lg_base else np.nan
+        ll = float(lg_loc.get(key, np.nan)) if lg_loc else np.nan
+        prob = market in prob_keys
+
+        if not (np.isfinite(b) and b > 0 and np.isfinite(l) and l > 0):
+            out[market] = 1.0
+            continue
+
+        team_effect = tlog(l, prob) - tlog(b, prob)
+        if np.isfinite(lb) and lb > 0 and np.isfinite(ll) and ll > 0:
+            league_effect = tlog(ll, prob) - tlog(lb, prob)
+        else:
+            league_effect = 0.0
+
+        # Empirical Bayes: small team samples are pulled strongly to the WNBA
+        # location effect; a large stable team split can express more of itself.
+        blended_effect = team_conf * team_effect + (1.0 - team_conf) * league_effect
+
+        if prob:
+            target = 1.0 / (1.0 + np.exp(-(tlog(b, True) + blended_effect)))
+            mod = target / b
+        else:
+            mod = float(np.exp(blended_effect))
+
+        cap = float(caps[market])
+        mod = float(np.clip(mod, 1.0 - cap, 1.0 + cap))
         out[market] = mod
         rows.append({
             "Stat": market,
             "Overall": b,
             "Location": l,
-            "Raw ratio": raw_ratio,
+            "Team raw ratio": (l / b) if b > 0 else np.nan,
+            "League location ratio": (ll / lb) if np.isfinite(lb) and lb > 0 and np.isfinite(ll) else np.nan,
+            "Team location confidence": team_conf,
             "Applied modifier": mod,
-            "Games": int(len(split)),
+            "Games": n,
+            "Rule": "data-driven; no hard-coded home/away direction",
         })
-    return out, pd.DataFrame(rows)
 
+    return out, pd.DataFrame(rows)
 
 def h2h_team_audit(
     league_team_logs: pd.DataFrame,
@@ -447,7 +526,7 @@ def h2h_profile_blend(
     opponent_abbr: str,
     base_profile: dict,
     rotation_similarity: float = 1.0,
-    max_weight: float = 0.15,
+    max_weight: float = 0.10,
 ) -> Tuple[dict, pd.DataFrame]:
     """Blend a DISJOINT same-season H2H sample into structural team rates.
 
@@ -457,8 +536,10 @@ def h2h_profile_blend(
     because two or three games are too noisy for efficiency estimation.
 
     Weight:
-        0.20 * N/(N+2) * rotation_similarity, capped at max_weight.
-    With two reasonably comparable H2Hs this is usually ~7-10%.
+        0.20 * N/(N+2) * rotation_similarity, capped at 10%.
+    Same-season H2H is deliberately a small matchup-specific layer because
+    pair samples are sparse; two comparable H2Hs are usually ~6-8%, while
+    even four games cannot become more than 10%.
     """
     out = dict(base_profile)
     if league_team_logs is None or league_team_logs.empty:

@@ -287,18 +287,19 @@ def _shrink_to_league(obs: float, league: float, games: float, k: float = 10.0) 
     return float(c * obs + (1.0 - c) * league)
 
 
-def team_matchup_modifiers(overall_profile, own_profile=None):
-    """Team-market context with structural offense/defense blending.
+def team_matchup_modifiers(overall_profile, own_profile=None, elasticities=None):
+    """Opponent adjustment for Team Markets using league-calibrated elasticity.
 
-    v2.12 changes two high-impact opportunity layers:
-      * 3P_SHARE is no longer own share times a +/-6% defensive multiplier.
-        The offense share and the opponent-allowed share are blended in logit
-        space after the defensive sample is shrunk toward league average.
-      * FTA/poss is similarly blended in log-rate space. This lets a genuine
-        foul-suppressing defense meaningfully pull down a high-FTA offense.
+    Conceptually:
+        current offense identity
+        + beta_stat * (opponent allowed - league average)
 
-    Other markets retain the v2.11 correction-style modifiers because they were
-    already behaving stably in audit tests.
+    where beta_stat is learned from historical pregame team-games by
+    ``fit_opponent_elasticities``. Shares/percentages are adjusted in logit
+    space; positive rates are adjusted in log space. This keeps opponent
+    information meaningful without treating the opponent's raw allowed average
+    as a second full sample or inventing a different hand-tuned exponent for
+    every matchup.
     """
     mods = overall_profile.get("modifiers", {})
     out = {
@@ -316,41 +317,69 @@ def team_matchup_modifiers(overall_profile, own_profile=None):
     if not own_profile:
         return out
 
+    elasticities = elasticities or {}
+    # If the empirical calibrator is unavailable, use only the same small
+    # structural floors used by fit_opponent_elasticities -- never the old
+    # hand-tuned 30-55% response coefficients.
+    defaults = {
+        "FGA_LIVE": 0.04,
+        "3P_SHARE": 0.08,
+        "FTA": 0.08,
+        "TOV": 0.08,
+        "OREB_PER_MISS": 0.08,
+        "AST_PER_MAKE": 0.06,
+        "PF": 0.06,
+        "3P_PCT": 0.03,
+        "2P_PCT": 0.03,
+    }
     rates = overall_profile.get("rates", {}) or {}
     lg = rates.get("league", {}) or {}
     opp = rates.get("opponent", {}) or {}
     games = float(opp.get("games", 0) or 0)
 
-    # Shot mix: offense remains primary, but an extreme defensive shot profile
-    # can now move the result materially. Defensive weight grows modestly when
-    # the opponent is further from league average; it is still capped.
-    own_share = float(own_profile.get("three_share", np.nan))
-    lg_share = float(lg.get("3P_SHARE", np.nan))
-    opp_share = float(opp.get("3P_SHARE", np.nan))
-    if np.isfinite(own_share) and own_share > 0 and np.isfinite(lg_share) and np.isfinite(opp_share):
-        opp_share_s = _shrink_to_league(opp_share, lg_share, games, k=10.0)
-        # Apply the DEFENSIVE DEVIATION FROM LEAGUE to the offense, rather than
-        # averaging the offense directly toward the defense. This preserves a
-        # team's own style in ordinary matchups but lets an extreme shot-profile
-        # defense matter materially. Beta rises only when the defense is truly
-        # far from league average.
-        beta = float(np.clip(0.45 + 14.0 * abs(opp_share_s - lg_share), 0.45, 1.00))
-        target_share = _inv_logit(
-            _logit(own_share) + beta * (_logit(opp_share_s) - _logit(lg_share))
-        )
-        out["3P_SHARE"] = float(np.clip(target_share / own_share, 0.88, 1.12))
+    def beta(name):
+        return float(elasticities.get(name, defaults[name]))
 
-    # Free throws: use a genuine offense/defense interaction instead of leaving
-    # a high own FTA rate almost untouched by a foul-suppressing opponent.
-    own_fta = float(own_profile.get("fta_pp", np.nan))
-    lg_fta = float(lg.get("FTA", np.nan))
-    opp_fta = float(opp.get("FTA", np.nan))
-    if np.isfinite(own_fta) and own_fta > 0 and np.isfinite(lg_fta) and lg_fta > 0 and np.isfinite(opp_fta) and opp_fta > 0:
-        opp_fta_s = _shrink_to_league(opp_fta, lg_fta, games, k=10.0)
-        def_w = 0.40
-        target_fta = float(np.exp((1.0 - def_w) * np.log(own_fta) + def_w * np.log(opp_fta_s)))
-        out["FTA"] = float(np.clip(target_fta / own_fta, 0.85, 1.15))
+    def rate_modifier(feature, own_key, lg_key=None, opp_key=None, bounds=(0.85, 1.15), k=10.0):
+        lk = lg_key or feature
+        ok = opp_key or feature
+        own = float(own_profile.get(own_key, np.nan))
+        lv = float(lg.get(lk, np.nan))
+        ov = float(opp.get(ok, np.nan))
+        if not (np.isfinite(own) and own > 0 and np.isfinite(lv) and lv > 0 and np.isfinite(ov) and ov > 0):
+            return None
+        ovs = _shrink_to_league(ov, lv, games, k=k)
+        target = float(np.exp(np.log(own) + beta(feature) * (np.log(ovs) - np.log(lv))))
+        return float(np.clip(target / own, bounds[0], bounds[1]))
 
+    def prob_modifier(feature, own_key, lg_key, opp_key, bounds=(0.94, 1.06), k=14.0):
+        own = float(own_profile.get(own_key, np.nan))
+        lv = float(lg.get(lg_key, np.nan))
+        ov = float(opp.get(opp_key, np.nan))
+        if not (np.isfinite(own) and 0 < own < 1 and np.isfinite(lv) and 0 < lv < 1 and np.isfinite(ov) and 0 < ov < 1):
+            return None
+        ovs = _shrink_to_league(ov, lv, games, k=k)
+        target = _inv_logit(_logit(own) + beta(feature) * (_logit(ovs) - _logit(lv)))
+        return float(np.clip(target / own, bounds[0], bounds[1]))
+
+    replacements = {
+        "FGA": rate_modifier("FGA_LIVE", "fga_live", bounds=(0.94, 1.06)),
+        "FTA": rate_modifier("FTA", "fta_pp", bounds=(0.84, 1.16)),
+        "TOV": rate_modifier("TOV", "tov_pp", bounds=(0.86, 1.14)),
+        "OREB": rate_modifier("OREB_PER_MISS", "oreb_per_miss", bounds=(0.86, 1.14)),
+        "AST": rate_modifier("AST_PER_MAKE", "assist_per_make", bounds=(0.88, 1.12)),
+        "PF": rate_modifier("PF", "pf_pp", bounds=(0.86, 1.14)),
+        "3P_SHARE": prob_modifier("3P_SHARE", "three_share", "3P_SHARE", "3P_SHARE", bounds=(0.84, 1.16), k=10.0),
+        # Shooting efficiency remains the most strongly shrunk opponent layer.
+        "3P_PCT": prob_modifier("3P_PCT", "three_pct", "3P_PCT", "3P_PCT", bounds=(0.94, 1.06), k=18.0),
+        "2P_PCT": prob_modifier("2P_PCT", "two_pct", "2P_PCT", "2P_PCT", bounds=(0.94, 1.06), k=18.0),
+    }
+    for key, value in replacements.items():
+        if value is not None and np.isfinite(value):
+            out[key] = float(value)
+
+    # BLK keeps the v3 own-ability/opponent-suffered logic that has already
+    # calibrated well in audits; do not overwrite it with the generic learner.
     return out
 
 
@@ -439,3 +468,204 @@ def block_position_susceptibility_modifier(
         "Applied modifier": mod,
     }
     return mod, audit
+
+
+# ---------------------------------------------------------------------
+# v2.13 empirical opponent-elasticity calibration
+# ---------------------------------------------------------------------
+def _single_game_structural_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Return one-row-per-team-game structural features used by Team Markets."""
+    x = df.copy()
+    for c in ["FGA","FGM","FG3A","FG3M","FTA","TOV","OREB","AST","PF"]:
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
+    x["POSS_CAL"] = estimate_possessions(x).clip(lower=1e-6)
+    live = (x["POSS_CAL"] - x["TOV"]).clip(lower=1e-6)
+    misses = (x["FGA"] - x["FGM"]).clip(lower=1e-6)
+    a2 = (x["FGA"] - x["FG3A"]).clip(lower=1e-6)
+    m2 = (x["FGM"] - x["FG3M"]).clip(lower=0.0)
+    out = pd.DataFrame({
+        "GAME_DATE": pd.to_datetime(x["GAME_DATE"], errors="coerce"),
+        "GAME_ID": x["GAME_ID"].astype(str),
+        "TEAM_ABBR": x["TEAM_ABBR"].astype(str),
+        "OPP_ABBR": x["OPP_ABBR"].astype(str),
+        "FGA_LIVE": x["FGA"] / live,
+        "3P_SHARE": x["FG3A"] / x["FGA"].replace(0, np.nan),
+        "FTA": x["FTA"] / x["POSS_CAL"],
+        "TOV": x["TOV"] / x["POSS_CAL"],
+        "OREB_PER_MISS": x["OREB"] / misses,
+        "AST_PER_MAKE": x["AST"] / x["FGM"].replace(0, np.nan),
+        "PF": x["PF"] / x["POSS_CAL"],
+        "3P_PCT": x["FG3M"] / x["FG3A"].replace(0, np.nan),
+        "2P_PCT": m2 / a2,
+    })
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def _transform_feature(name: str, s: pd.Series) -> pd.Series:
+    v = pd.to_numeric(s, errors="coerce").astype(float)
+    if name in {"3P_SHARE", "3P_PCT", "2P_PCT"}:
+        v = v.clip(1e-4, 1 - 1e-4)
+        return np.log(v / (1.0 - v))
+    return np.log(v.clip(lower=1e-4))
+
+
+def fit_opponent_elasticities(league_team_logs: pd.DataFrame):
+    """Estimate stat-specific opponent response from historical WNBA team-games.
+
+    There is deliberately NO universal "opponent weight".  For every derivative
+    feature we build a pregame own baseline, a pregame opponent-allowed baseline
+    and a pregame league baseline.  The coefficient is the predictive slope of
+    the realized deviation from the team's own identity on the opponent's
+    deviation from league average.
+
+    v2.14 changes two things versus v2.13:
+      * strong hand-picked priors (e.g. 0.55 for 3P share) are removed;
+      * the learned slope is shrunk by both sample size and its statistical
+        signal, with only a SMALL non-zero structural floor.  Thus opponent
+        context always matters a little, but it only matters a lot when WNBA
+        history actually supports it.
+
+    Shares / shooting percentages are learned in logit space. Positive rates are
+    learned in log space. The model remains league-level rather than team-specific
+    because ~30-40 games are far too noisy for a separate elasticity per team.
+    """
+    if league_team_logs is None or league_team_logs.empty:
+        return {}, pd.DataFrame()
+
+    x = _single_game_structural_features(league_team_logs)
+    x = x.sort_values(["GAME_DATE", "GAME_ID", "TEAM_ABBR"]).reset_index(drop=True)
+    features = [
+        "FGA_LIVE", "3P_SHARE", "FTA", "TOV", "OREB_PER_MISS",
+        "AST_PER_MAKE", "PF", "3P_PCT", "2P_PCT",
+    ]
+
+    # Small structural floors only. These are NOT target weights; they simply
+    # prevent a noisy early-season fit from pretending the opponent is irrelevant.
+    floors = {
+        "FGA_LIVE": 0.04,
+        "3P_SHARE": 0.08,
+        "FTA": 0.08,
+        "TOV": 0.08,
+        "OREB_PER_MISS": 0.08,
+        "AST_PER_MAKE": 0.06,
+        "PF": 0.06,
+        "3P_PCT": 0.03,
+        "2P_PCT": 0.03,
+    }
+    caps = {
+        "FGA_LIVE": 0.55,
+        "3P_SHARE": 0.95,
+        "FTA": 0.85,
+        "TOV": 0.75,
+        "OREB_PER_MISS": 0.75,
+        "AST_PER_MAKE": 0.65,
+        "PF": 0.70,
+        # Opponent FG% is real, but raw opponent shooting percentage is noisy.
+        "3P_PCT": 0.35,
+        "2P_PCT": 0.35,
+    }
+
+    result, audit = {}, []
+    for feat in features:
+        tmp = x[["GAME_DATE", "GAME_ID", "TEAM_ABBR", "OPP_ABBR", feat]].copy()
+
+        # Pregame own-offense mean.
+        tmp["OWN_PRIOR"] = (
+            tmp.groupby("TEAM_ABBR")[feat]
+            .transform(lambda z: z.expanding(min_periods=5).mean().shift(1))
+        )
+        tmp["OWN_N"] = tmp.groupby("TEAM_ABBR").cumcount()
+
+        # Pregame defensive allowed mean. Rows with OPP_ABBR=D are exactly the
+        # offensive outcomes previously allowed by defense D.
+        tmp["DEF_PRIOR"] = (
+            tmp.groupby("OPP_ABBR")[feat]
+            .transform(lambda z: z.expanding(min_periods=5).mean().shift(1))
+        )
+        tmp["DEF_N"] = tmp.groupby("OPP_ABBR").cumcount()
+
+        # Pregame league baseline by GAME, preventing the other row of the same
+        # game from leaking into the prior.
+        game_means = (
+            tmp.groupby(["GAME_DATE", "GAME_ID"], sort=True)[feat]
+            .mean().reset_index().sort_values(["GAME_DATE", "GAME_ID"])
+        )
+        game_means["LG_PRIOR"] = game_means[feat].expanding(min_periods=10).mean().shift(1)
+        tmp = tmp.merge(
+            game_means[["GAME_DATE", "GAME_ID", "LG_PRIOR"]],
+            on=["GAME_DATE", "GAME_ID"], how="left",
+        )
+        tmp = tmp.dropna(subset=[feat, "OWN_PRIOR", "DEF_PRIOR", "LG_PRIOR"])
+        tmp = tmp[(tmp["OWN_N"] >= 5) & (tmp["DEF_N"] >= 5)].copy()
+
+        floor = floors[feat]
+        cap = caps[feat]
+        raw = np.nan
+        se_beta = np.nan
+        base_rmse = adj_rmse = np.nan
+        gain = 0.0
+        signal_conf = 0.0
+        sample_conf = 0.0
+
+        if len(tmp) < 60:
+            beta = floor
+        else:
+            y_actual = _transform_feature(feat, tmp[feat])
+            own_t = _transform_feature(feat, tmp["OWN_PRIOR"])
+            def_t = _transform_feature(feat, tmp["DEF_PRIOR"])
+            lg_t = _transform_feature(feat, tmp["LG_PRIOR"])
+
+            xv = (def_t - lg_t).clip(-0.75, 0.75).to_numpy(dtype=float)
+            yv = (y_actual - own_t).clip(-0.90, 0.90).to_numpy(dtype=float)
+            good = np.isfinite(xv) & np.isfinite(yv)
+            xv, yv = xv[good], yv[good]
+
+            denom = float(np.sum(xv * xv))
+            if denom <= 1e-9 or len(xv) < 40:
+                beta = floor
+            else:
+                raw_unclipped = float(np.sum(xv * yv) / denom)
+                raw = float(np.clip(raw_unclipped, 0.0, 1.25))
+
+                residual = yv - raw * xv
+                dof = max(len(xv) - 1, 1)
+                sigma2 = float(np.sum(residual * residual) / dof)
+                se_beta = float(np.sqrt(max(sigma2 / denom, 0.0)))
+
+                # How believable is the sign/magnitude of the slope?
+                signal_conf = float(
+                    (raw * raw) / (raw * raw + se_beta * se_beta + 1e-9)
+                )
+                sample_conf = float(len(xv) / (len(xv) + 120.0))
+
+                beta = floor + (raw - floor) * signal_conf * sample_conf
+                beta = float(np.clip(beta, floor, cap))
+
+                base_rmse = float(np.sqrt(np.mean(yv ** 2))) if len(yv) else np.nan
+                adj_rmse = float(np.sqrt(np.mean((yv - beta * xv) ** 2))) if len(yv) else np.nan
+                if np.isfinite(base_rmse) and base_rmse > 0 and np.isfinite(adj_rmse):
+                    gain = float((base_rmse - adj_rmse) / base_rmse)
+                    # If the opponent layer does not improve historical prediction,
+                    # do not let noisy correlation create a large adjustment.
+                    if gain <= 0:
+                        beta = floor
+                        adj_rmse = float(np.sqrt(np.mean((yv - beta * xv) ** 2)))
+                        gain = float((base_rmse - adj_rmse) / base_rmse)
+
+        result[feat] = float(beta)
+        audit.append({
+            "Feature": feat,
+            "Learned elasticity": float(beta),
+            "Raw slope": raw,
+            "Slope SE": se_beta,
+            "Signal confidence": signal_conf,
+            "Sample confidence": sample_conf,
+            "Structural floor": floor,
+            "Calibration rows": int(len(tmp)),
+            "Base transformed RMSE": base_rmse,
+            "Opponent-adjusted RMSE": adj_rmse,
+            "Relative RMSE gain": gain,
+        })
+
+    return result, pd.DataFrame(audit)
