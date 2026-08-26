@@ -44,6 +44,7 @@ from core.availability import (
 )
 from core.availability_impact import (
     recent_team_player_names, augment_current_pool, build_rotation_state_impact,
+    defensive_absence_bridge,
 )
 
 
@@ -52,10 +53,10 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.15.1")
+st.title("🏀 Basketball Pricing Engine v2.16.0")
 st.caption(
-    "Single-score near-state availability + stat-specific absence relevance • 50k cached sims • "
-    "role-aware minute/event redistribution • non-overlap Old/G6–10/L5 • team/player state consistency"
+    "Relevant-state player samples • stat-specific role routing • defensive OUT bridge • "
+    "possession-consistent FGA chain • 50k cached sims • non-overlap Old/G6–10/L5"
 )
 
 
@@ -963,6 +964,20 @@ with tab_team:
         home_roster_mod = home_rot_impact.modifiers
         away_roster_mod = away_rot_impact.modifiers
 
+        # v2.16 current DEFENSIVE roster bridge.  Each current OUT is evaluated
+        # separately from her first team appearance onward.  >=10 MIN is ON,
+        # 0 MIN is OFF, and 0<MIN<10 is excluded from both groups.  The combined
+        # effect is strongly shrunk/overlap-protected and modifies the OPPONENT
+        # offense; it is not another historical outer sample.
+        home_def_out_mod, home_def_out_audit = defensive_absence_bridge(
+            player_db, team_db, pool, setup["home_abbr"], home_out,
+            exclude_opponent_abbr=setup["away_abbr"], on_min_minutes=10.0,
+        )
+        away_def_out_mod, away_def_out_audit = defensive_absence_bridge(
+            player_db, team_db, pool, setup["away_abbr"], away_out,
+            exclude_opponent_abbr=setup["home_abbr"], on_min_minutes=10.0,
+        )
+
         # Structural matchup blending should see the CURRENT offensive identity.
         # The final context still multiplies the roster modifier because the
         # simulator's base profile is historical; this is not double counting.
@@ -1005,27 +1020,28 @@ with tab_team:
             exclude_opponent_abbr=setup["home_abbr"],
         )
 
-        def combined_mods(auto, loc, roster):
+        def combined_mods(auto, loc, roster, opp_def_out):
             # Conditional layers are combined once each:
-            # historical profile -> roster state -> opponent interaction -> small location.
+            # historical offense -> own roster state -> opponent baseline matchup
+            # -> CURRENT opponent defensive roster -> small location.
             return {
                 "FGA": float(np.clip(roster.get("FGA", 1.0) * auto.get("FGA", 1.0) * loc.get("FGA", 1.0), 0.90, 1.10)),
-                "3P_SHARE": float(np.clip(roster.get("3P_SHARE", 1.0) * auto.get("3P_SHARE", 1.0) * loc.get("3P_SHARE", 1.0), 0.84, 1.16)),
-                "FTA": float(np.clip(roster.get("FTA", 1.0) * auto.get("FTA", 1.0) * loc.get("FTA", 1.0), 0.80, 1.20)),
-                "TOV": float(np.clip(roster.get("TOV", 1.0) * auto.get("TOV", 1.0) * loc.get("TOV", 1.0), 0.82, 1.18)),
-                "OREB": float(np.clip(roster.get("OREB", 1.0) * auto.get("OREB", 1.0) * loc.get("OREB", 1.0), 0.82, 1.18)),
-                "AST": float(np.clip(roster.get("AST", 1.0) * auto.get("AST", 1.0) * loc.get("AST", 1.0), 0.82, 1.18)),
+                "3P_SHARE": float(np.clip(roster.get("3P_SHARE", 1.0) * auto.get("3P_SHARE", 1.0) * opp_def_out.get("3P_SHARE",1.0) * loc.get("3P_SHARE", 1.0), 0.84, 1.16)),
+                "FTA": float(np.clip(roster.get("FTA", 1.0) * auto.get("FTA", 1.0) * opp_def_out.get("FTA",1.0) * loc.get("FTA", 1.0), 0.80, 1.20)),
+                "TOV": float(np.clip(roster.get("TOV", 1.0) * auto.get("TOV", 1.0) * opp_def_out.get("TOV",1.0) * loc.get("TOV", 1.0), 0.82, 1.18)),
+                "OREB": float(np.clip(roster.get("OREB", 1.0) * auto.get("OREB", 1.0) * opp_def_out.get("OREB",1.0) * loc.get("OREB", 1.0), 0.82, 1.18)),
+                "AST": float(np.clip(roster.get("AST", 1.0) * auto.get("AST", 1.0) * opp_def_out.get("AST",1.0) * loc.get("AST", 1.0), 0.82, 1.18)),
                 "PF": float(np.clip(roster.get("PF", 1.0) * auto.get("PF", 1.0) * loc.get("PF", 1.0), 0.84, 1.16)),
                 "DREB": float(np.clip(roster.get("DREB", 1.0) * loc.get("DREB", 1.0), 0.88, 1.12)),
                 "STL": float(np.clip(roster.get("STL", 1.0) * loc.get("STL", 1.0), 0.86, 1.14)),
                 "BLK": float(np.clip(roster.get("BLK", 1.0) * auto.get("BLK", 1.0) * loc.get("BLK", 1.0), 0.82, 1.18)),
-                "3P_PCT": float(np.clip(roster.get("3P_PCT", 1.0) * auto.get("3P_PCT", 1.0) * loc.get("3P_PCT", 1.0), 0.92, 1.08)),
-                "2P_PCT": float(np.clip(roster.get("2P_PCT", 1.0) * auto.get("2P_PCT", 1.0) * loc.get("2P_PCT", 1.0), 0.92, 1.08)),
+                "3P_PCT": float(np.clip(roster.get("3P_PCT", 1.0) * auto.get("3P_PCT", 1.0) * opp_def_out.get("3P_PCT",1.0) * loc.get("3P_PCT", 1.0), 0.92, 1.08)),
+                "2P_PCT": float(np.clip(roster.get("2P_PCT", 1.0) * auto.get("2P_PCT", 1.0) * opp_def_out.get("2P_PCT",1.0) * loc.get("2P_PCT", 1.0), 0.92, 1.08)),
             }
 
 
-        home_mod = combined_mods(home_auto, home_loc, home_roster_mod)
-        away_mod = combined_mods(away_auto, away_loc, away_roster_mod)
+        home_mod = combined_mods(home_auto, home_loc, home_roster_mod, away_def_out_mod)
+        away_mod = combined_mods(away_auto, away_loc, away_roster_mod, home_def_out_mod)
 
         # v2.15.1: Streamlit widgets keep their session_state value after first
         # creation, so changing confirmed OUT / shared minutes / shrink K could
@@ -1041,6 +1057,8 @@ with tab_team:
             tuple(sorted((str(k), round(float(v), 4)) for k, v in (manual_context.get("projected_minutes", {}) or {}).items())),
             tuple((k, round(float(home_roster_mod.get(k, 1.0)), 5)) for k in sorted(home_roster_mod)),
             tuple((k, round(float(away_roster_mod.get(k, 1.0)), 5)) for k in sorted(away_roster_mod)),
+            tuple((k, round(float(home_def_out_mod.get(k, 1.0)), 5)) for k in sorted(home_def_out_mod)),
+            tuple((k, round(float(away_def_out_mod.get(k, 1.0)), 5)) for k in sorted(away_def_out_mod)),
             tuple((k, round(float(home_mod.get(k, 1.0)), 5)) for k in sorted(home_mod)),
             tuple((k, round(float(away_mod.get(k, 1.0)), 5)) for k in sorted(away_mod)),
         )
@@ -1141,6 +1159,8 @@ with tab_team:
             tuple(sorted((str(k), float(v)) for k, v in (manual_context.get("projected_minutes", {}) or {}).items())),
             tuple(round(home_roster_mod[k], 4) for k in sorted(home_roster_mod)),
             tuple(round(away_roster_mod[k], 4) for k in sorted(away_roster_mod)),
+            tuple(round(home_def_out_mod[k], 4) for k in sorted(home_def_out_mod)),
+            tuple(round(away_def_out_mod[k], 4) for k in sorted(away_def_out_mod)),
             round(home_h2h_sim, 4), round(away_h2h_sim, 4),
             round(home_blk_pos, 4), round(away_blk_pos, 4),
             tuple(round(home_mod[k], 4) for k in sorted(home_mod)),
@@ -1265,6 +1285,31 @@ with tab_team:
             st.caption("No bookmaker input is required. Compare the market later against Model line / Fair / Play-from columns above.")
 
             with st.expander("Model audit: buckets / location / H2H / conservation"):
+                st.markdown("**Possession identity audit**")
+                _poss_rows = []
+                for _abbr, _sim in [(setup["away_abbr"], away_sim), (setup["home_abbr"], home_sim)]:
+                    _m = _sim.mean(numeric_only=True)
+                    _recon = float(_m.get("FGA",0.0) - _m.get("OREB",0.0) + _m.get("TOV",0.0) + 0.44*_m.get("FTA",0.0))
+                    _poss = float(_m.get("POSS", shared_pace))
+                    _poss_rows.append({
+                        "Team": _abbr, "Sim POSS": _poss,
+                        "FGA-OREB+TOV+0.44FTA": _recon, "Identity gap": _recon-_poss,
+                    })
+                st.dataframe(pd.DataFrame(_poss_rows).round(3), use_container_width=True, hide_index=True)
+                st.caption("v2.16 target: the box-score possession identity should reconcile to the shared pace in expectation; a persistent multi-possession gap is a model bug, not a pace opinion.")
+
+                st.markdown("**Current defensive OUT bridge (individual ON/OFF splits)**")
+                st.caption(
+                    "For each current OUT: >=10 MIN = ON, 0 MIN = OFF, 0<MIN<10 excluded. "
+                    "Splits begin at that player's first appearance for the team and exclude current H2H. "
+                    "Combined modifiers are shrunk and overlap-protected; they adjust only the opponent offense."
+                )
+                if isinstance(home_def_out_audit, pd.DataFrame) and not home_def_out_audit.empty:
+                    st.markdown(f"**{setup['home_abbr']} defense OUT audit → affects {setup['away_abbr']} offense**")
+                    st.dataframe(home_def_out_audit.round(4), use_container_width=True, hide_index=True)
+                if isinstance(away_def_out_audit, pd.DataFrame) and not away_def_out_audit.empty:
+                    st.markdown(f"**{setup['away_abbr']} defense OUT audit → affects {setup['home_abbr']} offense**")
+                    st.dataframe(away_def_out_audit.round(4), use_container_width=True, hide_index=True)
                 st.markdown(f"**{setup['away_abbr']} buckets — {away_regime}**")
                 st.dataframe(away_audit.round(4), use_container_width=True, hide_index=True)
                 st.markdown(f"**{setup['home_abbr']} buckets — {home_regime}**")
@@ -1791,7 +1836,11 @@ with tab_player:
                             remaining = {}
                             for k, rv in raw_map.items():
                                 c = float(player_conf_by_stat.get(stat_for_role[k], 0.0))
-                                exponent = float(np.clip(1.0 - c, 0.0, 1.0))
+                                # v2.16: sparse empirical evidence must not hand
+                                # 100% control to the synthetic fallback.  The
+                                # residual structural bridge is capped at 65%
+                                # credibility until walk-forward calibration.
+                                exponent = float(0.65 * np.clip(1.0 - c, 0.0, 1.0))
                                 remaining[k] = exponent
                                 fallback[k] = float(np.exp(exponent * np.log(max(rv, 1e-6))))
                             fallback_audit = pd.DataFrame([{
@@ -2008,5 +2057,5 @@ with tab_audit:
 
 st.caption(
     "Model-implied fair odds are not yet historically calibrated true odds. "
-    "v2.15.1 keeps v2.15 near-state/redistribution logic and fixes stale Streamlit AUTO team modifiers after OUT/minute/context changes; 50k cached simulations remain default. Re-backtest before treating model fair odds as calibrated true probabilities."
+    "v2.16.0 adds relevant-OUT player states, stat-specific event routing, an individual defensive-absence bridge with <10 MIN exclusion, and a possession-consistent FGA chain. The v2.15.1 stale-state fix remains. Re-backtest before treating fair odds as calibrated true probabilities."
 )
