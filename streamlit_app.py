@@ -40,6 +40,7 @@ from core.pace_engine import (
 from core.role_splits import current_out_teammates, same_role_game_weights
 from core.availability import (
     confirmed_out_players, availability_state_weights, combine_game_weights,
+    availability_similarity_weight_maps, confidence_by_stat, combine_stat_weight_maps,
 )
 from core.availability_impact import (
     recent_team_player_names, augment_current_pool, build_rotation_state_impact,
@@ -51,16 +52,100 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.14.0")
+st.title("🏀 Basketball Pricing Engine v2.15.0")
 st.caption(
-    "Role-aware 8–10 player rotations + learned OUT-minute replacement • shared minute restrictions • "
-    "league-calibrated opponent elasticity • possession-first pace • non-overlap H2H • BLK v3"
+    "Single-score near-state availability + stat-specific absence relevance • 50k cached sims • "
+    "role-aware minute/event redistribution • non-overlap Old/G6–10/L5 • team/player state consistency"
 )
 
 
 @st.cache_data(show_spinner=False)
 def cached_opponent_elasticities(team_logs: pd.DataFrame):
     return fit_opponent_elasticities(team_logs)
+
+
+def _render_player_deep_analysis_impl(board, detail_store, target_ev, reference_odds):
+    """Fast UI-only player pricing panel.
+
+    When Streamlit supports fragments, changing player/market reruns only this
+    panel. The 50k simulation arrays and model audits are reused from session
+    state; no minutes/state/profile/Monte-Carlo work is repeated.
+    """
+    st.markdown("### 4. Price one selected player")
+    pname = st.selectbox(
+        "Deep-dive player", board["Player"].tolist(), key="deep_player"
+    )
+    detail = detail_store[pname]
+    sim = detail["sim"]
+    markets = ["PTS","REB","AST","3PM","3PA","FTA","PRA","PR","PA","AR"]
+
+    st.markdown("#### Automatic model lines + fair prices")
+    cached_table = detail.get("auto_market_table")
+    if not isinstance(cached_table, pd.DataFrame):
+        cached_table = auto_market_table(
+            sim, markets, target_ev=target_ev, reference_odds=reference_odds
+        )
+    st.dataframe(cached_table.round(3), use_container_width=True, hide_index=True)
+
+    with st.expander("Model audit", expanded=False):
+        st.write({
+            "opponent": detail["opp_abbr"],
+            "projected_minutes": detail["ctx"].projected_minutes,
+            "minutes_sd": detail["ctx"].minutes_sd,
+            "pace_multiplier": detail["ctx"].pace_multiplier,
+        })
+        st.markdown("**Non-overlapping sample audit**")
+        st.dataframe(detail["profile_audit"], use_container_width=True)
+        st.markdown("**Opponent / position audit**")
+        st.dataframe(detail["matchup_audit"].round(4), use_container_width=True)
+        st.markdown("**Confirmed-OUT exact/near-state player-role audit**")
+        st.dataframe(detail["same_role_audit"].round(3), use_container_width=True, hide_index=True)
+        st.markdown("**Residual role fallback audit**")
+        fb = detail.get("availability_fallback_audit")
+        if isinstance(fb, pd.DataFrame) and not fb.empty:
+            st.dataframe(fb.round(4), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Neutral fallback: no roster-state role redistribution applied.")
+
+        h2h = detail["plog"][
+            detail["plog"]["OPP_ABBR"].astype(str).str.upper()
+            == str(detail["opp_abbr"]).upper()
+        ]
+        st.markdown("**H2H — zero extra weight**")
+        if h2h.empty:
+            st.caption("No same-season H2H.")
+        else:
+            cols = [c for c in [
+                "GAME_DATE","OT_FLAG","MIN","PTS","REB","AST","FG3M","FG3A","FTA"
+            ] if c in h2h.columns]
+            st.dataframe(h2h[cols].sort_values("GAME_DATE", ascending=False), use_container_width=True)
+
+    st.markdown("#### Price ladder — no bookmaker input required")
+    ladder_market = st.selectbox("Market ladder", markets, key="player_ladder_market")
+    st.caption(
+        f"Play-from price = the minimum decimal price that gives at least "
+        f"{target_ev:.0%} model EV. Fair price alone is NOT labeled value. "
+        f"The {reference_odds:.2f} columns above also show the line needed at a common market price."
+    )
+    st.dataframe(
+        line_ladder(
+            sim[ladder_market],
+            center_line=model_line(sim[ladder_market])["line"],
+            radius=3, target_ev=target_ev,
+        ).round(3),
+        use_container_width=True, hide_index=True,
+    )
+    st.info(
+        "Use the sportsbook only as a comparison after the model is frozen: "
+        "match its offered line to this ladder, then require at least the displayed play-from price."
+    )
+
+
+# Streamlit >=1.37: selectbox changes inside this panel no longer rerun the full app.
+_render_player_deep_analysis = (
+    st.fragment(_render_player_deep_analysis_impl)
+    if hasattr(st, "fragment") else _render_player_deep_analysis_impl
+)
 
 
 def get_secret(name):
@@ -497,8 +582,8 @@ with tab_game:
             ac3.number_input(
                 "State shrink K", min_value=3.0, max_value=15.0, value=6.0, step=1.0,
                 help=(
-                    "Exact-state confidence = N/(N+K). If exact OUT games are sparse/zero, v2.12 uses a "
-                    "roster-synthetic fallback from the 200-minute rotation instead of leaving the team unchanged."
+                    "v2.15 near-state evidence is partial-pooled with K. Five fully comparable games is the maturity point; "
+                    "1–4 games still count with strong shrinkage. Synthetic rotation fallback fills only residual uncertainty."
                 ), key="availability_state_k",
             )
             manual_context = _apply_confirmed_out_selection(
@@ -509,8 +594,8 @@ with tab_game:
             )
             st.session_state["game_context"] = manual_context
             st.caption(
-                "Overlap guard: exact historical OUT games are primary. The roster-synthetic fallback is automatically "
-                "shrunk as exact-state confidence rises; it is not added as a fourth historical sample."
+                "Overlap guard: each historical game gets one stat-specific availability similarity score only. "
+                "Near-state relevance is an INNER weight inside Old/G6–10/L5; synthetic fallback fills only the remaining gap."
             )
 
         # Shared minute restrictions/returns are current-state information and
@@ -777,13 +862,19 @@ with tab_team:
         home_out = confirmed_out_players(manual_context, pool, setup["home_abbr"])
         away_out = confirmed_out_players(manual_context, pool, setup["away_abbr"])
 
-        home_avail_w, home_avail_audit, home_exact_ids = availability_state_weights(
-            player_db, home_log, setup["home_abbr"], home_out, k=float(availability_k),
-            exclude_opponent_abbr=setup["away_abbr"],
+        team_state_stats = [
+            "FGA", "3PA", "FTA", "TOV", "OREB", "DREB",
+            "AST", "STL", "BLK", "PF",
+        ]
+        home_avail_maps, home_avail_audit, home_state_scores = availability_similarity_weight_maps(
+            player_db, home_log, setup["home_abbr"], home_out, team_state_stats,
+            current_pool=pool, focal_player=None, k=float(availability_k),
+            maturity_games=5.0, exclude_opponent_abbr=setup["away_abbr"],
         )
-        away_avail_w, away_avail_audit, away_exact_ids = availability_state_weights(
-            player_db, away_log, setup["away_abbr"], away_out, k=float(availability_k),
-            exclude_opponent_abbr=setup["home_abbr"],
+        away_avail_maps, away_avail_audit, away_state_scores = availability_similarity_weight_maps(
+            player_db, away_log, setup["away_abbr"], away_out, team_state_stats,
+            current_pool=pool, focal_player=None, k=float(availability_k),
+            maturity_games=5.0, exclude_opponent_abbr=setup["home_abbr"],
         )
 
         home_rot_w = (
@@ -798,21 +889,24 @@ with tab_team:
                 out_players=away_out, residual_strength=0.15,
             ) if rotation_similarity_enabled else {}
         )
-        home_game_weights = combine_game_weights(home_avail_w, home_rot_w)
-        away_game_weights = combine_game_weights(away_avail_w, away_rot_w)
+        home_game_weights_by_stat = combine_stat_weight_maps(home_avail_maps, home_rot_w)
+        away_game_weights_by_stat = combine_stat_weight_maps(away_avail_maps, away_rot_w)
+        # Compatibility/audit view only. Team profile itself uses the stat-specific maps above.
+        home_game_weights = home_game_weights_by_stat.get("FGA", home_rot_w)
+        away_game_weights = away_game_weights_by_stat.get("FGA", away_rot_w)
 
         # Baseline excludes current-opponent H2H INSIDE the actual Old/G6-10/L5
-        # buckets. H2H is then added back once, with a small rotation-aware weight.
+        # buckets. Near-state similarity is also INNER-only, once per historical game.
         home_profile, home_audit = build_team_profile(
             home_log, home_cfg,
             league_team_logs=team_db,
-            game_weights=home_game_weights,
+            game_weights_by_stat=home_game_weights_by_stat,
             exclude_opponent_abbr=setup["away_abbr"],
         )
         away_profile, away_audit = build_team_profile(
             away_log, away_cfg,
             league_team_logs=team_db,
-            game_weights=away_game_weights,
+            game_weights_by_stat=away_game_weights_by_stat,
             exclude_opponent_abbr=setup["home_abbr"],
         )
 
@@ -845,18 +939,26 @@ with tab_team:
         # player just left the roster), a synthetic 200-minute counterfactual
         # moves team style instead of leaving the line unchanged. Explicit
         # minute restrictions are a separate current-state layer.
-        def _audit_conf(df):
-            if df is None or df.empty or "State confidence" not in df.columns:
-                return 0.0
-            return float(pd.to_numeric(df["State confidence"], errors="coerce").fillna(0.0).iloc[0])
+        def _impact_confidence(audit):
+            c = confidence_by_stat(audit)
+            return {
+                "FGA": c.get("FGA", 0.0),
+                "3P_SHARE": c.get("3PA", 0.0),
+                "3P_PCT": c.get("3PA", 0.0),
+                "2P_PCT": c.get("FGA", 0.0),
+                "FTA": c.get("FTA", 0.0), "TOV": c.get("TOV", 0.0),
+                "OREB": c.get("OREB", 0.0), "DREB": c.get("DREB", 0.0),
+                "AST": c.get("AST", 0.0), "STL": c.get("STL", 0.0),
+                "BLK": c.get("BLK", 0.0), "PF": c.get("PF", 0.0),
+            }
 
         home_rot_impact = build_rotation_state_impact(
             player_db, team_db, pool, setup["home_abbr"], setup["home_name"],
-            manual_context, home_out, exact_state_confidence=_audit_conf(home_avail_audit),
+            manual_context, home_out, state_confidence_by_stat=_impact_confidence(home_avail_audit),
         )
         away_rot_impact = build_rotation_state_impact(
             player_db, team_db, pool, setup["away_abbr"], setup["away_name"],
-            manual_context, away_out, exact_state_confidence=_audit_conf(away_avail_audit),
+            manual_context, away_out, state_confidence_by_stat=_impact_confidence(away_avail_audit),
         )
         home_roster_mod = home_rot_impact.modifiers
         away_roster_mod = away_rot_impact.modifiers
@@ -978,7 +1080,7 @@ with tab_team:
         n = c2.select_slider(
             "Game simulations",
             [25_000, 50_000, 100_000, 250_000, 500_000],
-            100_000,
+            50_000,
             key="game_team_sims",
         )
 
@@ -1141,9 +1243,9 @@ with tab_team:
                 st.markdown(f"**{setup['home_abbr']} buckets — {home_regime}**")
                 st.dataframe(home_audit.round(4), use_container_width=True, hide_index=True)
 
-                st.markdown("**Confirmed OUT exact-state + residual rotation — overlap audit**")
+                st.markdown("**Confirmed OUT exact/near-state + residual rotation — overlap audit**")
                 st.caption(
-                    "Exact OUT-state relevance and residual rotation are both INNER-bucket weights. "
+                    "Availability similarity and residual rotation are both INNER-bucket weights. Each game receives one availability score per stat. "
                     "Selected OUT names are removed from residual Jaccard, so the same absence is not counted twice. "
                     "GTD/Q is not modeled unless you explicitly select OUT."
                 )
@@ -1154,8 +1256,8 @@ with tab_team:
 
                 st.markdown("**Roster-state bridge — OUT fallback + minute restrictions**")
                 st.caption(
-                    "Healthy / OUT-only / current are 200-minute synthetic counterfactuals. The OUT bridge fades as "
-                    "exact-state confidence rises; shared minute restrictions are a separate current-state layer."
+                    "Healthy / OUT-only / current are 200-minute synthetic counterfactuals. The OUT bridge fades separately by stat as "
+                    "exact/near-state confidence rises; shared minute restrictions are a separate current-state layer."
                 )
                 ra1, ra2 = st.columns(2)
                 with ra1:
@@ -1548,12 +1650,11 @@ with tab_player:
                 key="selected_sims",
             )
             same_role_enabled = st.toggle(
-                "AUTO: exact confirmed-OUT state for player per-minute role",
+                "AUTO: exact + near confirmed-OUT state for player per-minute role",
                 value=True,
                 help=(
-                    "Example: if Fudd and James are confirmed OUT, a focal player's historical games where BOTH "
-                    "were absent together are partial-pooled inside Old/G6-10/L5. Eligibility starts only after all "
-                    "selected teammates had joined the team. Minutes are handled separately by the 200-minute engine."
+                    "Every historical game gets one stat-specific similarity score to today's OUT state. A 4/5 game is not "
+                    "reused as 3/5 or 2/5. Position/role relevance changes by stat, while minutes remain separate in the 200-minute engine."
                 ),
                 key="same_role_absence_toggle",
             )
@@ -1606,33 +1707,26 @@ with tab_player:
                     )
 
                     if same_role_enabled and out_teammates:
-                        role_game_weights, same_role_audit, exact_role_ids = availability_state_weights(
-                            player_db, plog, team_abbr, out_teammates,
-                            k=float(player_availability_k),
+                        player_state_stats = ["FGA", "3PA", "FTA", "REB", "AST"]
+                        role_game_weights_by_stat, same_role_audit, role_state_scores = availability_similarity_weight_maps(
+                            player_db, plog, team_abbr, out_teammates, player_state_stats,
+                            current_pool=pool, focal_player=pname,
+                            k=float(player_availability_k), maturity_games=5.0,
                         )
-                        # Add transparent focal-player outcomes for the exact state.
-                        exact_mask = plog["GAME_ID"].astype(str).isin(exact_role_ids)
-                        exact_rows = plog[exact_mask].copy()
-                        for col, label in [
-                            ("MIN", "Exact-state MIN"), ("PTS", "Exact-state PTS"),
-                            ("REB", "Exact-state REB"), ("AST", "Exact-state AST"),
-                            ("FG3A", "Exact-state 3PA"), ("FTA", "Exact-state FTA"),
-                        ]:
-                            same_role_audit[label] = (
-                                float(pd.to_numeric(exact_rows[col], errors="coerce").mean())
-                                if (not exact_rows.empty and col in exact_rows.columns) else np.nan
-                            )
                         same_role_audit["Profile overlap guard"] = (
-                            "Stable outer 55/20/25 for this OUT state; exact-state evidence is inner only."
+                            "Single score per historical game/stat; INNER weighting only inside Old/G6-10/L5. "
+                            "No nested 4/5→3/5→2/5 samples."
                         )
                         # Same absence must not ALSO become the generic role-change outer profile.
                         cfg = WeightConfig.role_change() if role else WeightConfig.stable()
                     else:
-                        role_game_weights = {}
-                        exact_role_ids = set()
+                        role_game_weights_by_stat = {}
+                        role_state_scores = {}
                         same_role_audit = pd.DataFrame([{
+                            "Stat": "—",
                             "Confirmed OUT state": "—",
                             "Exact-state games": 0,
+                            "Evidence mass": 0.0,
                             "State confidence": 0.0,
                             "Profile overlap guard": "Neutral: no confirmed OUT teammate state selected.",
                         }])
@@ -1643,15 +1737,10 @@ with tab_player:
                         )
 
                     profile,audit = build_player_profile(
-                        plog,cfg,game_weights=role_game_weights
+                        plog,cfg,game_weights_by_stat=role_game_weights_by_stat
                     )
 
-                    player_conf = 0.0
-                    if isinstance(same_role_audit, pd.DataFrame) and not same_role_audit.empty \
-                       and "State confidence" in same_role_audit.columns:
-                        player_conf = float(pd.to_numeric(
-                            same_role_audit["State confidence"], errors="coerce"
-                        ).fillna(0.0).iloc[0])
+                    player_conf_by_stat = confidence_by_stat(same_role_audit)
                     fallback = {
                         "usage": 1.0, "three_role": 1.0, "fta_role": 1.0,
                         "creation": 1.0, "reb_role": 1.0,
@@ -1661,7 +1750,6 @@ with tab_player:
                         hit = raw_role_mods[raw_role_mods["Player"].astype(str).eq(str(pname))]
                         if not hit.empty:
                             rr = hit.iloc[0]
-                            exponent = float(np.clip(1.0 - player_conf, 0.0, 1.0))
                             raw_map = {
                                 "usage": float(rr.get("Usage fallback", 1.0)),
                                 "three_role": float(rr.get("Three-role fallback", 1.0)),
@@ -1669,12 +1757,20 @@ with tab_player:
                                 "creation": float(rr.get("Creation fallback", 1.0)),
                                 "reb_role": float(rr.get("Rebound-role fallback", 1.0)),
                             }
+                            stat_for_role = {
+                                "usage": "FGA", "three_role": "3PA", "fta_role": "FTA",
+                                "creation": "AST", "reb_role": "REB",
+                            }
+                            remaining = {}
                             for k, rv in raw_map.items():
+                                c = float(player_conf_by_stat.get(stat_for_role[k], 0.0))
+                                exponent = float(np.clip(1.0 - c, 0.0, 1.0))
+                                remaining[k] = exponent
                                 fallback[k] = float(np.exp(exponent * np.log(max(rv, 1e-6))))
                             fallback_audit = pd.DataFrame([{
                                 "Player": pname,
-                                "Exact-state confidence": player_conf,
-                                "Fallback remaining weight": exponent,
+                                **{f"Confidence {st}": float(player_conf_by_stat.get(st, 0.0)) for st in ("FGA","3PA","FTA","AST","REB")},
+                                **{f"Remaining {k}": v for k, v in remaining.items()},
                                 **{f"Raw {k}": v for k, v in raw_map.items()},
                                 **{f"Applied {k}": v for k, v in fallback.items()},
                             }])
@@ -1754,6 +1850,10 @@ with tab_player:
                         "ctx":ctx,
                         "plog":plog,
                         "opp_abbr":opp_abbr,
+                        "auto_market_table": auto_market_table(
+                            sim, ["PTS","REB","AST","3PM","3PA","FTA","PRA","PR","PA","AR"],
+                            target_ev=target_ev, reference_odds=reference_odds,
+                        ),
                     }
 
                 st.session_state["selected_player_board"] = pd.DataFrame(
@@ -1775,98 +1875,9 @@ with tab_player:
                     hide_index=True,
                 )
 
-                st.markdown("### 4. Price one selected player")
-                pname = st.selectbox(
-                    "Deep-dive player",
-                    board["Player"].tolist(),
-                    key="deep_player",
-                )
-                detail = st.session_state["selected_player_details"][pname]
-                sim = detail["sim"]
-                markets = ["PTS","REB","AST","3PM","3PA","FTA","PRA","PR","PA","AR"]
-
-                st.markdown("#### Automatic model lines + fair prices")
-                st.dataframe(
-                    auto_market_table(sim, markets, target_ev=target_ev, reference_odds=reference_odds).round(3),
-                    use_container_width=True, hide_index=True,
-                )
-
-                with st.expander("Model audit", expanded=False):
-                    st.write({
-                        "opponent": detail["opp_abbr"],
-                        "projected_minutes":
-                            detail["ctx"].projected_minutes,
-                        "minutes_sd":
-                            detail["ctx"].minutes_sd,
-                        "pace_multiplier":
-                            detail["ctx"].pace_multiplier,
-                    })
-                    st.markdown("**Non-overlapping sample audit**")
-                    st.dataframe(
-                        detail["profile_audit"],
-                        use_container_width=True,
-                    )
-                    st.markdown("**Opponent / position audit**")
-                    st.dataframe(
-                        detail["matchup_audit"].round(4),
-                        use_container_width=True,
-                    )
-                    st.markdown("**Confirmed-OUT exact-state player-role audit**")
-                    st.dataframe(
-                        detail["same_role_audit"].round(3),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                    st.markdown("**Sparse-OUT / minute-restriction role fallback audit**")
-                    fb = detail.get("availability_fallback_audit")
-                    if isinstance(fb, pd.DataFrame) and not fb.empty:
-                        st.dataframe(fb.round(4), use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("Neutral fallback: no roster-state role redistribution applied.")
-
-                    h2h = detail["plog"][
-                        detail["plog"]["OPP_ABBR"].astype(str).str.upper()
-                        == str(detail["opp_abbr"]).upper()
-                    ]
-                    st.markdown("**H2H — zero extra weight**")
-                    if h2h.empty:
-                        st.caption("No same-season H2H.")
-                    else:
-                        cols = [
-                            c for c in [
-                                "GAME_DATE","OT_FLAG","MIN","PTS","REB",
-                                "AST","FG3M","FG3A","FTA"
-                            ] if c in h2h.columns
-                        ]
-                        st.dataframe(
-                            h2h[cols].sort_values(
-                                "GAME_DATE",ascending=False
-                            ),
-                            use_container_width=True,
-                        )
-
-                st.markdown("#### Price ladder — no bookmaker input required")
-                ladder_market = st.selectbox(
-                    "Market ladder", markets, key="player_ladder_market"
-                )
-                st.caption(
-                    f"Play-from price = the minimum decimal price that gives at least "
-                    f"{target_ev:.0%} model EV. Fair price alone is NOT labeled value. "
-                    f"The {reference_odds:.2f} columns above also show the line needed at a common market price."
-                )
-                st.dataframe(
-                    line_ladder(
-                        sim[ladder_market],
-                        center_line=model_line(sim[ladder_market])["line"],
-                        radius=3,
-                        target_ev=target_ev,
-                    ).round(3),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.info(
-                    "Use the sportsbook only as a comparison after the model is frozen: "
-                    "match its offered line to this ladder, then require at least the displayed play-from price."
+                _render_player_deep_analysis(
+                    board, st.session_state["selected_player_details"],
+                    target_ev, reference_odds,
                 )
         else:
             st.info("Select at least one player.")
@@ -1879,12 +1890,13 @@ with tab_audit:
     st.subheader("Data Audit")
 
     st.markdown("""
-**v2.12 overlap / state protocol**
+**v2.15 overlap / state protocol**
 - Old season / Games 6–10 / L5 stay non-overlapping.
 - Stable = 55/20/25; role-change = 35/20/45.
 - Confirmed OUT is explicit trader input only; QUESTIONABLE/GTD is not probability-modeled.
-- Exact OUT-state games are reweighted INSIDE the existing buckets, never added as a fourth sample.
-- If exact OUT games are sparse/zero, a 200-minute roster counterfactual supplies a shrunk fallback; its weight automatically fades as exact-state confidence rises.
+- Each historical game receives ONE stat-specific exact/near-state similarity score INSIDE the existing bucket; it is never reused in nested 4/5→3/5→2/5 samples.
+- Five fully comparable games is a maturity point, not a hard cutoff: 1–4 games contribute with strong shrinkage.
+- A 200-minute roster counterfactual supplies only residual fallback, fading separately by stat as near-state confidence rises.
 - Shared projected-minute restrictions/returns are current-state information and affect BOTH team markets and player props.
 - Residual Jaccard removes those selected OUT names first and is only 0.85–1.00, so the same absence is not counted twice.
 - Same-season H2H rows are removed from baseline buckets, opponent-allowed profiles and location splits before H2H is added back once with a small rotation-aware weight.
@@ -1904,8 +1916,8 @@ with tab_audit:
 - Full team rotation is constrained to 200 regulation minutes.
 - Explicit minute overrides use the historically learned replacement matrix.
 - One shared Confirmed OUT selector in Game Setup feeds BOTH Team Markets and Player Props.
-- Player Props use exact JOINT absence-state partial pooling for per-minute rates, with an eligibility-start guard.
-- When exact joint OUT games are sparse/zero, a capped vacated-opportunity fallback adjusts usage/creation/rebound/3PA/FTA roles; this fallback is shrunk away as exact-state evidence grows.
+- Player Props use stat-specific exact/near absence-state partial pooling for per-minute rates. Pre-roster non-appearances are mismatches, never fake OUT games.
+- Vacated opportunities are routed through the learned teammate replacement matrix, so guard creation does not become a generic frontcourt boost; residual fallback shrinks separately for FGA/3PA/FTA/AST/REB.
 - Pace control is fitted from completed WNBA games with a mild ridge prior.
 - The exact same projected possessions feed Team Markets and Player Props.
 - Market total/handicap remain audit-only.
@@ -1969,5 +1981,5 @@ with tab_audit:
 
 st.caption(
     "Model-implied fair odds are not yet historically calibrated true odds. "
-    "v2.14 uses data-learned opponent response, data-driven minimal home/away effects, and role/position-aware minute redistribution; re-backtest before treating model fair odds as calibrated true probabilities."
+    "v2.15 adds single-score stat-specific near-state availability, maturity-weighted sparse-sample shrinkage, role-aware event redistribution and 50k cached simulations; re-backtest before treating model fair odds as calibrated true probabilities."
 )
