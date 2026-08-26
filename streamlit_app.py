@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import numpy as np
@@ -14,7 +15,7 @@ from core.buckets import WeightConfig
 from core.player_model import PlayerContext, build_player_profile, simulate_player
 from core.team_model import (
     TeamContext, build_team_profile, simulate_game,
-    team_location_modifiers, h2h_team_audit, h2h_block_modifier,
+    team_location_modifiers, h2h_team_audit, h2h_profile_blend,
 )
 from core.pricing import (
     price, auto_market_table, model_line, most_market, most_market_calibrated, line_ladder,
@@ -25,15 +26,20 @@ from core.matchup import (
     player_matchup_modifiers,
     team_matchup_modifiers,
     position_environment,
+    block_position_susceptibility_modifier,
 )
 from core.minutes_engine import (
     project_team_minutes, rotation_regime_for_team, rotation_similarity_weights,
+    residual_rotation_similarity_weights, h2h_rotation_similarity,
 )
 from core.pace_engine import (
     project_game_pace,
     player_historical_pace_environment,
 )
 from core.role_splits import current_out_teammates, same_role_game_weights
+from core.availability import (
+    confirmed_out_players, availability_state_weights, combine_game_weights,
+)
 
 
 st.set_page_config(
@@ -41,10 +47,10 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.10.0")
+st.title("🏀 Basketball Pricing Engine v2.11.0")
 st.caption(
-    "Trader overrides • Rotation-aware minutes • Coupled two-team markets • Auto line ladders/play-from prices • "
-    "Visible IN/OUT weighting • Calibrated team-with-most • Transparent BLK model • No overlapping recent samples"
+    "Confirmed-OUT state weighting • Non-overlap H2H • FGA→3P-share shot model • BLK v3 • "
+    "Coupled two-team markets • Auto line ladders/play-from prices • No duplicate injury/H2H samples"
 )
 
 
@@ -76,6 +82,7 @@ def reset_context_widgets():
         "sel_override_",
         "home_team_mod_",
         "away_team_mod_",
+        "confirmed_out_",
     )
     for key in list(st.session_state.keys()):
         if any(str(key).startswith(p) for p in prefixes):
@@ -92,6 +99,41 @@ def context_role(manual_context, player_name):
         player_name,
         {},
     ) or {}
+
+
+def _context_out_names_for_team(manual_context, pool, team_abbr):
+    return confirmed_out_players(manual_context or {}, pool, team_abbr)
+
+
+def _apply_confirmed_out_selection(manual_context, pool, team_abbr, selected_names):
+    """Update only CONFIRMED OUT state for current-team players.
+
+    GTD/questionable entries may remain in JSON for notes, but Team Markets do
+    not probabilistically model them. A player affects availability only after
+    the trader explicitly selects OUT.
+    """
+    ctx = copy.deepcopy(manual_context or {})
+    injuries = ctx.setdefault("injuries", {})
+    team_names = set(
+        pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())]
+        ["PLAYER_NAME"].astype(str).tolist()
+    )
+    selected_cf = {str(x).casefold() for x in selected_names}
+    # Remove stale OUT flags for this current team when user deselects them.
+    for name in list(injuries.keys()):
+        if str(name) not in team_names:
+            continue
+        info = injuries.get(name, {})
+        status = str(info.get("status", "") if isinstance(info, dict) else info).upper()
+        if status == "OUT" and str(name).casefold() not in selected_cf:
+            injuries.pop(name, None)
+    for name in selected_names:
+        old = injuries.get(str(name), {})
+        note = old.get("note") if isinstance(old, dict) else None
+        injuries[str(name)] = {"status": "OUT", "team": str(team_abbr).upper()}
+        if note:
+            injuries[str(name)]["note"] = note
+    return ctx
 
 
 def concat_without_attrs(frames, **kwargs):
@@ -201,6 +243,7 @@ with tab_game:
                 st.session_state["sdv_data"] = pack
                 for k in [
                     "game_setup", "opp_profile_home", "opp_profile_away",
+                    "team_opp_profile_home", "team_opp_profile_away",
                     "pace_projection", "team_sim", "team_game_sim", "player_sim",
                     "selected_player_board",
                 ]:
@@ -248,11 +291,20 @@ with tab_game:
             }
             st.session_state["game_setup"] = setup
             reset_context_widgets()
+            # Full opponent profiles remain available for Player Props.
             st.session_state["opp_profile_home"] = opponent_allowed_profile(
                 team_db, setup["home_abbr"]
             )
             st.session_state["opp_profile_away"] = opponent_allowed_profile(
                 team_db, setup["away_abbr"]
+            )
+            # Team Markets keep opponent-allowed evidence disjoint from the
+            # explicit same-season H2H sample.
+            st.session_state["team_opp_profile_home"] = opponent_allowed_profile(
+                team_db, setup["home_abbr"], exclude_team_abbr=setup["away_abbr"]
+            )
+            st.session_state["team_opp_profile_away"] = opponent_allowed_profile(
+                team_db, setup["away_abbr"], exclude_team_abbr=setup["home_abbr"]
             )
             st.session_state["pace_projection"] = project_game_pace(
                 team_db,
@@ -423,14 +475,6 @@ with tab_team:
             team_db[team_db["TEAM_ID"] == setup["away_id"]].copy()
         )
 
-        # AUTO regime comes from the same JSON parser as the Minutes Engine.
-        home_regime_auto = rotation_regime_for_team(
-            manual_context, setup["home_name"], setup["home_abbr"]
-        )
-        away_regime_auto = rotation_regime_for_team(
-            manual_context, setup["away_name"], setup["away_abbr"]
-        )
-
         st.markdown(
             f"### {setup['away_abbr']} @ {setup['home_abbr']}"
         )
@@ -440,11 +484,72 @@ with tab_team:
             "rebounds, steals, blocks and 'team with most' markets are coherent."
         )
 
+        # -----------------------------------------------------------------
+        # CONFIRMED OUT state: explicit trader input only. No Q/GTD guessing.
+        # -----------------------------------------------------------------
+        with st.expander("Confirmed OUT availability — exact historical state", expanded=True):
+            st.caption(
+                "Select only confirmed OUT players. QUESTIONABLE/GTD is ignored until you explicitly mark OUT. "
+                "The model looks for historical games where ALL selected OUT players were absent together. "
+                "Those games are reweighted inside Old/G6–10/L5; they are NOT added as a fourth sample."
+            )
+            ac1, ac2, ac3 = st.columns([1, 1, 0.7])
+            away_opts = sorted(
+                pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["away_abbr"].upper())]
+                ["PLAYER_NAME"].astype(str).unique().tolist(),
+                key=str.casefold,
+            )
+            home_opts = sorted(
+                pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["home_abbr"].upper())]
+                ["PLAYER_NAME"].astype(str).unique().tolist(),
+                key=str.casefold,
+            )
+            away_default = [x for x in _context_out_names_for_team(manual_context, pool, setup["away_abbr"]) if x in away_opts]
+            home_default = [x for x in _context_out_names_for_team(manual_context, pool, setup["home_abbr"]) if x in home_opts]
+            away_selected_out = ac1.multiselect(
+                f"{setup['away_abbr']} confirmed OUT", away_opts, default=away_default,
+                key=f"confirmed_out_{setup['away_abbr']}",
+            )
+            home_selected_out = ac2.multiselect(
+                f"{setup['home_abbr']} confirmed OUT", home_opts, default=home_default,
+                key=f"confirmed_out_{setup['home_abbr']}",
+            )
+            availability_k = ac3.number_input(
+                "State shrink K", min_value=3.0, max_value=15.0, value=6.0, step=1.0,
+                help=(
+                    "Provisional partial-pooling strength. Exact-state confidence = N/(N+K). "
+                    "K=6 is intentionally conservative and should later be tuned by rolling out-of-sample backtest."
+                ),
+                key="availability_state_k",
+            )
+            manual_context = _apply_confirmed_out_selection(
+                manual_context, pool, setup["away_abbr"], away_selected_out
+            )
+            manual_context = _apply_confirmed_out_selection(
+                manual_context, pool, setup["home_abbr"], home_selected_out
+            )
+            # Persist so the Player Props minutes/role engines see the same confirmed OUT state.
+            st.session_state["game_context"] = manual_context
+            st.caption(
+                "Overlap guard: OUT identity is handled by the exact-state engine. Residual rotation similarity removes "
+                "those OUT names before Jaccard, so the same absence is not counted twice."
+            )
+
+        # AUTO regime is separate from confirmed OUT state. Use role_change only
+        # for a broader structural role/rotation change, not merely because the
+        # same OUT players were selected above.
+        home_regime_auto = rotation_regime_for_team(
+            manual_context, setup["home_name"], setup["home_abbr"]
+        )
+        away_regime_auto = rotation_regime_for_team(
+            manual_context, setup["away_name"], setup["away_abbr"]
+        )
+
         with st.expander("Team sample weighting / trader override", expanded=False):
             st.caption(
                 "AUTO reads rotation_regime from game_context.json. Stable = "
-                "55/20/25; role_change = 35/20/45. Rotation similarity then "
-                "acts only INSIDE each non-overlapping bucket, not as a second sample."
+                "55/20/25; role_change = 35/20/45. Confirmed OUT state is a separate INNER-bucket relevance layer. "
+                "Use role_change only for residual structural change so the same absence is not counted twice."
             )
             c1, c2 = st.columns(2)
             home_mode = c1.selectbox(
@@ -458,82 +563,138 @@ with tab_team:
                 key="away_team_weighting_mode",
             )
             rotation_similarity_enabled = st.toggle(
-                "AUTO: weight team history toward the current IN/OUT rotation",
+                "AUTO: residual rotation similarity after OUT-state matching",
                 value=True,
                 help=(
-                    "Historical games with a player-participation pattern closer to today's available rotation "
-                    "receive a soft inner weight. This never creates a fourth sample and can be switched off for audit."
+                    "Confirmed OUT players are removed from this Jaccard comparison because their effect is already "
+                    "handled by exact availability-state weighting. Only the residual rotation receives a weak 0.85–1.00 inner weight."
                 ),
                 key="team_rotation_similarity_toggle",
             )
 
-        def resolve_cfg(mode, auto_regime):
+        def resolve_cfg(mode, auto_regime, has_confirmed_out):
             if mode.startswith("Stable"):
                 return WeightConfig.stable(), "stable"
             if mode.startswith("Role"):
                 return WeightConfig.role_change(), "role_change"
+            # Overlap guard: when confirmed OUT identity is already modeled by
+            # exact-state historical matching, AUTO does not ALSO switch to the
+            # 35/20/45 injury-style recency profile. If there is a broader role
+            # change (trade/coaching shift), trader can explicitly choose Role change.
+            if has_confirmed_out:
+                return WeightConfig.stable(), "stable (OUT-state guard)"
             return (
                 (WeightConfig.role_change(), "role_change")
                 if auto_regime == "role_change"
                 else (WeightConfig.stable(), "stable")
             )
 
-        home_cfg, home_regime = resolve_cfg(home_mode, home_regime_auto)
-        away_cfg, away_regime = resolve_cfg(away_mode, away_regime_auto)
+        home_cfg, home_regime = resolve_cfg(home_mode, home_regime_auto, bool(home_selected_out))
+        away_cfg, away_regime = resolve_cfg(away_mode, away_regime_auto, bool(away_selected_out))
+        if (home_selected_out and home_regime_auto == "role_change" and home_mode == "AUTO") or \
+           (away_selected_out and away_regime_auto == "role_change" and away_mode == "AUTO"):
+            st.caption(
+                "OUT-state overlap guard active: AUTO keeps Stable 55/20/25 when confirmed OUT is selected. "
+                "Choose Role change explicitly only if there is an additional structural rotation change beyond those OUTs."
+            )
 
-        # Current-rotation similarity is learned from player participation and
-        # applied as an inner historical-game modifier. OUT players are already
-        # removed from today's rotation signature, so no second injury penalty.
-        home_game_weights = (
-            rotation_similarity_weights(
-                player_db, pool, setup["home_abbr"], manual_context
+        # -----------------------------------------------------------------
+        # INNER historical relevance: exact OUT state + weak residual rotation.
+        # These two layers are deliberately separated to avoid injury overlap.
+        # -----------------------------------------------------------------
+        home_out = confirmed_out_players(manual_context, pool, setup["home_abbr"])
+        away_out = confirmed_out_players(manual_context, pool, setup["away_abbr"])
+
+        home_avail_w, home_avail_audit, home_exact_ids = availability_state_weights(
+            player_db, home_log, setup["home_abbr"], home_out, k=float(availability_k),
+            exclude_opponent_abbr=setup["away_abbr"],
+        )
+        away_avail_w, away_avail_audit, away_exact_ids = availability_state_weights(
+            player_db, away_log, setup["away_abbr"], away_out, k=float(availability_k),
+            exclude_opponent_abbr=setup["home_abbr"],
+        )
+
+        home_rot_w = (
+            residual_rotation_similarity_weights(
+                player_db, pool, setup["home_abbr"], manual_context,
+                out_players=home_out, residual_strength=0.15,
             ) if rotation_similarity_enabled else {}
         )
-        away_game_weights = (
-            rotation_similarity_weights(
-                player_db, pool, setup["away_abbr"], manual_context
+        away_rot_w = (
+            residual_rotation_similarity_weights(
+                player_db, pool, setup["away_abbr"], manual_context,
+                out_players=away_out, residual_strength=0.15,
             ) if rotation_similarity_enabled else {}
         )
+        home_game_weights = combine_game_weights(home_avail_w, home_rot_w)
+        away_game_weights = combine_game_weights(away_avail_w, away_rot_w)
 
+        # Baseline excludes current-opponent H2H INSIDE the actual Old/G6-10/L5
+        # buckets. H2H is then added back once, with a small rotation-aware weight.
         home_profile, home_audit = build_team_profile(
             home_log, home_cfg,
             league_team_logs=team_db,
             game_weights=home_game_weights,
+            exclude_opponent_abbr=setup["away_abbr"],
         )
         away_profile, away_audit = build_team_profile(
             away_log, away_cfg,
             league_team_logs=team_db,
             game_weights=away_game_weights,
+            exclude_opponent_abbr=setup["home_abbr"],
         )
 
-        # Opponent overall allowance is the matchup base. Team Markets do not
-        # add a positional sample on top, avoiding the player-model style double count.
-        home_opp = st.session_state["opp_profile_away"]
-        away_opp = st.session_state["opp_profile_home"]
+        h2h_all = h2h_team_audit(team_db, setup["home_abbr"], setup["away_abbr"])
+        home_h2h_ids = (
+            h2h_all[h2h_all["TEAM_ABBR"].astype(str).str.upper().eq(setup["home_abbr"].upper())]["GAME_ID"].astype(str).tolist()
+            if not h2h_all.empty else []
+        )
+        away_h2h_ids = (
+            h2h_all[h2h_all["TEAM_ABBR"].astype(str).str.upper().eq(setup["away_abbr"].upper())]["GAME_ID"].astype(str).tolist()
+            if not h2h_all.empty else []
+        )
+        home_h2h_sim = h2h_rotation_similarity(
+            player_db, pool, setup["home_abbr"], manual_context, home_h2h_ids
+        )
+        away_h2h_sim = h2h_rotation_similarity(
+            player_db, pool, setup["away_abbr"], manual_context, away_h2h_ids
+        )
+        home_profile, home_h2h_audit = h2h_profile_blend(
+            team_db, setup["home_abbr"], setup["away_abbr"], home_profile,
+            rotation_similarity=home_h2h_sim,
+        )
+        away_profile, away_h2h_audit = h2h_profile_blend(
+            team_db, setup["away_abbr"], setup["home_abbr"], away_profile,
+            rotation_similarity=away_h2h_sim,
+        )
+
+        # Opponent allowance for Team Markets excludes the same H2H rows, so the
+        # explicit H2H layer above is genuinely non-overlapping.
+        home_opp = st.session_state.get("team_opp_profile_away") or opponent_allowed_profile(
+            team_db, setup["away_abbr"], exclude_team_abbr=setup["home_abbr"]
+        )
+        away_opp = st.session_state.get("team_opp_profile_home") or opponent_allowed_profile(
+            team_db, setup["home_abbr"], exclude_team_abbr=setup["away_abbr"]
+        )
         home_auto = team_matchup_modifiers(home_opp)
         away_auto = team_matchup_modifiers(away_opp)
 
-        # Small shrinked location correction, never a second full sample.
+        # Small location correction with the current H2H opponent excluded as well.
         home_loc, home_loc_audit = team_location_modifiers(
-            home_log, True, league_team_logs=team_db
+            home_log, True, league_team_logs=team_db,
+            exclude_opponent_abbr=setup["away_abbr"],
         )
         away_loc, away_loc_audit = team_location_modifiers(
-            away_log, False, league_team_logs=team_db
+            away_log, False, league_team_logs=team_db,
+            exclude_opponent_abbr=setup["home_abbr"],
         )
 
         def combined_mods(auto, loc):
-            # Attempt mix is already encoded in the team's own weighted profile.
-            # Opponent + location are contextual corrections, not another full sample.
-            # Cap the combined attempt correction to avoid systematic 3PA/2PA overreaction.
-            three_mod = float(np.clip(
-                auto.get("3PA", 1.0) * loc.get("3PA", 1.0), 0.92, 1.08
-            ))
-            two_mod = float(np.clip(
-                auto.get("2PA", 1.0) * loc.get("2PA", 1.0), 0.92, 1.08
-            ))
+            # v2.11 removes independent 3PA and 2PA contextual multipliers.
+            # Total FGA opportunity and the 3P share are distinct conditional layers.
             return {
-                "3PA": three_mod,
-                "2PA": two_mod,
+                "FGA": float(np.clip(auto.get("FGA", 1.0) * loc.get("FGA", 1.0), 0.94, 1.06)),
+                "3P_SHARE": float(np.clip(auto.get("3P_SHARE", 1.0) * loc.get("3P_SHARE", 1.0), 0.92, 1.08)),
                 "FTA": float(auto.get("FTA", 1.0) * loc.get("FTA", 1.0)),
                 "TOV": float(auto.get("TOV", 1.0) * loc.get("TOV", 1.0)),
                 "OREB": float(auto.get("OREB", 1.0) * loc.get("OREB", 1.0)),
@@ -541,7 +702,7 @@ with tab_team:
                 "PF": float(auto.get("PF", 1.0) * loc.get("PF", 1.0)),
                 "DREB": float(loc.get("DREB", 1.0)),
                 "STL": float(loc.get("STL", 1.0)),
-                "BLK": float(np.clip(auto.get("BLK", 1.0) * loc.get("BLK", 1.0), 0.90, 1.10)),
+                "BLK": float(np.clip(auto.get("BLK", 1.0) * loc.get("BLK", 1.0), 0.88, 1.12)),
                 "3P_PCT": float(auto.get("3P_PCT", 1.0)),
                 "2P_PCT": float(auto.get("2P_PCT", 1.0)),
             }
@@ -549,16 +710,25 @@ with tab_team:
         home_mod = combined_mods(home_auto, home_loc)
         away_mod = combined_mods(away_auto, away_loc)
 
+        # Optional positional BLK susceptibility. It is neutral unless the
+        # loaded player data contains an actual blocked-attempt field.
+        home_blk_pos, home_blk_pos_audit = block_position_susceptibility_modifier(
+            player_db, setup["away_abbr"], current_pool=pool, out_players=away_out
+        )
+        away_blk_pos, away_blk_pos_audit = block_position_susceptibility_modifier(
+            player_db, setup["home_abbr"], current_pool=pool, out_players=home_out
+        )
+
         with st.expander("Automatic matchup/location modifiers — optional trader override", expanded=False):
             st.caption(
-                "Leave these untouched for full AUTO. Opponent allowance is shrinked; "
-                "home/away is a small correction. Shooting percentage is NOT set by L5 hot/cold results."
+                "Leave these untouched for full AUTO. FGA and 3P_SHARE replace independent 3PA/2PA multipliers. "
+                "OREB is per miss; AST is per made FG. This keeps the main opportunity layers from being counted twice."
             )
 
             def modifier_editor(prefix, team_abbr, mods):
                 cols = st.columns(5)
                 out = {}
-                keys = ["3PA","2PA","FTA","TOV","OREB","AST","PF","DREB","STL","BLK","3P_PCT","2P_PCT"]
+                keys = ["FGA","3P_SHARE","FTA","TOV","OREB","AST","PF","DREB","STL","BLK","3P_PCT","2P_PCT"]
                 for i, key in enumerate(keys):
                     out[key] = cols[i % 5].number_input(
                         f"{team_abbr} {key}",
@@ -572,18 +742,6 @@ with tab_team:
             away_mod = modifier_editor("away_team_mod", setup["away_abbr"], away_mod)
             st.markdown(f"**{setup['home_abbr']}**")
             home_mod = modifier_editor("home_team_mod", setup["home_abbr"], home_mod)
-
-        # H2H is already in the historical buckets. For BLK only, allow a TINY
-        # same-season correction (max +/-3%) because the user explicitly wants H2H
-        # considered, without double-counting it as another sample.
-        home_blk_h2h, home_blk_h2h_audit = h2h_block_modifier(
-            team_db, setup["home_abbr"], setup["away_abbr"],
-            home_profile.get("blk_rate_pp", home_profile.get("blk_pp", 0.05)),
-        )
-        away_blk_h2h, away_blk_h2h_audit = h2h_block_modifier(
-            team_db, setup["away_abbr"], setup["home_abbr"],
-            away_profile.get("blk_rate_pp", away_profile.get("blk_pp", 0.05)),
-        )
 
         pace_obj = st.session_state["pace_projection"]
         c1, c2 = st.columns(2)
@@ -600,13 +758,13 @@ with tab_team:
             key="game_team_sims",
         )
 
-        def make_ctx(mod, blk_h2h=1.0):
+        def make_ctx(mod, blk_position=1.0):
             return TeamContext(
                 projected_possessions=float(shared_pace),
                 possessions_sd=float(poss_sd),
-                three_pa=float(mod["3PA"]),
+                fga=float(mod["FGA"]),
+                three_share=float(mod["3P_SHARE"]),
                 three_pct=float(mod.get("3P_PCT", 1.0)),
-                two_pa=float(mod["2PA"]),
                 two_pct=float(mod.get("2P_PCT", 1.0)),
                 fta=float(mod["FTA"]),
                 tov=float(mod["TOV"]),
@@ -616,16 +774,19 @@ with tab_team:
                 dreb=float(mod["DREB"]),
                 stl=float(mod["STL"]),
                 blk=float(mod["BLK"]),
-                blk_h2h=float(blk_h2h),
+                blk_position=float(blk_position),
+                blk_h2h=1.0,
             )
 
-        home_ctx = make_ctx(home_mod, home_blk_h2h)
-        away_ctx = make_ctx(away_mod, away_blk_h2h)
+        home_ctx = make_ctx(home_mod, home_blk_pos)
+        away_ctx = make_ctx(away_mod, away_blk_pos)
 
         fingerprint = (
             setup["home_abbr"], setup["away_abbr"], float(shared_pace),
             float(poss_sd), home_regime, away_regime, bool(rotation_similarity_enabled),
-            round(home_blk_h2h, 4), round(away_blk_h2h, 4),
+            tuple(home_out), tuple(away_out), float(availability_k),
+            round(home_h2h_sim, 4), round(away_h2h_sim, 4),
+            round(home_blk_pos, 4), round(away_blk_pos, 4),
             tuple(round(home_mod[k], 4) for k in sorted(home_mod)),
             tuple(round(away_mod[k], 4) for k in sorted(away_mod)),
             int(n),
@@ -753,80 +914,111 @@ with tab_team:
                 st.markdown(f"**{setup['home_abbr']} buckets — {home_regime}**")
                 st.dataframe(home_audit.round(4), use_container_width=True, hide_index=True)
 
-                st.markdown("**Current IN/OUT + rotation-similarity weighting**")
+                st.markdown("**Confirmed OUT exact-state + residual rotation — overlap audit**")
+                st.caption(
+                    "Exact OUT-state relevance and residual rotation are both INNER-bucket weights. "
+                    "Selected OUT names are removed from residual Jaccard, so the same absence is not counted twice. "
+                    "GTD/Q is not modeled unless you explicitly select OUT."
+                )
+                st.dataframe(
+                    pd.concat([away_avail_audit, home_avail_audit], ignore_index=True).round(3),
+                    use_container_width=True, hide_index=True,
+                )
 
-                def _team_availability_row(team_abbr, team_name, game_weights, regime):
-                    injuries = (manual_context or {}).get("injuries", {})
-                    out_names, gtd_names = [], []
-                    for nm, info in injuries.items():
-                        if not isinstance(info, dict):
-                            continue
-                        info_team = str(info.get("team", "")).strip().upper()
-                        # Resolve team either from JSON or current player pool.
-                        pool_hit = pool[pool["PLAYER_NAME"].astype(str).str.casefold() == str(nm).casefold()]
-                        pool_team = str(pool_hit.iloc[0]["TEAM_ABBR"]).upper() if not pool_hit.empty else ""
-                        belongs = info_team in {str(team_abbr).upper(), str(team_name).upper()} or pool_team == str(team_abbr).upper()
-                        if not belongs:
-                            continue
-                        status = str(info.get("status", "")).upper()
-                        if status == "OUT":
-                            out_names.append(str(nm))
-                        elif status in {"GTD", "QUESTIONABLE", "DOUBTFUL"}:
-                            gtd_names.append(f"{nm} ({status})")
+                def _inner_weight_summary(team_abbr, game_weights, regime, out_names):
                     ws = np.asarray(list(game_weights.values()), dtype=float) if game_weights else np.asarray([])
                     return {
                         "Team": team_abbr,
                         "Regime": regime,
-                        "Rotation weighting": "ON" if rotation_similarity_enabled else "OFF",
-                        "OUT": ", ".join(out_names) if out_names else "—",
-                        "GTD/Q": ", ".join(gtd_names) if gtd_names else "—",
+                        "Confirmed OUT": ", ".join(out_names) if out_names else "—",
+                        "Residual rotation": "ON 0.85–1.00" if rotation_similarity_enabled else "OFF",
                         "Historical games weighted": int(len(ws)),
-                        "Min inner weight": float(ws.min()) if ws.size else 1.0,
-                        "Mean inner weight": float(ws.mean()) if ws.size else 1.0,
-                        "Max inner weight": float(ws.max()) if ws.size else 1.0,
+                        "Min combined inner weight": float(ws.min()) if ws.size else 1.0,
+                        "Mean combined inner weight": float(ws.mean()) if ws.size else 1.0,
+                        "Max combined inner weight": float(ws.max()) if ws.size else 1.0,
                     }
 
                 st.dataframe(pd.DataFrame([
-                    _team_availability_row(setup["away_abbr"], setup["away_name"], away_game_weights, away_regime),
-                    _team_availability_row(setup["home_abbr"], setup["home_name"], home_game_weights, home_regime),
+                    _inner_weight_summary(setup["away_abbr"], away_game_weights, away_regime, away_out),
+                    _inner_weight_summary(setup["home_abbr"], home_game_weights, home_regime, home_out),
                 ]).round(3), use_container_width=True, hide_index=True)
 
-                st.markdown("**BLK model audit — own rate / opponent allowed / H2H**")
-                blk_audit = pd.DataFrame([
+                st.markdown("**Shot architecture audit — FGA → 3P share → 3PA/2PA**")
+                st.dataframe(pd.DataFrame([
                     {
                         "Team": setup["away_abbr"],
-                        "Own weighted BLK/poss": away_profile.get("blk_pp", np.nan),
-                        "Own stabilized BLK/poss": away_profile.get("blk_rate_pp", np.nan),
-                        "Opponent BLK-allowed modifier": away_auto.get("BLK", 1.0),
-                        "Location BLK modifier": away_loc.get("BLK", 1.0),
-                        "H2H BLK modifier": away_blk_h2h,
+                        "Base FGA/live": away_profile.get("fga_live", np.nan),
+                        "Base 3P share": away_profile.get("three_share", np.nan),
+                        "Opponent+location FGA mod": away_mod.get("FGA", 1.0),
+                        "Opponent+location 3P-share mod": away_mod.get("3P_SHARE", 1.0),
                     },
                     {
                         "Team": setup["home_abbr"],
-                        "Own weighted BLK/poss": home_profile.get("blk_pp", np.nan),
-                        "Own stabilized BLK/poss": home_profile.get("blk_rate_pp", np.nan),
-                        "Opponent BLK-allowed modifier": home_auto.get("BLK", 1.0),
+                        "Base FGA/live": home_profile.get("fga_live", np.nan),
+                        "Base 3P share": home_profile.get("three_share", np.nan),
+                        "Opponent+location FGA mod": home_mod.get("FGA", 1.0),
+                        "Opponent+location 3P-share mod": home_mod.get("3P_SHARE", 1.0),
+                    },
+                ]).round(4), use_container_width=True, hide_index=True)
+
+                st.markdown("**BLK v3 audit — own ability / opponent suffered / H2H / position / tiny 2PA**")
+                def _h2h_blk_weight(audit):
+                    if audit is None or audit.empty:
+                        return 0.0
+                    hit = audit[audit["Feature"].astype(str).eq("blk_rate_pp")]
+                    return float(hit.iloc[0]["Applied H2H weight"]) if not hit.empty else 0.0
+
+                blk_audit = pd.DataFrame([
+                    {
+                        "Team": setup["away_abbr"],
+                        "Base non-H2H BLK/poss": away_profile.get("blk_pp", np.nan),
+                        "Final own BLK/poss after H2H": away_profile.get("blk_rate_pp", np.nan),
+                        "Opponent BLK-suffered modifier": away_auto.get("BLK", 1.0),
+                        "Location BLK modifier": away_loc.get("BLK", 1.0),
+                        "Positional relative modifier": away_blk_pos,
+                        "H2H weight": _h2h_blk_weight(away_h2h_audit),
+                        "2PA effect cap": "±2%",
+                    },
+                    {
+                        "Team": setup["home_abbr"],
+                        "Base non-H2H BLK/poss": home_profile.get("blk_pp", np.nan),
+                        "Final own BLK/poss after H2H": home_profile.get("blk_rate_pp", np.nan),
+                        "Opponent BLK-suffered modifier": home_auto.get("BLK", 1.0),
                         "Location BLK modifier": home_loc.get("BLK", 1.0),
-                        "H2H BLK modifier": home_blk_h2h,
+                        "Positional relative modifier": home_blk_pos,
+                        "H2H weight": _h2h_blk_weight(home_h2h_audit),
+                        "2PA effect cap": "±2%",
                     },
                 ])
                 st.dataframe(blk_audit.round(4), use_container_width=True, hide_index=True)
-                if not away_blk_h2h_audit.empty or not home_blk_h2h_audit.empty:
-                    cb1, cb2 = st.columns(2)
-                    cb1.dataframe(away_blk_h2h_audit.round(4), use_container_width=True, hide_index=True)
-                    cb2.dataframe(home_blk_h2h_audit.round(4), use_container_width=True, hide_index=True)
+
+                hb1, hb2 = st.columns(2)
+                with hb1:
+                    st.caption(f"{setup['away_abbr']} disjoint H2H structural blend")
+                    st.dataframe(away_h2h_audit.round(4), use_container_width=True, hide_index=True)
+                with hb2:
+                    st.caption(f"{setup['home_abbr']} disjoint H2H structural blend")
+                    st.dataframe(home_h2h_audit.round(4), use_container_width=True, hide_index=True)
+
+                with st.expander("Positional BLK susceptibility audit", expanded=False):
+                    st.caption(
+                        "Applied only if the loaded player dataset contains a real BLKA/blocked-attempt field. "
+                        "Otherwise the modifier is exactly 1.00; the model never infers positional blocks from 2PA."
+                    )
+                    pb1, pb2 = st.columns(2)
+                    pb1.dataframe(away_blk_pos_audit.round(4), use_container_width=True, hide_index=True)
+                    pb2.dataframe(home_blk_pos_audit.round(4), use_container_width=True, hide_index=True)
 
                 st.markdown("**Location correction (small shrink only)**")
                 ca, ch = st.columns(2)
                 ca.dataframe(away_loc_audit.round(4), use_container_width=True, hide_index=True)
                 ch.dataframe(home_loc_audit.round(4), use_container_width=True, hide_index=True)
 
-                st.markdown("**H2H — audit only, ZERO extra numerical weight**")
-                h2h = h2h_team_audit(team_db, setup["home_abbr"], setup["away_abbr"])
-                if h2h.empty:
+                st.markdown("**H2H raw rows — separated from baseline and opponent-allowed samples**")
+                if h2h_all.empty:
                     st.caption("No same-season H2H rows found.")
                 else:
-                    st.dataframe(h2h, use_container_width=True, hide_index=True)
+                    st.dataframe(h2h_all, use_container_width=True, hide_index=True)
 
                 # Explicit conservation checks from the actual simulations.
                 checks = {
@@ -836,8 +1028,8 @@ with tab_team:
                     "Home REB = OREB + DREB": bool(((home_sim["REB"] - home_sim["OREB"] - home_sim["DREB"]) == 0).all()),
                     "Away STL <= Home TOV": bool((away_sim["STL"] <= home_sim["TOV"]).all()),
                     "Home STL <= Away TOV": bool((home_sim["STL"] <= away_sim["TOV"]).all()),
-                    "Away BLK <= Home missed 2PA": bool((away_sim["BLK"] <= (home_sim["2PA"]-home_sim["2PM"])).all()),
-                    "Home BLK <= Away missed 2PA": bool((home_sim["BLK"] <= (away_sim["2PA"]-away_sim["2PM"])).all()),
+                    "Away BLK <= Home missed FGA": bool((away_sim["BLK"] <= (home_sim["FGA"]-home_sim["FGM"])).all()),
+                    "Home BLK <= Away missed FGA": bool((home_sim["BLK"] <= (away_sim["FGA"]-away_sim["FGM"])).all()),
                 }
                 st.json(checks)
 
@@ -1319,32 +1511,30 @@ with tab_audit:
     st.subheader("Data Audit")
 
     st.markdown("""
-**Unchanged core protocol**
-- Old season / Games 6–10 / L5 are non-overlapping.
+**v2.11 overlap protocol**
+- Old season / Games 6–10 / L5 stay non-overlapping.
 - Stable = 55/20/25; role-change = 35/20/45.
-- H2H receives 0% extra weight by default.
-- Opponent overall + opponent-by-position avoid double counting.
-- Position matchup is applied to PTS/REB/AST/3PA/FTA; 3P%/2P% position effects are heavily shrinked.
-- 3PM is generated from 3PA volume and regressed efficiency, never raw L5 makes.
-- Confirmed teammate absences can reweight historical same-role games INSIDE the existing buckets.
+- Confirmed OUT is explicit trader input only; QUESTIONABLE/GTD is not probability-modeled.
+- Exact OUT-state games are reweighted INSIDE the existing buckets, never added as a fourth sample.
+- Residual Jaccard removes those selected OUT names first and is only 0.85–1.00, so the same absence is not counted twice.
+- Same-season H2H rows are removed from baseline buckets, opponent-allowed profiles and location splits before H2H is added back once with a small rotation-aware weight.
+- Team shot generation is conditional: possessions → TOV → FGA → 3P share → 3PA/2PA. Independent 3PA/2PA Poisson draws are gone.
+- Team OREB matchup uses OREB per miss; AST matchup uses AST per made FG; TOV remains per possession.
+- Shooting percentages remain heavily regressed and are not set by L5 hot/cold results.
+- Team BLK = own ability × opponent blocks-suffered × disjoint H2H × optional relative positional susceptibility × tiny 2PA opportunity nudge (max ±2%).
+- BLK conservation is against total missed FGA, not only missed 2PA, because three-point attempts can also be blocked.
+- Positional BLK is applied only when a real player-level BLKA/blocked-attempt field exists; otherwise it is exactly neutral rather than inferred from 2PA.
+- REB still uses available misses; no extra 3PA→REB multiplier is added, avoiding overlap. A 2P/3P rebound split waits for real play-by-play attribution.
 - Fair price is break-even only; Play-from price adds the selected target-EV buffer.
-- Joint Monte Carlo / stress logic remains intact.
+- Team-with-most calibration remains downstream of the joint simulation and does not use bookmaker prices.
 
-**New feeding layer**
-- Trader declares availability; injuries are not guessed automatically.
-- Minutes are similarity-weighted inside the existing buckets.
-- OT and large blowout minute games are downweighted, not deleted.
+**Minutes / pace**
 - Full team rotation is constrained to 200 regulation minutes.
-- Explicit minute overrides are redistributed through a historically learned teammate replacement matrix, not proportional roster scaling.
-- OUT availability is not hit with that full matrix a second time; it is already handled by current-rotation similarity + the 200-minute constraint.
-- Trader/metadata minutes override AUTO and the remaining rotation rebalances.
-- Pace control is fitted from completed WNBA games, with a mild ridge prior
-  rather than fixed 50/50.
+- Explicit minute overrides use the historically learned replacement matrix.
+- Player Props continue to use the same confirmed OUT context.
+- Pace control is fitted from completed WNBA games with a mild ridge prior.
 - The exact same projected possessions feed Team Markets and Player Props.
-- Team BLK starts from own weighted BLK/poss, corrected by opponent BLK allowed, tiny capped H2H, and only a small 2PA opportunity nudge; misses are only a conservation cap.
-- Player pace adjustment is today's game pace / that player's historical
-  pace environment, so pace is applied once rather than double-counted.
-- Market total/handicap are audit-only in v2.6.
+- Market total/handicap remain audit-only.
     """)
 
     setup = st.session_state.get("game_setup")
@@ -1382,6 +1572,14 @@ with tab_audit:
         if ap:
             st.markdown(f"### {setup['away_abbr']} opponent allowed")
             st.dataframe(ap["audit"].round(4),use_container_width=True)
+        thp = st.session_state.get("team_opp_profile_home")
+        tap = st.session_state.get("team_opp_profile_away")
+        if thp:
+            st.markdown(f"### {setup['home_abbr']} TEAM-MARKET opponent allowed (current H2H excluded)")
+            st.dataframe(thp["audit"].round(4), use_container_width=True)
+        if tap:
+            st.markdown(f"### {setup['away_abbr']} TEAM-MARKET opponent allowed (current H2H excluded)")
+            st.dataframe(tap["audit"].round(4), use_container_width=True)
 
     st.write({
         "historical_provider":"SportsDataverse",
@@ -1395,5 +1593,5 @@ with tab_audit:
 
 st.caption(
     "Model-implied fair odds are not yet historically calibrated true odds. "
-    "v2.6 preserves the existing value model and upgrades only the input layer."
+    "v2.11 changes the team opportunity architecture and availability/H2H handling; re-backtest before treating model fair odds as calibrated true probabilities."
 )

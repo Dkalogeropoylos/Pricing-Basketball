@@ -47,8 +47,8 @@ def main():
     assert 'blk_per_opp_2pa' in pa and 'blk_per_opp_2miss' not in pa
     ctx=TeamContext(projected_possessions=80)
     h,a=simulate_game(pa,pb,ctx,ctx,n=20000,seed=3)
-    assert (h.BLK <= (a['2PA']-a['2PM'])).all()
-    assert (a.BLK <= (h['2PA']-h['2PM'])).all()
+    assert (h.BLK <= (a['FGA']-a['FGM'])).all()
+    assert (a.BLK <= (h['FGA']-h['FGM'])).all()
     assert ((h.FGA-h['2PA']-h['3PA'])==0).all()
 
     # Fair 1.70 with 6% target EV should require ~1.802.
