@@ -22,6 +22,11 @@ class TeamContext:
     # Offense-vs-opponent interaction multipliers.
     # 1.00 = neutral. These are already shrinked contextual adjustments,
     # not extra samples.
+    # v2.11 shot architecture: first generate total FGA, then allocate the
+    # shot mix through 3P_SHARE. Legacy three_pa/two_pa fields are retained
+    # for backward compatibility but are no longer used by simulate_game().
+    fga: float = 1.0
+    three_share: float = 1.0
     three_pa: float = 1.0
     three_pct: float = 1.0
     two_pa: float = 1.0
@@ -37,8 +42,10 @@ class TeamContext:
     dreb: float = 1.0
     stl: float = 1.0
     blk: float = 1.0
-    # Tiny same-season H2H block correction. H2H games are already inside
-    # the history, so this is capped tightly to avoid double counting.
+    # Optional RELATIVE positional susceptibility correction. Neutral unless
+    # a player-level blocked-attempt field is actually available.
+    blk_position: float = 1.0
+    # Legacy field retained; v2.11 folds H2H into the disjoint team profile.
     blk_h2h: float = 1.0
 
 
@@ -141,6 +148,8 @@ def _feat(
         "two_pa_pp": _safe_div(a2, poss),
         "three_pa_live": _safe_div(a3, live_poss),
         "two_pa_live": _safe_div(a2, live_poss),
+        "fga_live": _safe_div(fga, live_poss),
+        "three_share": _safe_div(a3, fga, 0.35),
         "fta_pp": _safe_div(fta, poss),
         "tov_pp": _safe_div(tov, poss),
         "oreb_pp": _safe_div(oreb, poss),
@@ -217,6 +226,7 @@ def build_team_profile(
     cfg: WeightConfig,
     league_team_logs: Optional[pd.DataFrame] = None,
     game_weights: Optional[Dict[str, float]] = None,
+    exclude_opponent_abbr: Optional[str] = None,
 ) -> Tuple[dict, pd.DataFrame]:
     """
     Team profile with:
@@ -227,7 +237,18 @@ def build_team_profile(
       - defensive conversion rates tied to opponent opportunities
     """
     x = df.sort_values("GAME_DATE").copy()
-    buckets = split_non_overlapping(x)
+    # Split the ACTUAL timeline first, then remove current-opponent H2H rows
+    # inside each bucket. This preserves the meaning of L5/G6-10 while keeping
+    # explicit H2H evidence disjoint from the baseline.
+    raw_buckets = split_non_overlapping(x)
+    if exclude_opponent_abbr and "OPP_ABBR" in x.columns:
+        opp = str(exclude_opponent_abbr).upper()
+        buckets = {
+            k: v[~v["OPP_ABBR"].astype(str).str.upper().eq(opp)].copy()
+            for k, v in raw_buckets.items()
+        }
+    else:
+        buckets = raw_buckets
     weights = active_weights(buckets, cfg)
     feats = {
         k: _feat(v, league_team_logs=league_team_logs, game_weights=game_weights)
@@ -238,6 +259,7 @@ def build_team_profile(
     for key in [
         "poss_pg",
         "three_pa_pp", "two_pa_pp", "three_pa_live", "two_pa_live",
+        "fga_live", "three_share",
         "fta_pp", "tov_pp", "oreb_pp", "dreb_pp", "oreb_per_miss",
         "ast_pp", "stl_pp", "blk_pp", "pf_pp",
         "assist_per_make", "dreb_capture", "stl_per_opp_tov",
@@ -245,6 +267,10 @@ def build_team_profile(
     ]:
         p[key] = weighted_average_feature(feats, weights, key)
 
+    # Shooting ability is NOT H2H-blended in v2.11, so keep the full season
+    # (including H2H) for the larger-sample shooting-percentage shrinkage.
+    # Removing H2H here would throw away information without avoiding any
+    # actual double count.
     full = _feat(x, league_team_logs=league_team_logs, game_weights=None)
 
     # Same philosophy as the player engine: recent shooting is NOT accepted as
@@ -287,7 +313,10 @@ def build_team_profile(
 
     audit = []
     for k in ("old", "mid", "l5"):
-        audit.append({"bucket": k, "weight": weights[k], **feats.get(k, {"games": 0})})
+        row = {"bucket": k, "weight": weights[k], **feats.get(k, {"games": 0})}
+        row["raw_bucket_games"] = int(len(raw_buckets.get(k, [])))
+        row["H2H_excluded"] = int(len(raw_buckets.get(k, [])) - len(buckets.get(k, [])))
+        audit.append(row)
     return p, pd.DataFrame(audit)
 
 
@@ -319,6 +348,7 @@ def team_location_modifiers(
     is_home: bool,
     league_team_logs: Optional[pd.DataFrame] = None,
     min_games: int = 5,
+    exclude_opponent_abbr: Optional[str] = None,
 ) -> Tuple[Dict[str, float], pd.DataFrame]:
     """
     Small home/away correction, explicitly shrinked so the location split does
@@ -326,6 +356,7 @@ def team_location_modifiers(
     primary signal.
     """
     neutral = {
+        "FGA": 1.0, "3P_SHARE": 1.0,
         "3PA": 1.0, "2PA": 1.0, "FTA": 1.0, "TOV": 1.0,
         "OREB": 1.0, "AST": 1.0, "PF": 1.0,
         "DREB": 1.0, "STL": 1.0, "BLK": 1.0,
@@ -334,7 +365,12 @@ def team_location_modifiers(
     if mask is None:
         return neutral, pd.DataFrame([{"Location": "unavailable", "Games": 0}])
 
+    base_log = team_log.copy()
     split = team_log[mask if is_home else ~mask].copy()
+    if exclude_opponent_abbr and "OPP_ABBR" in team_log.columns:
+        opp = str(exclude_opponent_abbr).upper()
+        base_log = base_log[~base_log["OPP_ABBR"].astype(str).str.upper().eq(opp)].copy()
+        split = split[~split["OPP_ABBR"].astype(str).str.upper().eq(opp)].copy()
     if len(split) < min_games:
         return neutral, pd.DataFrame([{
             "Location": "home" if is_home else "away",
@@ -342,9 +378,13 @@ def team_location_modifiers(
             "Note": f"< {min_games} games; neutral location modifier",
         }])
 
-    base = _feat(team_log, league_team_logs=league_team_logs)
+    base = _feat(base_log, league_team_logs=league_team_logs)
     loc = _feat(split, league_team_logs=league_team_logs)
     mapping = {
+        "FGA": "fga_live",
+        "3P_SHARE": "three_share",
+        # Legacy audit rows retained but Team Markets no longer multiply
+        # independent 3PA and 2PA opportunity rates.
         "3PA": "three_pa_live",
         "2PA": "two_pa_live",
         "FTA": "fta_pp",
@@ -399,6 +439,87 @@ def h2h_team_audit(
         ] if c in h.columns
     ]
     return h[cols].sort_values(["GAME_DATE", "TEAM_ABBR"], ascending=[False, True]).reset_index(drop=True)
+
+
+def h2h_profile_blend(
+    league_team_logs: pd.DataFrame,
+    team_abbr: str,
+    opponent_abbr: str,
+    base_profile: dict,
+    rotation_similarity: float = 1.0,
+    max_weight: float = 0.15,
+) -> Tuple[dict, pd.DataFrame]:
+    """Blend a DISJOINT same-season H2H sample into structural team rates.
+
+    build_team_profile(..., exclude_opponent_abbr=...) must be used for the
+    baseline when this function is used. That guarantees H2H rows do not also
+    live inside Old/G6-10/L5. Shooting percentages are intentionally excluded
+    because two or three games are too noisy for efficiency estimation.
+
+    Weight:
+        0.20 * N/(N+2) * rotation_similarity, capped at max_weight.
+    With two reasonably comparable H2Hs this is usually ~7-10%.
+    """
+    out = dict(base_profile)
+    if league_team_logs is None or league_team_logs.empty:
+        return out, pd.DataFrame()
+
+    x = league_team_logs.copy()
+    mask = (
+        x["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())
+        & x["OPP_ABBR"].astype(str).str.upper().eq(str(opponent_abbr).upper())
+    )
+    h = x[mask].copy()
+    if h.empty:
+        return out, pd.DataFrame([{
+            "H2H games": 0, "Rotation similarity": float(rotation_similarity),
+            "Applied H2H weight": 0.0,
+        }])
+
+    hfeat = _feat(h, league_team_logs=league_team_logs, game_weights=None)
+    n = int(len(h))
+    sim = float(np.clip(rotation_similarity, 0.0, 1.0))
+    w = min(float(max_weight), 0.20 * (n / (n + 2.0)) * sim)
+
+    mapping = [
+        ("fga_live", "fga_live"),
+        ("three_share", "three_share"),
+        ("fta_pp", "fta_pp"),
+        ("tov_pp", "tov_pp"),
+        ("oreb_per_miss", "oreb_per_miss"),
+        ("assist_per_make", "assist_per_make"),
+        ("pf_pp", "pf_pp"),
+        ("dreb_capture", "dreb_capture"),
+        ("stl_per_opp_tov", "stl_per_opp_tov"),
+        ("blk_rate_pp", "blk_pp"),
+    ]
+    rows = []
+    for target_key, h2h_key in mapping:
+        b = float(base_profile.get(target_key, np.nan))
+        hv = float(hfeat.get(h2h_key, np.nan))
+        if not (np.isfinite(b) and b > 0 and np.isfinite(hv) and hv > 0 and w > 0):
+            applied = b
+        elif target_key in {"dreb_capture", "stl_per_opp_tov"}:
+            applied = (1.0 - w) * b + w * hv
+        else:
+            applied = float(np.exp((1.0 - w) * np.log(b) + w * np.log(hv)))
+        if np.isfinite(applied):
+            out[target_key] = float(applied)
+        rows.append({
+            "Feature": target_key,
+            "Base non-H2H": b,
+            "H2H value": hv,
+            "H2H games": n,
+            "Rotation similarity": sim,
+            "Applied H2H weight": w,
+            "Final": applied,
+        })
+
+    # Keep legacy derived shot fields coherent for audits/backward code paths.
+    if np.isfinite(out.get("fga_live", np.nan)) and np.isfinite(out.get("three_share", np.nan)):
+        out["three_pa_live"] = out["fga_live"] * out["three_share"]
+        out["two_pa_live"] = out["fga_live"] * (1.0 - out["three_share"])
+    return out, pd.DataFrame(rows)
 
 
 def h2h_block_modifier(
@@ -457,6 +578,15 @@ def _simulate_offense(
     z_tov: np.ndarray,
     z_reb: np.ndarray,
 ) -> Dict[str, np.ndarray]:
+    """Simulate one offense using a conditional event chain.
+
+    v2.11 key change:
+        possessions -> TOV -> total FGA -> 3P share -> 3PA/2PA
+
+    3PA and 2PA are no longer independent Poisson draws. This guarantees the
+    shot mix is coherent and prevents arbitrary redistribution between the two
+    attempt markets.
+    """
     poss_i = np.maximum(poss.astype(int), 1)
 
     tov_rate = np.clip(
@@ -466,18 +596,29 @@ def _simulate_offense(
     tov = rng.binomial(poss_i, tov_rate)
     live = np.maximum(poss_i - tov, 1)
 
-    perimeter = np.exp(0.08 * z_style - 0.5 * 0.08**2)
-    three_live = profile.get(
-        "three_pa_live",
-        profile["three_pa_pp"] / max(1.0 - profile["tov_pp"], 0.55),
-    )
-    two_live = profile.get(
-        "two_pa_live",
-        profile["two_pa_pp"] / max(1.0 - profile["tov_pp"], 0.55),
-    )
+    # Total field-goal opportunity conditional on a possession surviving TOV.
+    fga_live = float(profile.get(
+        "fga_live",
+        profile.get("three_pa_live", 0.35) + profile.get("two_pa_live", 0.55),
+    ))
+    fga_mean = np.clip(live * fga_live * ctx.fga, 0.001, None)
+    fga = rng.poisson(fga_mean)
 
-    a3 = rng.poisson(np.clip(live * three_live * ctx.three_pa * perimeter, 0.001, None))
-    a2 = rng.poisson(np.clip(live * two_live * ctx.two_pa / perimeter**0.35, 0.001, None))
+    # Allocate FGA to 3PA vs 2PA. Style noise moves the SHARE, not total FGA.
+    base_share = float(profile.get(
+        "three_share",
+        profile.get("three_pa_live", 0.35) /
+        max(profile.get("three_pa_live", 0.35) + profile.get("two_pa_live", 0.55), 1e-9),
+    ))
+    base_share = float(np.clip(base_share * ctx.three_share, 0.08, 0.72))
+    # Logit-normal perturbation keeps the share inside (0,1) and preserves the
+    # central share much better than separate 3PA/2PA Poisson multipliers.
+    logit = np.log(base_share / max(1.0 - base_share, 1e-9))
+    p3_share = 1.0 / (1.0 + np.exp(-(logit + 0.18 * z_style)))
+    p3_share = np.clip(p3_share, 0.06, 0.75)
+    a3 = rng.binomial(fga, p3_share)
+    a2 = fga - a3
+
     fta = rng.poisson(np.clip(
         poss * profile["fta_pp"] * ctx.fta * np.exp(0.12 * z_foul - 0.5 * 0.12**2),
         0.001, None,
@@ -491,13 +632,15 @@ def _simulate_offense(
     m2 = rng.binomial(a2, p2)
     ftm = rng.binomial(fta, pft)
     fgm = m3 + m2
-    fga = a3 + a2
     pts = 3 * m3 + 2 * m2 + ftm
 
     misses3 = np.maximum(a3 - m3, 0)
     misses2 = np.maximum(a2 - m2, 0)
     misses = misses3 + misses2
 
+    # Current box-score data supports OREB per total miss. A 2P/3P split is NOT
+    # invented here; it should only be activated when play-by-play attribution
+    # is actually available, otherwise it would create pseudo-information.
     oreb_share = np.clip(
         profile.get("oreb_per_miss", 0.25)
         * ctx.oreb
@@ -531,9 +674,9 @@ def _simulate_offense(
         "PF": pf,
         "PTS": pts,
         "MISSES": misses,
+        "3MISS": misses3,
         "2MISS": misses2,
     }
-
 
 def simulate_game(
     home_profile: dict,
@@ -554,9 +697,10 @@ def simulate_game(
       - OREB is sampled from OWN misses
       - DREB is sampled from OPPONENT misses not already rebounded offensively
       - STL is a subset of OPPONENT turnovers
-      - BLK starts from OWN weighted BLK/poss, then uses opponent BLK-allowed,
-        tiny H2H, and a small opponent-2PA opportunity correction; actual 2P
-        misses are only a logical cap
+      - BLK starts from OWN non-H2H weighted BLK/poss, with disjoint H2H folded
+        into the profile, opponent block-susceptibility, optional positional
+        susceptibility, and only a tiny opponent-2PA opportunity nudge
+      - BLK <= opponent total missed FGA (three-point shots can be blocked too)
       - REB = OREB + DREB
 
     This removes the old same-team STL/TOV and BLK/2PA direction errors and
@@ -622,37 +766,38 @@ def simulate_game(
     h_stl = rng.binomial(a["TOV"], h_stl_p)
     a_stl = rng.binomial(h["TOV"], a_stl_p)
 
-    # Blocks -- deliberately simple and transparent:
-    #   own weighted BLK/poss
-    # x opponent's tendency to ALLOW blocks (ctx.blk)
-    # x tiny same-season H2H correction (ctx.blk_h2h)
-    # x small 2PA-opportunity adjustment
+    # Blocks -- v2.11:
+    #   own ability (base profile, with DISJOINT H2H already blended in)
+    # x opponent's tendency to be blocked (ctx.blk)
+    # x optional RELATIVE positional susceptibility (ctx.blk_position)
+    # x tiny 2PA-opportunity adjustment (max +/-2%)
     # x pace automatically through possessions.
-    # Opponent 2PA is NOT the main denominator; it only nudges opportunity +/-4%.
+    # 2PA is deliberately NOT the main denominator.
     h_lg_2pa = max(float(home_profile.get("league_two_pa_pp", 0.54)), 0.10)
     a_lg_2pa = max(float(away_profile.get("league_two_pa_pp", 0.54)), 0.10)
     a_2pa_rate = a["2PA"] / np.maximum(poss, 1)
     h_2pa_rate = h["2PA"] / np.maximum(poss, 1)
-    h_2pa_mod = np.clip((a_2pa_rate / h_lg_2pa) ** 0.15, 0.96, 1.04)
-    a_2pa_mod = np.clip((h_2pa_rate / a_lg_2pa) ** 0.15, 0.96, 1.04)
+    h_2pa_mod = np.clip((a_2pa_rate / h_lg_2pa) ** 0.07, 0.98, 1.02)
+    a_2pa_mod = np.clip((h_2pa_rate / a_lg_2pa) ** 0.07, 0.98, 1.02)
 
     h_blk_noise = np.exp(0.10 * blend(z_game_blk, 0.55) - 0.5 * 0.10**2)
     a_blk_noise = np.exp(0.10 * blend(z_game_blk, 0.55) - 0.5 * 0.10**2)
     h_blk_mean = np.clip(
         poss * home_profile.get("blk_rate_pp", home_profile.get("blk_pp", 0.05))
-        * home_ctx.blk * home_ctx.blk_h2h * h_2pa_mod * h_blk_noise,
+        * home_ctx.blk * home_ctx.blk_position * h_2pa_mod * h_blk_noise,
         0.001, None,
     )
     a_blk_mean = np.clip(
         poss * away_profile.get("blk_rate_pp", away_profile.get("blk_pp", 0.05))
-        * away_ctx.blk * away_ctx.blk_h2h * a_2pa_mod * a_blk_noise,
+        * away_ctx.blk * away_ctx.blk_position * a_2pa_mod * a_blk_noise,
         0.001, None,
     )
     h_blk_candidate = rng.poisson(h_blk_mean)
     a_blk_candidate = rng.poisson(a_blk_mean)
-    # A block is a missed 2PA in the box score, so this is only a conservation cap.
-    h_blk = np.minimum(h_blk_candidate, a["2MISS"])
-    a_blk = np.minimum(a_blk_candidate, h["2MISS"])
+    # Three-point attempts can also be blocked. Total missed FGA is the correct
+    # box-score conservation cap; the old 2MISS-only cap was structurally wrong.
+    h_blk = np.minimum(h_blk_candidate, a["MISSES"])
+    a_blk = np.minimum(a_blk_candidate, h["MISSES"])
 
     h["DREB"] = h_dreb
     a["DREB"] = a_dreb

@@ -571,3 +571,58 @@ def rotation_similarity_weights(
         sim = _jaccard(current, hist)
         out[str(gid)] = 0.55 + 0.45 * sim
     return out
+
+
+def residual_rotation_similarity_weights(
+    player_db: pd.DataFrame,
+    current_pool: pd.DataFrame,
+    team_abbr: str,
+    manual_context: dict,
+    out_players: Optional[Iterable[str]] = None,
+    residual_strength: float = 0.15,
+) -> Dict[str, float]:
+    """Weak residual rotation weighting for Team Markets.
+
+    Confirmed OUT-player identity is handled by the separate exact availability
+    state engine. To avoid counting the same absence twice, selected OUT names are
+    REMOVED from both current and historical rotation sets before Jaccard is
+    calculated. The residual rotation modifier is intentionally weak:
+        (1-strength) + strength * Jaccard
+    with default strength 0.15 => [0.85, 1.00].
+    """
+    out_norm = {str(x).strip().casefold() for x in (out_players or [])}
+    current = _current_rotation_set(
+        player_db, current_pool, team_abbr, manual_context
+    ) - out_norm
+    historical = _historical_rotation_sets(player_db, team_abbr)
+    s = float(np.clip(residual_strength, 0.0, 0.35))
+    out: Dict[str, float] = {}
+    for gid, hist in historical.items():
+        hist_resid = set(hist) - out_norm
+        sim = _jaccard(current, hist_resid)
+        out[str(gid)] = (1.0 - s) + s * sim
+    return out
+
+
+def h2h_rotation_similarity(
+    player_db: pd.DataFrame,
+    current_pool: pd.DataFrame,
+    team_abbr: str,
+    manual_context: dict,
+    game_ids: Iterable[str],
+) -> float:
+    """Mean current-vs-H2H rotation similarity for H2H confidence.
+
+    Unlike residual team-history weighting, confirmed OUT names are NOT removed
+    here. If a player is OUT today but played in an old H2H, that H2H should be
+    considered less comparable.
+    """
+    gids = {str(x) for x in game_ids}
+    if not gids:
+        return 0.0
+    current = _current_rotation_set(
+        player_db, current_pool, team_abbr, manual_context
+    )
+    historical = _historical_rotation_sets(player_db, team_abbr)
+    sims = [_jaccard(current, historical.get(gid, set())) for gid in gids if gid in historical]
+    return float(np.mean(sims)) if sims else 0.0
