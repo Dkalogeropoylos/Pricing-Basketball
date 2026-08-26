@@ -391,9 +391,77 @@ with tab_game:
                 key="market_spread_audit",
             )
 
+    # ---------------------------------------------------------------
+    # SHARED CONFIRMED-OUT STATE — single source of truth for BOTH
+    # Team Markets and Player Props. Keeping one selector avoids the two
+    # tabs silently disagreeing about availability.
+    # ---------------------------------------------------------------
+    if setup and data_pack is not None:
+        provider = SportsDataverseWNBA()
+        pool = provider.current_player_pool(player_db)
+        manual_context = st.session_state.get("game_context", {})
+        with st.expander(
+            "Confirmed OUT availability — shared by Team Markets + Player Props",
+            expanded=True,
+        ):
+            st.caption(
+                "Select only confirmed OUT players. QUESTIONABLE/GTD is ignored until you explicitly mark OUT. "
+                "This exact same state feeds the team availability engine, the 200-minute player rotation, "
+                "and each focal player's same-state per-minute profile."
+            )
+            ac1, ac2, ac3 = st.columns([1, 1, 0.7])
+            away_opts = sorted(
+                pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["away_abbr"].upper())]
+                ["PLAYER_NAME"].astype(str).unique().tolist(),
+                key=str.casefold,
+            )
+            home_opts = sorted(
+                pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["home_abbr"].upper())]
+                ["PLAYER_NAME"].astype(str).unique().tolist(),
+                key=str.casefold,
+            )
+            away_default = [
+                x for x in _context_out_names_for_team(manual_context, pool, setup["away_abbr"])
+                if x in away_opts
+            ]
+            home_default = [
+                x for x in _context_out_names_for_team(manual_context, pool, setup["home_abbr"])
+                if x in home_opts
+            ]
+            away_selected_out = ac1.multiselect(
+                f"{setup['away_abbr']} confirmed OUT",
+                away_opts, default=away_default,
+                key=f"global_confirmed_out_{setup['away_abbr']}",
+            )
+            home_selected_out = ac2.multiselect(
+                f"{setup['home_abbr']} confirmed OUT",
+                home_opts, default=home_default,
+                key=f"global_confirmed_out_{setup['home_abbr']}",
+            )
+            ac3.number_input(
+                "State shrink K", min_value=3.0, max_value=15.0, value=6.0, step=1.0,
+                help=(
+                    "Provisional partial-pooling strength. Exact-state confidence = N/(N+K). "
+                    "One shared K is used by team and player exact-state weighting until rolling backtests calibrate it."
+                ),
+                key="availability_state_k",
+            )
+            manual_context = _apply_confirmed_out_selection(
+                manual_context, pool, setup["away_abbr"], away_selected_out
+            )
+            manual_context = _apply_confirmed_out_selection(
+                manual_context, pool, setup["home_abbr"], home_selected_out
+            )
+            st.session_state["game_context"] = manual_context
+            st.caption(
+                "Overlap guard: OUT identity is one shared state. Team rates use exact-state inner weighting; "
+                "player minutes redistribute to 200; player profiles use exact-state PER-MINUTE rates. "
+                "The same absence is not added again as a separate usage boost."
+            )
+
     st.markdown("### Trader context")
     st.caption(
-        "The model does not guess injuries. Trader marks OUT/GTD and can "
+        "The model does not guess injuries. Trader marks confirmed OUT and can "
         "override minutes/roles. If minutes are omitted, the Minutes Engine "
         "projects them automatically."
     )
@@ -485,55 +553,22 @@ with tab_team:
         )
 
         # -----------------------------------------------------------------
-        # CONFIRMED OUT state: explicit trader input only. No Q/GTD guessing.
+        # CONFIRMED OUT state comes from the single shared selector in Game Setup.
+        # Team Markets only READ it here, so Team and Player tabs cannot disagree.
         # -----------------------------------------------------------------
-        with st.expander("Confirmed OUT availability — exact historical state", expanded=True):
-            st.caption(
-                "Select only confirmed OUT players. QUESTIONABLE/GTD is ignored until you explicitly mark OUT. "
-                "The model looks for historical games where ALL selected OUT players were absent together. "
-                "Those games are reweighted inside Old/G6–10/L5; they are NOT added as a fourth sample."
-            )
-            ac1, ac2, ac3 = st.columns([1, 1, 0.7])
-            away_opts = sorted(
-                pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["away_abbr"].upper())]
-                ["PLAYER_NAME"].astype(str).unique().tolist(),
-                key=str.casefold,
-            )
-            home_opts = sorted(
-                pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["home_abbr"].upper())]
-                ["PLAYER_NAME"].astype(str).unique().tolist(),
-                key=str.casefold,
-            )
-            away_default = [x for x in _context_out_names_for_team(manual_context, pool, setup["away_abbr"]) if x in away_opts]
-            home_default = [x for x in _context_out_names_for_team(manual_context, pool, setup["home_abbr"]) if x in home_opts]
-            away_selected_out = ac1.multiselect(
-                f"{setup['away_abbr']} confirmed OUT", away_opts, default=away_default,
-                key=f"confirmed_out_{setup['away_abbr']}",
-            )
-            home_selected_out = ac2.multiselect(
-                f"{setup['home_abbr']} confirmed OUT", home_opts, default=home_default,
-                key=f"confirmed_out_{setup['home_abbr']}",
-            )
-            availability_k = ac3.number_input(
-                "State shrink K", min_value=3.0, max_value=15.0, value=6.0, step=1.0,
-                help=(
-                    "Provisional partial-pooling strength. Exact-state confidence = N/(N+K). "
-                    "K=6 is intentionally conservative and should later be tuned by rolling out-of-sample backtest."
-                ),
-                key="availability_state_k",
-            )
-            manual_context = _apply_confirmed_out_selection(
-                manual_context, pool, setup["away_abbr"], away_selected_out
-            )
-            manual_context = _apply_confirmed_out_selection(
-                manual_context, pool, setup["home_abbr"], home_selected_out
-            )
-            # Persist so the Player Props minutes/role engines see the same confirmed OUT state.
-            st.session_state["game_context"] = manual_context
-            st.caption(
-                "Overlap guard: OUT identity is handled by the exact-state engine. Residual rotation similarity removes "
-                "those OUT names before Jaccard, so the same absence is not counted twice."
-            )
+        away_selected_out = _context_out_names_for_team(
+            manual_context, pool, setup["away_abbr"]
+        )
+        home_selected_out = _context_out_names_for_team(
+            manual_context, pool, setup["home_abbr"]
+        )
+        availability_k = float(st.session_state.get("availability_state_k", 6.0))
+        st.caption(
+            "Shared confirmed OUT state — "
+            f"{setup['away_abbr']}: {', '.join(away_selected_out) if away_selected_out else '—'} | "
+            f"{setup['home_abbr']}: {', '.join(home_selected_out) if home_selected_out else '—'} | "
+            f"shrink K={availability_k:.1f}. Change this only in Game Setup."
+        )
 
         # AUTO regime is separate from confirmed OUT state. Use role_change only
         # for a broader structural role/rotation change, not merely because the
@@ -1051,6 +1086,15 @@ with tab_player:
         provider = SportsDataverseWNBA()
         pool = provider.current_player_pool(player_db)
         manual_context = st.session_state.get("game_context", {})
+        away_prop_out = _context_out_names_for_team(manual_context, pool, setup["away_abbr"])
+        home_prop_out = _context_out_names_for_team(manual_context, pool, setup["home_abbr"])
+        player_availability_k = float(st.session_state.get("availability_state_k", 6.0))
+        st.info(
+            "Confirmed OUT used by Player Props — "
+            f"{setup['away_abbr']}: {', '.join(away_prop_out) if away_prop_out else '—'} | "
+            f"{setup['home_abbr']}: {', '.join(home_prop_out) if home_prop_out else '—'}. "
+            "Change OUT players in Game Setup; the same state is used here automatically."
+        )
 
         # Background minutes engine always projects the whole rotation so the
         # team stays at 200 regulation minutes.
@@ -1253,11 +1297,12 @@ with tab_player:
                 key="selected_sims",
             )
             same_role_enabled = st.toggle(
-                "AUTO: weight historical games toward the current teammate-absence state",
+                "AUTO: exact confirmed-OUT state for player per-minute role",
                 value=True,
                 help=(
-                    "Example: if Fudd is confirmed OUT, Bueckers games in which Fudd did not play "
-                    "receive a regularized inner weight. This does NOT create a fourth sample."
+                    "Example: if Fudd and James are confirmed OUT, a focal player's historical games where BOTH "
+                    "were absent together are partial-pooled inside Old/G6-10/L5. Eligibility starts only after all "
+                    "selected teammates had joined the team. Minutes are handled separately by the 200-minute engine."
                 ),
                 key="same_role_absence_toggle",
             )
@@ -1298,22 +1343,54 @@ with tab_player:
                         player_db[player_db["PLAYER_ID"] == pid].copy()
                     )
 
-                    # Preserve fixed protocol. Team/player regime comes from
-                    # trader rotation context or explicit role redistribution.
+                    # Player injury logic has three deliberately separate layers:
+                    #   1) 200-minute engine -> MINUTES after confirmed OUTs
+                    #   2) exact-state inner weights -> PER-MINUTE role/opportunity rates
+                    #   3) explicit trader role multipliers -> only if trader intentionally adds them
+                    # The OUT state itself must not also trigger 35/20/45 automatically.
                     role = context_role(manual_context, pname)
                     regime = str(mr["Regime"])
-                    cfg = (
-                        WeightConfig.role_change()
-                        if regime == "role_change" or role
-                        else WeightConfig.stable()
-                    )
                     out_teammates = current_out_teammates(
                         manual_context, pool, team_abbr, pname
                     )
-                    role_game_weights, same_role_audit = same_role_game_weights(
-                        plog, player_db, team_abbr, out_teammates,
-                        enabled=same_role_enabled,
-                    )
+
+                    if same_role_enabled and out_teammates:
+                        role_game_weights, same_role_audit, exact_role_ids = availability_state_weights(
+                            player_db, plog, team_abbr, out_teammates,
+                            k=float(player_availability_k),
+                        )
+                        # Add transparent focal-player outcomes for the exact state.
+                        exact_mask = plog["GAME_ID"].astype(str).isin(exact_role_ids)
+                        exact_rows = plog[exact_mask].copy()
+                        for col, label in [
+                            ("MIN", "Exact-state MIN"), ("PTS", "Exact-state PTS"),
+                            ("REB", "Exact-state REB"), ("AST", "Exact-state AST"),
+                            ("FG3A", "Exact-state 3PA"), ("FTA", "Exact-state FTA"),
+                        ]:
+                            same_role_audit[label] = (
+                                float(pd.to_numeric(exact_rows[col], errors="coerce").mean())
+                                if (not exact_rows.empty and col in exact_rows.columns) else np.nan
+                            )
+                        same_role_audit["Profile overlap guard"] = (
+                            "Stable outer 55/20/25 for this OUT state; exact-state evidence is inner only."
+                        )
+                        # Same absence must not ALSO become the generic role-change outer profile.
+                        cfg = WeightConfig.role_change() if role else WeightConfig.stable()
+                    else:
+                        role_game_weights = {}
+                        exact_role_ids = set()
+                        same_role_audit = pd.DataFrame([{
+                            "Confirmed OUT state": "—",
+                            "Exact-state games": 0,
+                            "State confidence": 0.0,
+                            "Profile overlap guard": "Neutral: no confirmed OUT teammate state selected.",
+                        }])
+                        cfg = (
+                            WeightConfig.role_change()
+                            if regime == "role_change" or role
+                            else WeightConfig.stable()
+                        )
+
                     profile,audit = build_player_profile(
                         plog,cfg,game_weights=role_game_weights
                     )
@@ -1449,7 +1526,7 @@ with tab_player:
                         detail["matchup_audit"].round(4),
                         use_container_width=True,
                     )
-                    st.markdown("**Current teammate-absence / same-role audit**")
+                    st.markdown("**Confirmed-OUT exact-state player-role audit**")
                     st.dataframe(
                         detail["same_role_audit"].round(3),
                         use_container_width=True,
@@ -1531,7 +1608,8 @@ with tab_audit:
 **Minutes / pace**
 - Full team rotation is constrained to 200 regulation minutes.
 - Explicit minute overrides use the historically learned replacement matrix.
-- Player Props continue to use the same confirmed OUT context.
+- One shared Confirmed OUT selector in Game Setup feeds BOTH Team Markets and Player Props.
+- Player Props use exact JOINT absence-state partial pooling for per-minute rates, with an eligibility-start guard.
 - Pace control is fitted from completed WNBA games with a mild ridge prior.
 - The exact same projected possessions feed Team Markets and Player Props.
 - Market total/handicap remain audit-only.
