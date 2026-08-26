@@ -40,6 +40,9 @@ from core.role_splits import current_out_teammates, same_role_game_weights
 from core.availability import (
     confirmed_out_players, availability_state_weights, combine_game_weights,
 )
+from core.availability_impact import (
+    recent_team_player_names, augment_current_pool, build_rotation_state_impact,
+)
 
 
 st.set_page_config(
@@ -47,10 +50,10 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.11.0")
+st.title("🏀 Basketball Pricing Engine v2.12.0")
 st.caption(
-    "Confirmed-OUT state weighting • Non-overlap H2H • FGA→3P-share shot model • BLK v3 • "
-    "Coupled two-team markets • Auto line ladders/play-from prices • No duplicate injury/H2H samples"
+    "Shared OUT + minute-restriction state • roster-aware fallback when exact OUT games do not exist • "
+    "offense/defense 3P-share + FTA blending • non-overlap H2H • BLK v3 • coupled team markets"
 )
 
 
@@ -83,6 +86,9 @@ def reset_context_widgets():
         "home_team_mod_",
         "away_team_mod_",
         "confirmed_out_",
+        "global_confirmed_out_",
+        "shared_min_names_",
+        "shared_min_value_",
     )
     for key in list(st.session_state.keys()):
         if any(str(key).startswith(p) for p in prefixes):
@@ -133,6 +139,47 @@ def _apply_confirmed_out_selection(manual_context, pool, team_abbr, selected_nam
         injuries[str(name)] = {"status": "OUT", "team": str(team_abbr).upper()}
         if note:
             injuries[str(name)]["note"] = note
+    return ctx
+
+
+def _context_pool_for_selector(current_pool, player_db, team_abbr):
+    """Pool used only for availability UI; includes recent ex-roster names.
+
+    Calculations themselves re-add only players explicitly selected OUT, so an
+    old traded player cannot accidentally receive current minutes.
+    """
+    recent = recent_team_player_names(player_db, team_abbr)
+    return augment_current_pool(current_pool, player_db, team_abbr, recent)
+
+
+def _apply_shared_minute_overrides(manual_context, pool, team_abbr, selected_values):
+    ctx = copy.deepcopy(manual_context or {})
+    block = dict(ctx.get("projected_minutes", {}) or {})
+    team_names = set(
+        pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())]
+        ["PLAYER_NAME"].astype(str).tolist()
+    )
+    selected_cf = {str(k).casefold(): float(v) for k, v in (selected_values or {}).items()}
+    # Deselecting a current-team override removes it from the shared state.
+    for name in list(block.keys()):
+        if str(name) in team_names and str(name).casefold() not in selected_cf:
+            block.pop(name, None)
+    for name_cf, value in selected_cf.items():
+        actual = next((n for n in team_names if str(n).casefold() == name_cf), None)
+        if actual is not None:
+            block[str(actual)] = float(value)
+    ctx["projected_minutes"] = block
+    return ctx
+
+
+def _clear_team_projected_minutes(manual_context, pool, team_abbr):
+    ctx = copy.deepcopy(manual_context or {})
+    block = dict(ctx.get("projected_minutes", {}) or {})
+    names = set(
+        pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())]
+        ["PLAYER_NAME"].astype(str).tolist()
+    )
+    ctx["projected_minutes"] = {k: v for k, v in block.items() if str(k) not in names}
     return ctx
 
 
@@ -399,65 +446,149 @@ with tab_game:
     if setup and data_pack is not None:
         provider = SportsDataverseWNBA()
         pool = provider.current_player_pool(player_db)
+        # Availability selector is allowed to show recently departed players so
+        # a fresh buyout/trade can still be marked unavailable. Calculations
+        # only re-add names that the trader actually selects OUT.
+        away_selector_pool = _context_pool_for_selector(pool, player_db, setup["away_abbr"])
+        home_selector_pool = _context_pool_for_selector(pool, player_db, setup["home_abbr"])
+        selector_pool = concat_without_attrs([away_selector_pool, home_selector_pool], ignore_index=True)
         manual_context = st.session_state.get("game_context", {})
+
         with st.expander(
             "Confirmed OUT availability — shared by Team Markets + Player Props",
             expanded=True,
         ):
             st.caption(
-                "Select only confirmed OUT players. QUESTIONABLE/GTD is ignored until you explicitly mark OUT. "
-                "This exact same state feeds the team availability engine, the 200-minute player rotation, "
-                "and each focal player's same-state per-minute profile."
+                "Select only confirmed OUT/unavailable players. Recent ex-roster names are shown too, so a buyout/trade "
+                "can move the historical baseline even before the team has played a game without that player. "
+                "QUESTIONABLE/GTD stays neutral until you explicitly mark OUT."
             )
             ac1, ac2, ac3 = st.columns([1, 1, 0.7])
             away_opts = sorted(
-                pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["away_abbr"].upper())]
-                ["PLAYER_NAME"].astype(str).unique().tolist(),
-                key=str.casefold,
+                away_selector_pool[away_selector_pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["away_abbr"].upper())]
+                ["PLAYER_NAME"].astype(str).unique().tolist(), key=str.casefold,
             )
             home_opts = sorted(
-                pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["home_abbr"].upper())]
-                ["PLAYER_NAME"].astype(str).unique().tolist(),
-                key=str.casefold,
+                home_selector_pool[home_selector_pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["home_abbr"].upper())]
+                ["PLAYER_NAME"].astype(str).unique().tolist(), key=str.casefold,
             )
             away_default = [
-                x for x in _context_out_names_for_team(manual_context, pool, setup["away_abbr"])
+                x for x in _context_out_names_for_team(manual_context, away_selector_pool, setup["away_abbr"])
                 if x in away_opts
             ]
             home_default = [
-                x for x in _context_out_names_for_team(manual_context, pool, setup["home_abbr"])
+                x for x in _context_out_names_for_team(manual_context, home_selector_pool, setup["home_abbr"])
                 if x in home_opts
             ]
             away_selected_out = ac1.multiselect(
-                f"{setup['away_abbr']} confirmed OUT",
-                away_opts, default=away_default,
+                f"{setup['away_abbr']} confirmed OUT", away_opts, default=away_default,
                 key=f"global_confirmed_out_{setup['away_abbr']}",
             )
             home_selected_out = ac2.multiselect(
-                f"{setup['home_abbr']} confirmed OUT",
-                home_opts, default=home_default,
+                f"{setup['home_abbr']} confirmed OUT", home_opts, default=home_default,
                 key=f"global_confirmed_out_{setup['home_abbr']}",
             )
             ac3.number_input(
                 "State shrink K", min_value=3.0, max_value=15.0, value=6.0, step=1.0,
                 help=(
-                    "Provisional partial-pooling strength. Exact-state confidence = N/(N+K). "
-                    "One shared K is used by team and player exact-state weighting until rolling backtests calibrate it."
-                ),
-                key="availability_state_k",
+                    "Exact-state confidence = N/(N+K). If exact OUT games are sparse/zero, v2.12 uses a "
+                    "roster-synthetic fallback from the 200-minute rotation instead of leaving the team unchanged."
+                ), key="availability_state_k",
             )
             manual_context = _apply_confirmed_out_selection(
-                manual_context, pool, setup["away_abbr"], away_selected_out
+                manual_context, away_selector_pool, setup["away_abbr"], away_selected_out
             )
             manual_context = _apply_confirmed_out_selection(
-                manual_context, pool, setup["home_abbr"], home_selected_out
+                manual_context, home_selector_pool, setup["home_abbr"], home_selected_out
             )
             st.session_state["game_context"] = manual_context
             st.caption(
-                "Overlap guard: OUT identity is one shared state. Team rates use exact-state inner weighting; "
-                "player minutes redistribute to 200; player profiles use exact-state PER-MINUTE rates. "
-                "The same absence is not added again as a separate usage boost."
+                "Overlap guard: exact historical OUT games are primary. The roster-synthetic fallback is automatically "
+                "shrunk as exact-state confidence rises; it is not added as a fourth historical sample."
             )
+
+        # Shared minute restrictions/returns are current-state information and
+        # must feed BOTH team markets and player props. Local player-tab overrides
+        # remain scenario-only; use this block for a real restriction such as Plum.
+        with st.expander("Shared minute overrides / restrictions", expanded=False):
+            st.caption(
+                "Use this for a real current restriction/return. These minutes are written to game_context and affect "
+                "the full 200-minute rotation, Team Markets and Player Props."
+            )
+            # Calculation pools include only selected OUT historical names; no
+            # unrelated old player is allowed back into today's rotation.
+            away_calc_pool = augment_current_pool(pool, player_db, setup["away_abbr"], away_selected_out)
+            home_calc_pool = augment_current_pool(pool, player_db, setup["home_abbr"], home_selected_out)
+            calc_pool = concat_without_attrs([away_calc_pool, home_calc_pool], ignore_index=True)
+
+            # AUTO baselines ignore existing shared minute overrides, but retain OUTs.
+            away_auto_ctx = _clear_team_projected_minutes(manual_context, away_calc_pool, setup["away_abbr"])
+            home_auto_ctx = _clear_team_projected_minutes(manual_context, home_calc_pool, setup["home_abbr"])
+            away_auto_min = project_team_minutes(
+                player_db, team_db, away_calc_pool, setup["away_abbr"], setup["away_name"], away_auto_ctx
+            )
+            home_auto_min = project_team_minutes(
+                player_db, team_db, home_calc_pool, setup["home_abbr"], setup["home_name"], home_auto_ctx
+            )
+            auto_min_map = {
+                str(r["Player"]): float(r["Projected Min"])
+                for _, r in concat_without_attrs([away_auto_min, home_auto_min], ignore_index=True).iterrows()
+            }
+            existing_pm = dict(manual_context.get("projected_minutes", {}) or {})
+            c1, c2 = st.columns(2)
+            away_active = sorted(
+                [x for x in pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["away_abbr"].upper())]["PLAYER_NAME"].astype(str).unique().tolist()
+                 if x not in set(away_selected_out)], key=str.casefold
+            )
+            home_active = sorted(
+                [x for x in pool[pool["TEAM_ABBR"].astype(str).str.upper().eq(setup["home_abbr"].upper())]["PLAYER_NAME"].astype(str).unique().tolist()
+                 if x not in set(home_selected_out)], key=str.casefold
+            )
+            away_existing = [x for x in away_active if x in existing_pm]
+            home_existing = [x for x in home_active if x in existing_pm]
+            away_min_names = c1.multiselect(
+                f"{setup['away_abbr']} minute overrides", away_active, default=away_existing,
+                key=f"shared_min_names_{setup['away_abbr']}",
+            )
+            home_min_names = c2.multiselect(
+                f"{setup['home_abbr']} minute overrides", home_active, default=home_existing,
+                key=f"shared_min_names_{setup['home_abbr']}",
+            )
+            away_values, home_values = {}, {}
+            if away_min_names:
+                st.markdown(f"**{setup['away_abbr']}**")
+                cols = st.columns(min(4, len(away_min_names)))
+                for i, name in enumerate(away_min_names):
+                    default = float(existing_pm.get(name, auto_min_map.get(name, 20.0)))
+                    away_values[name] = cols[i % len(cols)].number_input(
+                        f"{name} expected MIN", min_value=0.0, max_value=40.0,
+                        value=float(np.clip(default, 0.0, 40.0)), step=0.5,
+                        key=f"shared_min_value_{setup['away_abbr']}_{name}",
+                        help=f"AUTO baseline ≈ {auto_min_map.get(name, np.nan):.1f}",
+                    )
+            if home_min_names:
+                st.markdown(f"**{setup['home_abbr']}**")
+                cols = st.columns(min(4, len(home_min_names)))
+                for i, name in enumerate(home_min_names):
+                    default = float(existing_pm.get(name, auto_min_map.get(name, 20.0)))
+                    home_values[name] = cols[i % len(cols)].number_input(
+                        f"{name} expected MIN", min_value=0.0, max_value=40.0,
+                        value=float(np.clip(default, 0.0, 40.0)), step=0.5,
+                        key=f"shared_min_value_{setup['home_abbr']}_{name}",
+                        help=f"AUTO baseline ≈ {auto_min_map.get(name, np.nan):.1f}",
+                    )
+            manual_context = _apply_shared_minute_overrides(
+                manual_context, away_calc_pool, setup["away_abbr"], away_values
+            )
+            manual_context = _apply_shared_minute_overrides(
+                manual_context, home_calc_pool, setup["home_abbr"], home_values
+            )
+            st.session_state["game_context"] = manual_context
+            if away_values or home_values:
+                st.success(
+                    "Shared minute context active: "
+                    + "; ".join([f"{k} {v:.1f}'" for k, v in {**away_values, **home_values}.items()])
+                )
 
     st.markdown("### Trader context")
     st.caption(
@@ -703,6 +834,43 @@ with tab_team:
             rotation_similarity=away_h2h_sim,
         )
 
+        # v2.12 roster-state bridge. Exact historical OUT matching remains the
+        # primary empirical layer. When exact games are sparse/zero (e.g. a
+        # player just left the roster), a synthetic 200-minute counterfactual
+        # moves team style instead of leaving the line unchanged. Explicit
+        # minute restrictions are a separate current-state layer.
+        def _audit_conf(df):
+            if df is None or df.empty or "State confidence" not in df.columns:
+                return 0.0
+            return float(pd.to_numeric(df["State confidence"], errors="coerce").fillna(0.0).iloc[0])
+
+        home_rot_impact = build_rotation_state_impact(
+            player_db, team_db, pool, setup["home_abbr"], setup["home_name"],
+            manual_context, home_out, exact_state_confidence=_audit_conf(home_avail_audit),
+        )
+        away_rot_impact = build_rotation_state_impact(
+            player_db, team_db, pool, setup["away_abbr"], setup["away_name"],
+            manual_context, away_out, exact_state_confidence=_audit_conf(away_avail_audit),
+        )
+        home_roster_mod = home_rot_impact.modifiers
+        away_roster_mod = away_rot_impact.modifiers
+
+        # Structural matchup blending should see the CURRENT offensive identity.
+        # The final context still multiplies the roster modifier because the
+        # simulator's base profile is historical; this is not double counting.
+        def _roster_adjusted_profile(profile, roster_mod):
+            q = dict(profile)
+            q["three_share"] = float(np.clip(
+                q.get("three_share", 0.35) * roster_mod.get("3P_SHARE", 1.0), 0.06, 0.75
+            ))
+            q["fta_pp"] = float(np.clip(
+                q.get("fta_pp", 0.24) * roster_mod.get("FTA", 1.0), 0.05, 0.55
+            ))
+            return q
+
+        home_match_profile = _roster_adjusted_profile(home_profile, home_roster_mod)
+        away_match_profile = _roster_adjusted_profile(away_profile, away_roster_mod)
+
         # Opponent allowance for Team Markets excludes the same H2H rows, so the
         # explicit H2H layer above is genuinely non-overlapping.
         home_opp = st.session_state.get("team_opp_profile_away") or opponent_allowed_profile(
@@ -711,8 +879,8 @@ with tab_team:
         away_opp = st.session_state.get("team_opp_profile_home") or opponent_allowed_profile(
             team_db, setup["home_abbr"], exclude_team_abbr=setup["away_abbr"]
         )
-        home_auto = team_matchup_modifiers(home_opp)
-        away_auto = team_matchup_modifiers(away_opp)
+        home_auto = team_matchup_modifiers(home_opp, own_profile=home_match_profile)
+        away_auto = team_matchup_modifiers(away_opp, own_profile=away_match_profile)
 
         # Small location correction with the current H2H opponent excluded as well.
         home_loc, home_loc_audit = team_location_modifiers(
@@ -724,26 +892,27 @@ with tab_team:
             exclude_opponent_abbr=setup["home_abbr"],
         )
 
-        def combined_mods(auto, loc):
-            # v2.11 removes independent 3PA and 2PA contextual multipliers.
-            # Total FGA opportunity and the 3P share are distinct conditional layers.
+        def combined_mods(auto, loc, roster):
+            # Conditional layers are combined once each:
+            # historical profile -> roster state -> opponent interaction -> small location.
             return {
-                "FGA": float(np.clip(auto.get("FGA", 1.0) * loc.get("FGA", 1.0), 0.94, 1.06)),
-                "3P_SHARE": float(np.clip(auto.get("3P_SHARE", 1.0) * loc.get("3P_SHARE", 1.0), 0.92, 1.08)),
-                "FTA": float(auto.get("FTA", 1.0) * loc.get("FTA", 1.0)),
-                "TOV": float(auto.get("TOV", 1.0) * loc.get("TOV", 1.0)),
-                "OREB": float(auto.get("OREB", 1.0) * loc.get("OREB", 1.0)),
-                "AST": float(auto.get("AST", 1.0) * loc.get("AST", 1.0)),
-                "PF": float(auto.get("PF", 1.0) * loc.get("PF", 1.0)),
-                "DREB": float(loc.get("DREB", 1.0)),
-                "STL": float(loc.get("STL", 1.0)),
-                "BLK": float(np.clip(auto.get("BLK", 1.0) * loc.get("BLK", 1.0), 0.88, 1.12)),
-                "3P_PCT": float(auto.get("3P_PCT", 1.0)),
-                "2P_PCT": float(auto.get("2P_PCT", 1.0)),
+                "FGA": float(np.clip(roster.get("FGA", 1.0) * auto.get("FGA", 1.0) * loc.get("FGA", 1.0), 0.90, 1.10)),
+                "3P_SHARE": float(np.clip(roster.get("3P_SHARE", 1.0) * auto.get("3P_SHARE", 1.0) * loc.get("3P_SHARE", 1.0), 0.84, 1.16)),
+                "FTA": float(np.clip(roster.get("FTA", 1.0) * auto.get("FTA", 1.0) * loc.get("FTA", 1.0), 0.80, 1.20)),
+                "TOV": float(np.clip(roster.get("TOV", 1.0) * auto.get("TOV", 1.0) * loc.get("TOV", 1.0), 0.82, 1.18)),
+                "OREB": float(np.clip(roster.get("OREB", 1.0) * auto.get("OREB", 1.0) * loc.get("OREB", 1.0), 0.82, 1.18)),
+                "AST": float(np.clip(roster.get("AST", 1.0) * auto.get("AST", 1.0) * loc.get("AST", 1.0), 0.82, 1.18)),
+                "PF": float(np.clip(roster.get("PF", 1.0) * auto.get("PF", 1.0) * loc.get("PF", 1.0), 0.84, 1.16)),
+                "DREB": float(np.clip(roster.get("DREB", 1.0) * loc.get("DREB", 1.0), 0.88, 1.12)),
+                "STL": float(np.clip(roster.get("STL", 1.0) * loc.get("STL", 1.0), 0.86, 1.14)),
+                "BLK": float(np.clip(roster.get("BLK", 1.0) * auto.get("BLK", 1.0) * loc.get("BLK", 1.0), 0.82, 1.18)),
+                "3P_PCT": float(np.clip(roster.get("3P_PCT", 1.0) * auto.get("3P_PCT", 1.0), 0.94, 1.06)),
+                "2P_PCT": float(np.clip(roster.get("2P_PCT", 1.0) * auto.get("2P_PCT", 1.0), 0.94, 1.06)),
             }
 
-        home_mod = combined_mods(home_auto, home_loc)
-        away_mod = combined_mods(away_auto, away_loc)
+
+        home_mod = combined_mods(home_auto, home_loc, home_roster_mod)
+        away_mod = combined_mods(away_auto, away_loc, away_roster_mod)
 
         # Optional positional BLK susceptibility. It is neutral unless the
         # loaded player data contains an actual blocked-attempt field.
@@ -820,6 +989,9 @@ with tab_team:
             setup["home_abbr"], setup["away_abbr"], float(shared_pace),
             float(poss_sd), home_regime, away_regime, bool(rotation_similarity_enabled),
             tuple(home_out), tuple(away_out), float(availability_k),
+            tuple(sorted((str(k), float(v)) for k, v in (manual_context.get("projected_minutes", {}) or {}).items())),
+            tuple(round(home_roster_mod[k], 4) for k in sorted(home_roster_mod)),
+            tuple(round(away_roster_mod[k], 4) for k in sorted(away_roster_mod)),
             round(home_h2h_sim, 4), round(away_h2h_sim, 4),
             round(home_blk_pos, 4), round(away_blk_pos, 4),
             tuple(round(home_mod[k], 4) for k in sorted(home_mod)),
@@ -960,6 +1132,27 @@ with tab_team:
                     use_container_width=True, hide_index=True,
                 )
 
+                st.markdown("**Roster-state bridge — OUT fallback + minute restrictions**")
+                st.caption(
+                    "Healthy / OUT-only / current are 200-minute synthetic counterfactuals. The OUT bridge fades as "
+                    "exact-state confidence rises; shared minute restrictions are a separate current-state layer."
+                )
+                ra1, ra2 = st.columns(2)
+                with ra1:
+                    st.caption(setup["away_abbr"])
+                    st.dataframe(away_rot_impact.team_audit.round(4), use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        away_rot_impact.current_minutes[["Player","Status","Projected Min","Source"]].round(2),
+                        use_container_width=True, hide_index=True,
+                    )
+                with ra2:
+                    st.caption(setup["home_abbr"])
+                    st.dataframe(home_rot_impact.team_audit.round(4), use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        home_rot_impact.current_minutes[["Player","Status","Projected Min","Source"]].round(2),
+                        use_container_width=True, hide_index=True,
+                    )
+
                 def _inner_weight_summary(team_abbr, game_weights, regime, out_names):
                     ws = np.asarray(list(game_weights.values()), dtype=float) if game_weights else np.asarray([])
                     return {
@@ -984,15 +1177,21 @@ with tab_team:
                         "Team": setup["away_abbr"],
                         "Base FGA/live": away_profile.get("fga_live", np.nan),
                         "Base 3P share": away_profile.get("three_share", np.nan),
-                        "Opponent+location FGA mod": away_mod.get("FGA", 1.0),
-                        "Opponent+location 3P-share mod": away_mod.get("3P_SHARE", 1.0),
+                        "Final FGA context mod": away_mod.get("FGA", 1.0),
+                        "Final 3P-share context mod": away_mod.get("3P_SHARE", 1.0),
+                        "Final FTA context mod": away_mod.get("FTA", 1.0),
+                        "Roster 3P-share mod": away_roster_mod.get("3P_SHARE", 1.0),
+                        "Roster FTA mod": away_roster_mod.get("FTA", 1.0),
                     },
                     {
                         "Team": setup["home_abbr"],
                         "Base FGA/live": home_profile.get("fga_live", np.nan),
                         "Base 3P share": home_profile.get("three_share", np.nan),
-                        "Opponent+location FGA mod": home_mod.get("FGA", 1.0),
-                        "Opponent+location 3P-share mod": home_mod.get("3P_SHARE", 1.0),
+                        "Final FGA context mod": home_mod.get("FGA", 1.0),
+                        "Final 3P-share context mod": home_mod.get("3P_SHARE", 1.0),
+                        "Final FTA context mod": home_mod.get("FTA", 1.0),
+                        "Roster 3P-share mod": home_roster_mod.get("3P_SHARE", 1.0),
+                        "Roster FTA mod": home_roster_mod.get("FTA", 1.0),
                     },
                 ]).round(4), use_container_width=True, hide_index=True)
 
@@ -1009,6 +1208,7 @@ with tab_team:
                         "Base non-H2H BLK/poss": away_profile.get("blk_pp", np.nan),
                         "Final own BLK/poss after H2H": away_profile.get("blk_rate_pp", np.nan),
                         "Opponent BLK-suffered modifier": away_auto.get("BLK", 1.0),
+                        "Roster BLK modifier": away_roster_mod.get("BLK", 1.0),
                         "Location BLK modifier": away_loc.get("BLK", 1.0),
                         "Positional relative modifier": away_blk_pos,
                         "H2H weight": _h2h_blk_weight(away_h2h_audit),
@@ -1019,6 +1219,7 @@ with tab_team:
                         "Base non-H2H BLK/poss": home_profile.get("blk_pp", np.nan),
                         "Final own BLK/poss after H2H": home_profile.get("blk_rate_pp", np.nan),
                         "Opponent BLK-suffered modifier": home_auto.get("BLK", 1.0),
+                        "Roster BLK modifier": home_roster_mod.get("BLK", 1.0),
                         "Location BLK modifier": home_loc.get("BLK", 1.0),
                         "Positional relative modifier": home_blk_pos,
                         "H2H weight": _h2h_blk_weight(home_h2h_audit),
@@ -1084,10 +1285,12 @@ with tab_player:
         st.info("Set the matchup first.")
     else:
         provider = SportsDataverseWNBA()
-        pool = provider.current_player_pool(player_db)
+        raw_pool = provider.current_player_pool(player_db)
         manual_context = st.session_state.get("game_context", {})
-        away_prop_out = _context_out_names_for_team(manual_context, pool, setup["away_abbr"])
-        home_prop_out = _context_out_names_for_team(manual_context, pool, setup["home_abbr"])
+        away_prop_out = _context_out_names_for_team(manual_context, raw_pool, setup["away_abbr"])
+        home_prop_out = _context_out_names_for_team(manual_context, raw_pool, setup["home_abbr"])
+        pool = augment_current_pool(raw_pool, player_db, setup["away_abbr"], away_prop_out)
+        pool = augment_current_pool(pool, player_db, setup["home_abbr"], home_prop_out)
         player_availability_k = float(st.session_state.get("availability_state_k", 6.0))
         st.info(
             "Confirmed OUT used by Player Props — "
@@ -1111,6 +1314,22 @@ with tab_player:
         base_minutes = concat_without_attrs(
             [base_away, base_home], ignore_index=True
         )
+
+        away_role_impact = build_rotation_state_impact(
+            player_db, team_db, raw_pool, setup["away_abbr"], setup["away_name"],
+            manual_context, away_prop_out, exact_state_confidence=0.0,
+        )
+        home_role_impact = build_rotation_state_impact(
+            player_db, team_db, raw_pool, setup["home_abbr"], setup["home_name"],
+            manual_context, home_prop_out, exact_state_confidence=0.0,
+        )
+        raw_role_mods = pd.concat([
+            away_role_impact.raw_player_role_modifiers,
+            home_role_impact.raw_player_role_modifiers,
+        ], ignore_index=True) if (
+            not away_role_impact.raw_player_role_modifiers.empty
+            or not home_role_impact.raw_player_role_modifiers.empty
+        ) else pd.DataFrame()
 
         st.markdown("### 1. Select players")
         all_options = []
@@ -1137,8 +1356,8 @@ with tab_player:
             st.caption(
                 "AUTO uses rotation similarity, starter history, OT/blowout "
                 "downweighting, non-overlapping buckets and a 200-minute team "
-                "constraint. Enter 0 to keep AUTO; any positive value is a "
-                "trader override and the rest of that team's minutes rebalance."
+                "constraint. Enter 0 to keep AUTO; any positive value is a LOCAL scenario override. "
+                "For a real injury restriction/return that must also move Team Markets, set it in Game Setup → Shared minute overrides."
             )
 
             override_cols = st.columns(
@@ -1395,6 +1614,39 @@ with tab_player:
                         plog,cfg,game_weights=role_game_weights
                     )
 
+                    player_conf = 0.0
+                    if isinstance(same_role_audit, pd.DataFrame) and not same_role_audit.empty \
+                       and "State confidence" in same_role_audit.columns:
+                        player_conf = float(pd.to_numeric(
+                            same_role_audit["State confidence"], errors="coerce"
+                        ).fillna(0.0).iloc[0])
+                    fallback = {
+                        "usage": 1.0, "three_role": 1.0, "fta_role": 1.0,
+                        "creation": 1.0, "reb_role": 1.0,
+                    }
+                    fallback_audit = pd.DataFrame()
+                    if isinstance(raw_role_mods, pd.DataFrame) and not raw_role_mods.empty:
+                        hit = raw_role_mods[raw_role_mods["Player"].astype(str).eq(str(pname))]
+                        if not hit.empty:
+                            rr = hit.iloc[0]
+                            exponent = float(np.clip(1.0 - player_conf, 0.0, 1.0))
+                            raw_map = {
+                                "usage": float(rr.get("Usage fallback", 1.0)),
+                                "three_role": float(rr.get("Three-role fallback", 1.0)),
+                                "fta_role": float(rr.get("FTA-role fallback", 1.0)),
+                                "creation": float(rr.get("Creation fallback", 1.0)),
+                                "reb_role": float(rr.get("Rebound-role fallback", 1.0)),
+                            }
+                            for k, rv in raw_map.items():
+                                fallback[k] = float(np.exp(exponent * np.log(max(rv, 1e-6))))
+                            fallback_audit = pd.DataFrame([{
+                                "Player": pname,
+                                "Exact-state confidence": player_conf,
+                                "Fallback remaining weight": exponent,
+                                **{f"Raw {k}": v for k, v in raw_map.items()},
+                                **{f"Applied {k}": v for k, v in fallback.items()},
+                            }])
+
                     pos_group = prow.get("POSITION_GROUP")
                     pvo,plg = {},{}
                     if pos_group:
@@ -1423,15 +1675,15 @@ with tab_player:
                         opp_fta=float(matchup_mods["FTA"]),
                         opp_three_pct=float(matchup_mods.get("3P_PCT",1.0)),
                         opp_two_pct=float(matchup_mods.get("2P_PCT",1.0)),
-                        usage=float(role.get("usage",1.0)),
-                        creation=float(role.get("creation",1.0)),
+                        usage=float(role.get("usage",1.0)) * fallback["usage"],
+                        creation=float(role.get("creation",1.0)) * fallback["creation"],
                         reb_role=float(
                             role.get("reb_role",role.get("reb",1.0))
-                        ),
+                        ) * fallback["reb_role"],
                         three_role=float(
                             role.get("three_role",role.get("three_pa",1.0))
-                        ),
-                        fta_role=float(role.get("fta_role",1.0)),
+                        ) * fallback["three_role"],
+                        fta_role=float(role.get("fta_role",1.0)) * fallback["fta_role"],
                     )
 
                     seed = (abs(hash(str(pid))) % 100000) + 1000
@@ -1466,6 +1718,7 @@ with tab_player:
                         "profile_audit":audit,
                         "matchup_audit":matchup_audit,
                         "same_role_audit":same_role_audit,
+                        "availability_fallback_audit":fallback_audit,
                         "ctx":ctx,
                         "plog":plog,
                         "opp_abbr":opp_abbr,
@@ -1532,6 +1785,12 @@ with tab_player:
                         use_container_width=True,
                         hide_index=True,
                     )
+                    st.markdown("**Sparse-OUT / minute-restriction role fallback audit**")
+                    fb = detail.get("availability_fallback_audit")
+                    if isinstance(fb, pd.DataFrame) and not fb.empty:
+                        st.dataframe(fb.round(4), use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Neutral fallback: no roster-state role redistribution applied.")
 
                     h2h = detail["plog"][
                         detail["plog"]["OPP_ABBR"].astype(str).str.upper()
@@ -1588,14 +1847,18 @@ with tab_audit:
     st.subheader("Data Audit")
 
     st.markdown("""
-**v2.11 overlap protocol**
+**v2.12 overlap / state protocol**
 - Old season / Games 6–10 / L5 stay non-overlapping.
 - Stable = 55/20/25; role-change = 35/20/45.
 - Confirmed OUT is explicit trader input only; QUESTIONABLE/GTD is not probability-modeled.
 - Exact OUT-state games are reweighted INSIDE the existing buckets, never added as a fourth sample.
+- If exact OUT games are sparse/zero, a 200-minute roster counterfactual supplies a shrunk fallback; its weight automatically fades as exact-state confidence rises.
+- Shared projected-minute restrictions/returns are current-state information and affect BOTH team markets and player props.
 - Residual Jaccard removes those selected OUT names first and is only 0.85–1.00, so the same absence is not counted twice.
 - Same-season H2H rows are removed from baseline buckets, opponent-allowed profiles and location splits before H2H is added back once with a small rotation-aware weight.
 - Team shot generation is conditional: possessions → TOV → FGA → 3P share → 3PA/2PA. Independent 3PA/2PA Poisson draws are gone.
+- 3P share uses offense style plus the opponent's deviation from league in logit space; extreme shot-profile defenses can now move share materially without replacing offensive identity.
+- FTA/poss uses offense/defense log-rate blending, so foul-suppressing defenses can meaningfully pull down a high-FTA offense.
 - Team OREB matchup uses OREB per miss; AST matchup uses AST per made FG; TOV remains per possession.
 - Shooting percentages remain heavily regressed and are not set by L5 hot/cold results.
 - Team BLK = own ability × opponent blocks-suffered × disjoint H2H × optional relative positional susceptibility × tiny 2PA opportunity nudge (max ±2%).
@@ -1610,6 +1873,7 @@ with tab_audit:
 - Explicit minute overrides use the historically learned replacement matrix.
 - One shared Confirmed OUT selector in Game Setup feeds BOTH Team Markets and Player Props.
 - Player Props use exact JOINT absence-state partial pooling for per-minute rates, with an eligibility-start guard.
+- When exact joint OUT games are sparse/zero, a capped vacated-opportunity fallback adjusts usage/creation/rebound/3PA/FTA roles; this fallback is shrunk away as exact-state evidence grows.
 - Pace control is fitted from completed WNBA games with a mild ridge prior.
 - The exact same projected possessions feed Team Markets and Player Props.
 - Market total/handicap remain audit-only.
@@ -1654,9 +1918,11 @@ with tab_audit:
         tap = st.session_state.get("team_opp_profile_away")
         if thp:
             st.markdown(f"### {setup['home_abbr']} TEAM-MARKET opponent allowed (current H2H excluded)")
+            st.caption("Raw opponent rates are shown here. For 3P_SHARE and FTA, Team Markets recompute the final interaction using the offense's own current profile; see the Team Model audit for the applied context modifier.")
             st.dataframe(thp["audit"].round(4), use_container_width=True)
         if tap:
             st.markdown(f"### {setup['away_abbr']} TEAM-MARKET opponent allowed (current H2H excluded)")
+            st.caption("Raw opponent rates are shown here. For 3P_SHARE and FTA, Team Markets recompute the final interaction using the offense's own current profile; see the Team Model audit for the applied context modifier.")
             st.dataframe(tap["audit"].round(4), use_container_width=True)
 
     st.write({
@@ -1671,5 +1937,5 @@ with tab_audit:
 
 st.caption(
     "Model-implied fair odds are not yet historically calibrated true odds. "
-    "v2.11 changes the team opportunity architecture and availability/H2H handling; re-backtest before treating model fair odds as calibrated true probabilities."
+    "v2.12 adds roster-state fallback and stronger structural 3P-share/FTA matchup blending; re-backtest before treating model fair odds as calibrated true probabilities."
 )
