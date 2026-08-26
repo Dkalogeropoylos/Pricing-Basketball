@@ -284,6 +284,7 @@ def build_rotation_state_impact(
     manual_context: dict,
     out_players: Iterable[str],
     exact_state_confidence: float = 0.0,
+    state_confidence_by_stat: Dict[str, float] | None = None,
 ) -> RotationStateImpact:
     """Roster/minute-state bridge for Team Markets and Player Props.
 
@@ -328,9 +329,12 @@ def build_rotation_state_impact(
     healthy_feat, healthy_by = _synthetic_from_minutes(healthy_board, profiles)
 
     conf = float(np.clip(exact_state_confidence, 0.0, 1.0))
-    # Exact historical state already moves the team profile. Synthetic OUT
-    # evidence fills only the remaining information gap.
-    out_evidence = 0.65 * (1.0 - conf)
+    conf_by = {
+        str(k).upper(): float(np.clip(v, 0.0, 1.0))
+        for k, v in (state_confidence_by_stat or {}).items()
+    }
+    def _state_conf(stat: str) -> float:
+        return float(conf_by.get(str(stat).upper(), conf))
 
     # Explicit projected_minutes are trader information and are not represented
     # by exact historical OUT matching, so they receive a separate strong but
@@ -351,6 +355,10 @@ def build_rotation_state_impact(
     rows = []
     for stat, power in TEAM_STAT_POWER.items():
         lo, hi = TEAM_CAPS[stat]
+        stat_conf = _state_conf(stat)
+        # Historical exact/near-state evidence already lives inside the team
+        # buckets. The synthetic bridge fills only the residual information gap.
+        out_evidence = 0.65 * (1.0 - stat_conf)
         r_out = _ratio(out_feat.get(stat, np.nan), healthy_feat.get(stat, np.nan), 1.0)
         r_rest = _ratio(current_feat.get(stat, np.nan), out_feat.get(stat, np.nan), 1.0)
         m_out = _pow_clip(r_out, power * out_evidence, lo, hi)
@@ -363,7 +371,7 @@ def build_rotation_state_impact(
             "OUT-only synthetic": out_feat.get(stat, np.nan),
             "Current synthetic": current_feat.get(stat, np.nan),
             "OUT raw ratio": r_out,
-            "Exact-state confidence": conf,
+            "State confidence": stat_conf,
             "OUT bridge strength": power * out_evidence,
             "Restriction raw ratio": r_rest,
             "Restriction bridge strength": power * restriction_evidence,
@@ -382,6 +390,53 @@ def build_rotation_state_impact(
         "AST": ("creation", 0.80),
         "REB": ("reb_role", 0.95),
     }
+    event_state_key = {"FGA":"FGA", "FG3A":"3PA", "FTA":"FTA", "AST":"AST", "REB":"REB"}
+    replacement_matrix = out_only_board.attrs.get("redistribution_matrix", {}) or {}
+
+    def _out_stage_adjust(base_by, reference_by, stage_current_board):
+        """Redistribute each OUT player's vacated events through the SAME
+        learned teammate-replacement relationships used for minutes.
+
+        This is the key v2.15 change: a guard's vacated AST/FGA no longer becomes
+        a generic team-wide boost. Players who actually replace that guard in the
+        historical/position-shrunk minute matrix receive most of the event volume.
+        """
+        adj = {name: {s: float(base_by.get(name, {}).get(s, 0.0)) for s in events} for name in names}
+        active = {
+            str(r["Player"]): float(r.get("Projected Min", 0.0) or 0.0)
+            for _, r in stage_current_board.iterrows()
+            if float(r.get("Projected Min", 0.0) or 0.0) > 0.1
+        }
+        out_set = {str(x) for x in out_players}
+        for stat, (_, preserve) in events.items():
+            stat_conf = _state_conf(event_state_key[stat])
+            residual_scale = (1.0 - stat_conf)
+            for focal in out_set:
+                lost = max(
+                    float(reference_by.get(focal, {}).get(stat, 0.0))
+                    - float(base_by.get(focal, {}).get(stat, 0.0)),
+                    0.0,
+                )
+                residual = lost * preserve * residual_scale
+                if residual <= 0 or not active:
+                    continue
+                matrix_row = replacement_matrix.get(focal, {}) or {}
+                raw_w = {}
+                for n, mins in active.items():
+                    if n in out_set or n == focal:
+                        continue
+                    replace_w = max(float(matrix_row.get(n, 0.0)), 0.0)
+                    # Ability is secondary: minute replacement identity is the
+                    # main routing signal; event propensity only breaks ties.
+                    contrib = max(float(base_by.get(n, {}).get(stat, 0.0)), 0.0)
+                    ability = max(contrib / max(mins, 1.0), 0.005)
+                    raw_w[n] = (max(replace_w, 0.002) ** 0.80) * (ability ** 0.20)
+                den = sum(raw_w.values())
+                if den <= 0:
+                    continue
+                for n, w in raw_w.items():
+                    adj.setdefault(n, {})[stat] = adj.get(n, {}).get(stat, 0.0) + residual * w / den
+        return adj
 
     def _stage_adjust(
         base_by, reference_by, stage_current_board, preserve_scale=1.0,
@@ -422,9 +477,8 @@ def build_rotation_state_impact(
 
     # OUT residual is reduced by exact-state evidence; restriction residual is
     # separate and full-strength because it is trader-specified current context.
-    out_adjusted = _stage_adjust(
-        out_by, healthy_by, out_only_board, preserve_scale=(1.0 - conf),
-        reference_board=healthy_board, exclude_minute_decliners=False,
+    out_adjusted = _out_stage_adjust(
+        out_by, healthy_by, out_only_board
     )
     current_adjusted = _stage_adjust(
         current_by, out_by, current_board, preserve_scale=1.0,

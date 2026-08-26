@@ -99,18 +99,49 @@ def build_player_profile(
     df: pd.DataFrame,
     cfg: WeightConfig,
     game_weights: Optional[Dict[str, float]] = None,
+    game_weights_by_stat: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Tuple[dict, pd.DataFrame]:
     """
-    Outer Old/G6-10/L5 weights remain non-overlapping. Optional teammate-absence
-    similarity is an INNER weight only, so it cannot become a fourth sample.
+    Outer Old/G6-10/L5 weights remain non-overlapping. Availability similarity
+    is an INNER weight only. v2.15 optionally uses a different single-score map
+    for each opportunity family (FGA/3PA/FTA/REB/AST), so a guard absence cannot
+    mechanically reweight a forward's rebound history as strongly as creation.
+
+    ``game_weights`` is retained for backward compatibility. If
+    ``game_weights_by_stat`` is supplied, it wins for the mapped feature only.
     """
     x = df.sort_values("GAME_DATE").copy()
     buckets = split_non_overlapping(x)
     weights = active_weights(buckets, cfg)
-    feats = {k: _features(v, game_weights=game_weights) for k, v in buckets.items()}
+    by = game_weights_by_stat or {}
+
+    feature_stat = {
+        "two_pa_pm": "FGA",
+        "three_pa_pm": "3PA",
+        "fta_pm": "FTA",
+        "reb_pm": "REB",
+        "ast_pm": "AST",
+        "pts_pm": "FGA",
+    }
+
+    # Calculate only the small set of distinct inner-weight views required by
+    # this player. Minutes are intentionally left neutral because the 200-minute
+    # engine already models them directly.
+    cache = {}
+    def bucket_features(bucket_name: str, stat_key: str | None):
+        key = (bucket_name, stat_key or "NEUTRAL")
+        if key not in cache:
+            wm = by.get(stat_key, game_weights) if stat_key else None
+            cache[key] = _features(buckets[bucket_name], game_weights=wm)
+        return cache[key]
 
     profile = {}
-    for key in ["min_pg", "two_pa_pm", "three_pa_pm", "fta_pm", "reb_pm", "ast_pm", "pts_pm"]:
+    neutral_feats = {k: bucket_features(k, None) for k in buckets}
+    profile["min_pg"] = weighted_average_feature(neutral_feats, weights, "min_pg")
+    audit_feats = neutral_feats
+
+    for key, stat_key in feature_stat.items():
+        feats = {k: bucket_features(k, stat_key) for k in buckets}
         profile[key] = weighted_average_feature(feats, weights, key)
 
     # Shooting ability intentionally uses the larger unweighted sample. A same-role
@@ -124,11 +155,16 @@ def build_player_profile(
 
     audit = []
     for k in ("old", "mid", "l5"):
-        audit.append({"bucket": k, "weight": weights[k], **feats.get(k, {"games": 0})})
+        row = {"bucket": k, "weight": weights[k], **audit_feats.get(k, {"games": 0})}
+        # Transparent effective sample sizes under each stat-specific map.
+        for stat_key in ("FGA", "3PA", "FTA", "REB", "AST"):
+            sf = bucket_features(k, stat_key)
+            row[f"effective_games_{stat_key}"] = sf.get("effective_games", len(buckets[k]))
+        audit.append(row)
     return profile, pd.DataFrame(audit)
 
 
-def simulate_player(profile: dict, ctx: PlayerContext, n=100_000, seed=1, opportunity_mult=1.0):
+def simulate_player(profile: dict, ctx: PlayerContext, n=50_000, seed=1, opportunity_mult=1.0):
     rng = np.random.default_rng(seed)
 
     z_min = rng.normal(size=n)

@@ -220,6 +220,250 @@ def availability_state_weights(
     return weights, pd.DataFrame([audit.as_dict()]), exact_ids
 
 
+
+# ---------------------------------------------------------------------------
+# v2.15 similarity-state engine
+# ---------------------------------------------------------------------------
+
+_STAT_SOURCE = {
+    "PTS": "PTS", "FGA": "FGA", "3PA": "FG3A", "FTA": "FTA",
+    "AST": "AST", "REB": "REB", "OREB": "OREB", "DREB": "DREB",
+    "TOV": "TOV", "PF": "PF", "STL": "STL", "BLK": "BLK",
+    # Efficiency-state relevance is driven by the volume that changes the mix.
+    "3P_PCT": "FG3A", "2P_PCT": "FGA", "3P_SHARE": "FG3A",
+}
+
+def _broad_pos_from_row(row) -> str:
+    raw = str(row.get("POSITION_GROUP", "") or "").strip().upper()
+    if raw in {"G", "F", "C"}:
+        return raw
+    raw = str(row.get("POSITION_ABBR", raw) or "").upper().replace(" ", "")
+    if "C" in raw and "F" not in raw and "G" not in raw:
+        return "C"
+    if "F" in raw:
+        return "F"
+    if "G" in raw:
+        return "G"
+    if "C" in raw:
+        return "C"
+    return ""
+
+def _player_position(player_db: pd.DataFrame, team_abbr: str, player_name: str, current_pool=None) -> str:
+    if current_pool is not None and not current_pool.empty:
+        hit = current_pool[
+            current_pool["PLAYER_NAME"].astype(str).str.casefold().eq(_norm_name(player_name))
+            & current_pool["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())
+        ]
+        if not hit.empty:
+            return _broad_pos_from_row(hit.iloc[0])
+    x = player_db[
+        player_db["PLAYER_NAME"].astype(str).str.casefold().eq(_norm_name(player_name))
+        & player_db["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())
+    ].copy()
+    if x.empty:
+        return ""
+    x["GAME_DATE"] = pd.to_datetime(x["GAME_DATE"], errors="coerce")
+    return _broad_pos_from_row(x.sort_values("GAME_DATE").iloc[-1])
+
+def _stat_position_compat(stat: str, focal_pos: str, absent_pos: str) -> float:
+    """Structural prior only; actual near-state games determine the outcome rate.
+
+    The prior follows the manual model logic built during review: creation transfers
+    mostly among handlers/wings, rebound opportunity mostly within the frontcourt,
+    and shot volume is more portable than either. It is deliberately broad and is
+    only used to decide how relevant an absence is for the focal stat.
+    """
+    f, a = str(focal_pos or ""), str(absent_pos or "")
+    if not f or not a:
+        return 0.45
+    if f == a:
+        return 1.0
+    pair = {f, a}
+    stat = str(stat).upper()
+    if stat in {"REB", "OREB", "DREB"}:
+        return 0.90 if pair == {"F", "C"} else (0.40 if pair == {"G", "F"} else 0.18)
+    if stat in {"AST", "TOV"}:
+        return 0.62 if pair == {"G", "F"} else (0.28 if pair == {"F", "C"} else 0.12)
+    if stat in {"3PA", "3P_PCT", "3P_SHARE"}:
+        return 0.78 if pair == {"G", "F"} else (0.32 if pair == {"F", "C"} else 0.12)
+    if stat in {"FGA", "PTS", "FTA", "2P_PCT"}:
+        return 0.68 if pair == {"G", "F"} else (0.72 if pair == {"F", "C"} else 0.22)
+    return 0.55 if pair in ({"G", "F"}, {"F", "C"}) else 0.25
+
+def _player_event_volume(player_db: pd.DataFrame, team_abbr: str, player_name: str, stat: str) -> float:
+    """Robust current-season event volume used only as an absence-relevance prior.
+
+    It is NOT added to Old/G6-10/L5 outcomes. Using a median active-minute role
+    times the player's season per-minute rate avoids counting injury DNP zeros as
+    evidence that a currently absent player had no role.
+    """
+    src = _STAT_SOURCE.get(str(stat).upper(), str(stat).upper())
+    x = player_db[
+        player_db["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())
+        & player_db["PLAYER_NAME"].astype(str).str.casefold().eq(_norm_name(player_name))
+    ].copy()
+    if x.empty or src not in x.columns:
+        return 0.0
+    mins = pd.to_numeric(x["MIN"], errors="coerce").fillna(0.0)
+    vals = pd.to_numeric(x[src], errors="coerce").fillna(0.0)
+    active = mins >= 1.0
+    if not active.any():
+        return 0.0
+    total_min = float(mins[active].sum())
+    rate = float(vals[active].sum()) / max(total_min, 1.0)
+    role_min = float(np.median(mins[active]))
+    return max(rate * role_min, 0.0)
+
+def _absence_relevance(
+    player_db: pd.DataFrame, team_abbr: str, out_players: Iterable[str], stat: str,
+    current_pool: pd.DataFrame | None = None, focal_player: str | None = None,
+) -> Dict[str, float]:
+    outs = [str(x) for x in out_players if str(x).strip()]
+    if not outs:
+        return {}
+    focal_pos = _player_position(player_db, team_abbr, focal_player, current_pool) if focal_player else ""
+    raw = {}
+    for name in outs:
+        volume = _player_event_volume(player_db, team_abbr, name, stat)
+        # sqrt keeps one high-volume star from making every other absence irrelevant.
+        volume_term = np.sqrt(max(volume, 0.03))
+        if focal_player:
+            apos = _player_position(player_db, team_abbr, name, current_pool)
+            compat = _stat_position_compat(stat, focal_pos, apos)
+        else:
+            compat = 1.0
+        raw[name] = max(float(volume_term * compat), 1e-4)
+    den = sum(raw.values())
+    if den <= 0:
+        return {n: 1.0 / len(outs) for n in outs}
+    return {n: float(v / den) for n, v in raw.items()}
+
+def availability_similarity_weight_maps(
+    player_db: pd.DataFrame,
+    team_log: pd.DataFrame,
+    team_abbr: str,
+    out_players: Iterable[str],
+    stats: Iterable[str],
+    current_pool: pd.DataFrame | None = None,
+    focal_player: str | None = None,
+    k: float = 6.0,
+    maturity_games: float = 5.0,
+    temperature: float = 1.5,
+    exclude_opponent_abbr: str | None = None,
+):
+    """Single-score-per-game near-state weighting, separately by stat.
+
+    Every historical game receives exactly ONE similarity score for a given stat.
+    There are no nested 4/5 -> 3/5 -> 2/5 samples, so a 4/5 game can never be
+    counted again as a 3/5 or 2/5 observation. The resulting map is only an
+    INNER weight inside Old/G6-10/L5.
+
+    Small samples are not hard-zeroed. Evidence mass is sum(similarity**2); five
+    fully comparable games are treated as a maturity point, while 1-4 games are
+    progressively shrunk toward neutral. This is a conservative partial-pooling
+    rule, not a new outer sample.
+    """
+    outs = tuple(sorted({str(x) for x in out_players if str(x).strip()}, key=str.casefold))
+    stats = tuple(dict.fromkeys(str(s).upper() for s in stats))
+    if not outs or team_log is None or team_log.empty:
+        audit = pd.DataFrame([{
+            "Stat": s, "Confirmed OUT state": "—", "Eligible games": 0,
+            "Exact-state games": 0, "Evidence mass": 0.0, "Maturity": 0.0,
+            "State confidence": 0.0, "Mean similarity": 0.0, "Max similarity": 0.0,
+        } for s in stats])
+        return {s: {} for s in stats}, audit, {s: {} for s in stats}
+
+    t = team_log.copy()
+    t["_DATE"] = pd.to_datetime(t["GAME_DATE"], errors="coerce")
+    if exclude_opponent_abbr and "OPP_ABBR" in t.columns:
+        t = t[~t["OPP_ABBR"].astype(str).str.upper().eq(str(exclude_opponent_abbr).upper())].copy()
+    gids = t["GAME_ID"].astype(str).tolist()
+    dates = dict(zip(t["GAME_ID"].astype(str), t["_DATE"]))
+
+    presence = _historical_presence(player_db, team_abbr, outs, min_minutes=1.0)
+    starts = {name: _first_team_appearance(player_db, team_abbr, name) for name in outs}
+
+    maps, audits, score_maps = {}, [], {}
+    for stat in stats:
+        relevance = _absence_relevance(
+            player_db, team_abbr, outs, stat, current_pool=current_pool, focal_player=focal_player
+        )
+        scores = {}
+        for gid in gids:
+            played = presence.get(str(gid), set())
+            gdate = dates.get(str(gid))
+            s = 0.0
+            for name, rel in relevance.items():
+                start = starts.get(name)
+                # Before a player joined this team, their non-appearance is NOT an
+                # injury-state match. Their relevance remains in the denominator,
+                # so a highly relevant mid-season arrival appropriately lowers the
+                # similarity of pre-arrival games rather than deleting all history.
+                roster_eligible = start is not None and pd.notna(gdate) and gdate >= start
+                absent = roster_eligible and _norm_name(name) not in played
+                if absent:
+                    s += rel
+            scores[str(gid)] = float(np.clip(s, 0.0, 1.0))
+
+        arr = np.asarray(list(scores.values()), dtype=float)
+        evidence = float(np.sum(arr ** 2))
+        mature = float(np.clip(evidence / max(float(maturity_games), 1e-6), 0.0, 1.0))
+        empirical_conf = float(evidence / (evidence + max(float(k), 1e-6))) if evidence > 0 else 0.0
+        confidence = float(np.clip(empirical_conf * mature, 0.0, 1.0))
+        mean_s = float(np.mean(arr)) if len(arr) else 0.0
+
+        # Kernel tilt around the natural mean. Mean weight is normalized to 1,
+        # preserving the outer Old/G6-10/L5 sample weights exactly.
+        raw_w = {gid: float(np.exp(float(temperature) * confidence * (sc - mean_s))) for gid, sc in scores.items()}
+        mean_w = float(np.mean(list(raw_w.values()))) if raw_w else 1.0
+        weights = {gid: float(np.clip(w / max(mean_w, 1e-9), 0.35, 2.85)) for gid, w in raw_w.items()}
+
+        exact = sum(1 for v in scores.values() if v >= 0.999999)
+        top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        audits.append({
+            "Stat": stat,
+            "Focal player": focal_player or "TEAM",
+            "Confirmed OUT state": ", ".join(outs),
+            "Eligible games": int(len(scores)),
+            "Exact-state games": int(exact),
+            "Evidence mass": evidence,
+            "Maturity": mature,
+            "State confidence": confidence,
+            "Mean similarity": mean_s,
+            "Max similarity": float(np.max(arr)) if len(arr) else 0.0,
+            "Top near-state games": ", ".join(f"{gid}:{sc:.2f}" for gid, sc in top),
+            "Relevance": ", ".join(f"{n}:{w:.2f}" for n, w in sorted(relevance.items(), key=lambda kv: kv[1], reverse=True)),
+            "Shrink K": float(k),
+            "Maturity games": float(maturity_games),
+        })
+        maps[stat] = weights
+        score_maps[stat] = scores
+
+    return maps, pd.DataFrame(audits), score_maps
+
+def confidence_by_stat(audit: pd.DataFrame) -> Dict[str, float]:
+    if audit is None or audit.empty:
+        return {}
+    out = {}
+    for _, r in audit.iterrows():
+        stat = str(r.get("Stat", "")).upper()
+        if stat:
+            out[stat] = float(pd.to_numeric(pd.Series([r.get("State confidence", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    return out
+
+def combine_stat_weight_maps(
+    stat_maps: Dict[str, Dict[str, float]],
+    common_map: Optional[Dict[str, float]] = None,
+) -> Dict[str, Dict[str, float]]:
+    """Combine a stat-specific availability map with one common residual map.
+
+    Each GAME_ID still occurs only once per stat. This is multiplication of two
+    different relevance dimensions, not nested absence-state sampling.
+    """
+    if not stat_maps:
+        return {}
+    return {stat: combine_game_weights(w, common_map) for stat, w in stat_maps.items()}
+
 def combine_game_weights(*weight_maps: Optional[Dict[str, float]]) -> Dict[str, float]:
     """Multiply independent INNER-bucket relevance weights.
 

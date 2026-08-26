@@ -703,6 +703,7 @@ def project_team_minutes(
         ["Minutes SD", "Low Min", "High Min"]
     ] = 0.0
 
+    out.attrs["redistribution_matrix"] = matrix
     out.attrs["redistribution_matrix_audit"] = matrix_audit
     out.attrs["out_redistribution_impact"] = out_impact
     out.attrs["override_impact"] = override_impact

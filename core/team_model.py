@@ -226,6 +226,7 @@ def build_team_profile(
     cfg: WeightConfig,
     league_team_logs: Optional[pd.DataFrame] = None,
     game_weights: Optional[Dict[str, float]] = None,
+    game_weights_by_stat: Optional[Dict[str, Dict[str, float]]] = None,
     exclude_opponent_abbr: Optional[str] = None,
 ) -> Tuple[dict, pd.DataFrame]:
     """
@@ -250,22 +251,43 @@ def build_team_profile(
     else:
         buckets = raw_buckets
     weights = active_weights(buckets, cfg)
-    feats = {
-        k: _feat(v, league_team_logs=league_team_logs, game_weights=game_weights)
-        for k, v in buckets.items()
+    by = game_weights_by_stat or {}
+
+    feature_stat = {
+        # Pace/possessions remain neutral here because the shared pace engine is
+        # already the dedicated possession model. Availability changes style,
+        # not a second copy of pace.
+        "poss_pg": None,
+        "three_pa_pp": "3PA", "three_pa_live": "3PA", "three_share": "3PA",
+        "two_pa_pp": "FGA", "two_pa_live": "FGA", "fga_live": "FGA",
+        "fta_pp": "FTA", "tov_pp": "TOV",
+        "oreb_pp": "OREB", "oreb_per_miss": "OREB",
+        "dreb_pp": "DREB", "dreb_capture": "DREB",
+        "ast_pp": "AST", "assist_per_make": "AST",
+        "stl_pp": "STL", "stl_per_opp_tov": "STL",
+        "blk_pp": "BLK", "blk_per_opp_2pa": "BLK",
+        "pf_pp": "PF",
     }
 
+    cache = {}
+    def bucket_feat(bucket_name: str, stat_key: str | None):
+        key = (bucket_name, stat_key or "NEUTRAL")
+        if key not in cache:
+            wm = by.get(stat_key, game_weights) if stat_key else None
+            cache[key] = _feat(
+                buckets[bucket_name], league_team_logs=league_team_logs, game_weights=wm
+            )
+        return cache[key]
+
     p = {}
-    for key in [
-        "poss_pg",
-        "three_pa_pp", "two_pa_pp", "three_pa_live", "two_pa_live",
-        "fga_live", "three_share",
-        "fta_pp", "tov_pp", "oreb_pp", "dreb_pp", "oreb_per_miss",
-        "ast_pp", "stl_pp", "blk_pp", "pf_pp",
-        "assist_per_make", "dreb_capture", "stl_per_opp_tov",
-        "blk_per_opp_2pa",
-    ]:
-        p[key] = weighted_average_feature(feats, weights, key)
+    neutral_feats = {k: bucket_feat(k, None) for k in buckets}
+    for key, stat_key in feature_stat.items():
+        feats_for_key = {k: bucket_feat(k, stat_key) for k in buckets}
+        p[key] = weighted_average_feature(feats_for_key, weights, key)
+
+    # Keep a neutral audit frame, then expose stat-specific effective sample
+    # sizes below. The outer Old/G6-10/L5 weights never change.
+    feats = neutral_feats
 
     # Shooting ability is NOT H2H-blended in v2.11, so keep the full season
     # (including H2H) for the larger-sample shooting-percentage shrinkage.
@@ -331,6 +353,9 @@ def build_team_profile(
         row = {"bucket": k, "weight": weights[k], **feats.get(k, {"games": 0})}
         row["raw_bucket_games"] = int(len(raw_buckets.get(k, [])))
         row["H2H_excluded"] = int(len(raw_buckets.get(k, [])) - len(buckets.get(k, [])))
+        for stat_key in ("FGA", "3PA", "FTA", "TOV", "OREB", "DREB", "AST", "STL", "BLK", "PF"):
+            sf = bucket_feat(k, stat_key)
+            row[f"effective_games_{stat_key}"] = sf.get("effective_games", len(buckets[k]))
         audit.append(row)
     return p, pd.DataFrame(audit)
 
@@ -764,7 +789,7 @@ def simulate_game(
     away_profile: dict,
     home_ctx: TeamContext,
     away_ctx: TeamContext,
-    n: int = 100_000,
+    n: int = 50_000,
     seed: int = 3,
     opportunity_mult: float = 1.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -902,7 +927,7 @@ def simulate_game(
 def simulate_team(
     profile: dict,
     ctx: TeamContext,
-    n: int = 100_000,
+    n: int = 50_000,
     seed: int = 3,
     opportunity_mult: float = 1.0,
 ) -> pd.DataFrame:

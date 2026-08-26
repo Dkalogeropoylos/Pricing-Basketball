@@ -115,14 +115,18 @@ def _pair_score(
     role_prior: float,
 ) -> Tuple[float, dict]:
     common = a.index.intersection(b.index)
-    if len(common) < 5:
-        # Very little empirical evidence -> small structural fallback.
+    n = len(common)
+    if n < 2:
+        # One game cannot identify an inverse-minute relationship. Keep the
+        # structural prior, but do not claim empirical confidence. Five common
+        # games remains the maturity point; it is no longer a hard 4->5 cliff.
         score = 0.10 * role_prior
         return score, {
-            "games": int(len(common)),
+            "games": int(n),
             "neg_slope": 0.0,
             "onoff": 0.0,
             "confidence": 0.0,
+            "maturity": float(n / 5.0),
             "role_prior": role_prior,
             "score": score,
         }
@@ -159,8 +163,11 @@ def _pair_score(
             lost_a = max(a_high - a_low, 1.0)
             onoff = float(np.clip((b_low - b_high) / lost_a, 0.0, 1.25))
 
-    n = len(common)
-    confidence = float(np.clip(n / (n + 12.0), 0.0, 1.0))
+    # Five common games is a maturity threshold, not an on/off switch.
+    # 2-4 games can contribute, but are strongly shrunk toward the positional
+    # prior; 5+ uses the ordinary N/(N+12) reliability curve.
+    maturity = float(np.clip(n / 5.0, 0.0, 1.0))
+    confidence = float(np.clip((n / (n + 12.0)) * maturity, 0.0, 1.0))
 
     empirical = 0.65 * neg_slope + 0.35 * onoff
 
@@ -178,6 +185,7 @@ def _pair_score(
         "neg_slope": neg_slope,
         "onoff": onoff,
         "confidence": confidence,
+        "maturity": maturity,
         "role_prior": role_prior,
         "score": score,
     }
