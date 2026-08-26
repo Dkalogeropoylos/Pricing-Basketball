@@ -149,7 +149,12 @@ def opponent_allowed_profile(
             "Opponent games": opp.get("games", 0),
             "H2H excluded team": str(exclude_team_abbr or "—"),
         })
-    return {"ratios": ratios, "modifiers": auto, "audit": pd.DataFrame(rows)}
+    return {
+        "ratios": ratios,
+        "modifiers": auto,
+        "rates": {"league": lg, "opponent": opp},
+        "audit": pd.DataFrame(rows),
+    }
 
 
 def position_environment(
@@ -266,10 +271,37 @@ def player_matchup_modifiers(overall_profile, position_vs_opp=None, position_lea
     return final, pd.DataFrame(rows)
 
 
-def team_matchup_modifiers(overall_profile):
-    """Team-market modifiers with structurally non-overlapping denominators."""
+def _logit(p: float) -> float:
+    p = float(np.clip(p, 1e-5, 1 - 1e-5))
+    return float(np.log(p / (1.0 - p)))
+
+
+def _inv_logit(x: float) -> float:
+    return float(1.0 / (1.0 + np.exp(-float(x))))
+
+
+def _shrink_to_league(obs: float, league: float, games: float, k: float = 10.0) -> float:
+    if not (np.isfinite(obs) and np.isfinite(league)):
+        return float(league if np.isfinite(league) else obs)
+    c = float(np.clip(float(games) / (float(games) + float(k)), 0.0, 1.0))
+    return float(c * obs + (1.0 - c) * league)
+
+
+def team_matchup_modifiers(overall_profile, own_profile=None):
+    """Team-market context with structural offense/defense blending.
+
+    v2.12 changes two high-impact opportunity layers:
+      * 3P_SHARE is no longer own share times a +/-6% defensive multiplier.
+        The offense share and the opponent-allowed share are blended in logit
+        space after the defensive sample is shrunk toward league average.
+      * FTA/poss is similarly blended in log-rate space. This lets a genuine
+        foul-suppressing defense meaningfully pull down a high-FTA offense.
+
+    Other markets retain the v2.11 correction-style modifiers because they were
+    already behaving stably in audit tests.
+    """
     mods = overall_profile.get("modifiers", {})
-    return {
+    out = {
         "FGA": mods.get("FGA_LIVE", 1.0),
         "3P_SHARE": mods.get("3P_SHARE", 1.0),
         "FTA": mods.get("FTA", 1.0),
@@ -281,6 +313,45 @@ def team_matchup_modifiers(overall_profile):
         "3P_PCT": mods.get("3P_PCT", 1.0),
         "2P_PCT": mods.get("2P_PCT", 1.0),
     }
+    if not own_profile:
+        return out
+
+    rates = overall_profile.get("rates", {}) or {}
+    lg = rates.get("league", {}) or {}
+    opp = rates.get("opponent", {}) or {}
+    games = float(opp.get("games", 0) or 0)
+
+    # Shot mix: offense remains primary, but an extreme defensive shot profile
+    # can now move the result materially. Defensive weight grows modestly when
+    # the opponent is further from league average; it is still capped.
+    own_share = float(own_profile.get("three_share", np.nan))
+    lg_share = float(lg.get("3P_SHARE", np.nan))
+    opp_share = float(opp.get("3P_SHARE", np.nan))
+    if np.isfinite(own_share) and own_share > 0 and np.isfinite(lg_share) and np.isfinite(opp_share):
+        opp_share_s = _shrink_to_league(opp_share, lg_share, games, k=10.0)
+        # Apply the DEFENSIVE DEVIATION FROM LEAGUE to the offense, rather than
+        # averaging the offense directly toward the defense. This preserves a
+        # team's own style in ordinary matchups but lets an extreme shot-profile
+        # defense matter materially. Beta rises only when the defense is truly
+        # far from league average.
+        beta = float(np.clip(0.45 + 14.0 * abs(opp_share_s - lg_share), 0.45, 1.00))
+        target_share = _inv_logit(
+            _logit(own_share) + beta * (_logit(opp_share_s) - _logit(lg_share))
+        )
+        out["3P_SHARE"] = float(np.clip(target_share / own_share, 0.88, 1.12))
+
+    # Free throws: use a genuine offense/defense interaction instead of leaving
+    # a high own FTA rate almost untouched by a foul-suppressing opponent.
+    own_fta = float(own_profile.get("fta_pp", np.nan))
+    lg_fta = float(lg.get("FTA", np.nan))
+    opp_fta = float(opp.get("FTA", np.nan))
+    if np.isfinite(own_fta) and own_fta > 0 and np.isfinite(lg_fta) and lg_fta > 0 and np.isfinite(opp_fta) and opp_fta > 0:
+        opp_fta_s = _shrink_to_league(opp_fta, lg_fta, games, k=10.0)
+        def_w = 0.40
+        target_fta = float(np.exp((1.0 - def_w) * np.log(own_fta) + def_w * np.log(opp_fta_s)))
+        out["FTA"] = float(np.clip(target_fta / own_fta, 0.85, 1.15))
+
+    return out
 
 
 def block_position_susceptibility_modifier(

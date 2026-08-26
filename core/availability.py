@@ -189,7 +189,9 @@ def availability_state_weights(
             team_abbr=str(team_abbr).upper(), out_players=out_players,
             eligibility_start=eligibility_start, eligible_games=n,
             exact_games=n_exact, natural_share=(n_exact / n if n else 0.0),
-            confidence=(n_exact / (n_exact + float(k)) if n_exact else 0.0),
+            # No contrast group => no identifiable exact-state effect. Keep
+            # confidence neutral so the roster-synthetic fallback is not muted.
+            confidence=0.0,
             target_share=(n_exact / n if n else 0.0),
             exact_weight=1.0, other_weight=1.0, k=float(k),
         )
