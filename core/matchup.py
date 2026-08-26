@@ -192,6 +192,7 @@ def _position_summary(df: pd.DataFrame) -> dict:
     fgm = float(pd.to_numeric(df["FGM"], errors="coerce").fillna(0).sum())
     a2 = max(fga - a3, 0.0)
     m2 = max(fgm - m3, 0.0)
+    out["2PA"] = a2 / mins * 36.0
     out["3P_PCT"] = m3 / a3 if a3 > 0 else np.nan
     out["2P_PCT"] = m2 / a2 if a2 > 0 else np.nan
     out["3P_ATT"] = a3
@@ -229,7 +230,7 @@ def combine_efficiency_overall_and_position(
 
 
 def player_matchup_modifiers(overall_profile, position_vs_opp=None, position_league=None):
-    mapping = {"PTS": "PTS", "REB": "REB", "AST": "AST", "3PA": "3PA", "FTA": "FTA"}
+    mapping = {"PTS": "PTS", "REB": "REB", "AST": "AST", "3PA": "3PA", "2PA": "2PA", "FTA": "FTA"}
     rows, final = [], {}
     for stat, poskey in mapping.items():
         overall_ratio = overall_profile.get("ratios", {}).get(stat, 1.0)
@@ -270,6 +271,83 @@ def player_matchup_modifiers(overall_profile, position_vs_opp=None, position_lea
         })
     return final, pd.DataFrame(rows)
 
+
+
+def player_h2h_modifiers(
+    player_log: pd.DataFrame,
+    opponent_abbr: str,
+    profile: dict,
+    projected_minutes: float,
+    rotation_similarity: float = 1.0,
+    max_weight: float = 0.05,
+):
+    """Tiny, rotation/minute-aware same-season H2H opportunity correction.
+
+    H2H is deliberately NOT a second sample and never changes shooting skill.
+    It only nudges 2PA/3PA/REB/AST opportunity rates in log space. The maximum
+    blend weight is 5%, and it shrinks further for sparse games, dissimilar
+    rotations and H2Hs played at very different minutes.
+    """
+    neutral = {"2PA": 1.0, "3PA": 1.0, "REB": 1.0, "AST": 1.0}
+    if player_log is None or player_log.empty:
+        return neutral, pd.DataFrame()
+    h = player_log[
+        player_log["OPP_ABBR"].astype(str).str.upper().eq(str(opponent_abbr).upper())
+    ].copy()
+    if h.empty:
+        return neutral, pd.DataFrame([{"H2H games": 0, "Applied H2H weight": 0.0}])
+
+    mins = pd.to_numeric(h.get("MIN", 0), errors="coerce").fillna(0.0)
+    h = h[mins > 0].copy()
+    if h.empty:
+        return neutral, pd.DataFrame([{"H2H games": 0, "Applied H2H weight": 0.0}])
+    mins = pd.to_numeric(h["MIN"], errors="coerce").fillna(0.0)
+    total_min = float(mins.sum())
+    if total_min <= 0:
+        return neutral, pd.DataFrame([{"H2H games": 0, "Applied H2H weight": 0.0}])
+
+    fga = float(pd.to_numeric(h.get("FGA", 0), errors="coerce").fillna(0.0).sum())
+    a3 = float(pd.to_numeric(h.get("FG3A", 0), errors="coerce").fillna(0.0).sum())
+    a2 = max(fga - a3, 0.0)
+    rates = {
+        "2PA": a2 / total_min,
+        "3PA": a3 / total_min,
+        "REB": float(pd.to_numeric(h.get("REB", 0), errors="coerce").fillna(0.0).sum()) / total_min,
+        "AST": float(pd.to_numeric(h.get("AST", 0), errors="coerce").fillna(0.0).sum()) / total_min,
+    }
+    base = {
+        "2PA": float(profile.get("two_pa_pm", np.nan)),
+        "3PA": float(profile.get("three_pa_pm", np.nan)),
+        "REB": float(profile.get("reb_pm", np.nan)),
+        "AST": float(profile.get("ast_pm", np.nan)),
+    }
+    n = int(len(h))
+    rot = float(np.clip(rotation_similarity, 0.0, 1.0))
+    minute_sim = float(np.mean(np.exp(-np.abs(mins.to_numpy(dtype=float) - float(projected_minutes)) / 10.0)))
+    maturity = float(n / (n + 2.0))
+    weight = float(min(float(max_weight), float(max_weight) * maturity * rot * minute_sim))
+
+    out = dict(neutral)
+    rows = []
+    for stat in ("2PA", "3PA", "REB", "AST"):
+        b = base[stat]
+        hv = rates[stat]
+        ratio = (hv / b) if np.isfinite(b) and b > 0 and np.isfinite(hv) else 1.0
+        ratio = float(np.clip(ratio, 0.70, 1.30))
+        mod = float(np.exp(weight * np.log(max(ratio, 1e-9)))) if weight > 0 else 1.0
+        out[stat] = float(np.clip(mod, 0.97, 1.03))
+        rows.append({
+            "Stat": stat,
+            "H2H games": n,
+            "H2H rate/min": hv,
+            "Baseline rate/min": b,
+            "Raw ratio": ratio,
+            "Rotation similarity": rot,
+            "Minute similarity": minute_sim,
+            "Applied H2H weight": weight,
+            "Final H2H modifier": out[stat],
+        })
+    return out, pd.DataFrame(rows)
 
 def _logit(p: float) -> float:
     p = float(np.clip(p, 1e-5, 1 - 1e-5))
