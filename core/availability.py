@@ -317,12 +317,24 @@ def _player_event_volume(player_db: pd.DataFrame, team_abbr: str, player_name: s
 def _absence_relevance(
     player_db: pd.DataFrame, team_abbr: str, out_players: Iterable[str], stat: str,
     current_pool: pd.DataFrame | None = None, focal_player: str | None = None,
-) -> Dict[str, float]:
+) -> tuple[Dict[str, float], Dict[str, float], list[str]]:
+    """Return normalized relevance only for materially related absences.
+
+    v2.16: the focal player's near-state no longer conditions on every selected
+    OUT simply because they are on the injury list.  For player props we first
+    form a stat-specific relevance score from event volume x positional/role
+    compatibility, then remove weak tail absences before normalizing.  This keeps
+    e.g. a frontcourt REB sample from being diluted by unrelated creator absences.
+
+    Team-level calls (no focal_player) keep every OUT because there is no focal
+    position to define a role family.
+    """
     outs = [str(x) for x in out_players if str(x).strip()]
     if not outs:
-        return {}
+        return {}, {}, []
     focal_pos = _player_position(player_db, team_abbr, focal_player, current_pool) if focal_player else ""
     raw = {}
+    compats = {}
     for name in outs:
         volume = _player_event_volume(player_db, team_abbr, name, stat)
         # sqrt keeps one high-volume star from making every other absence irrelevant.
@@ -332,11 +344,40 @@ def _absence_relevance(
             compat = _stat_position_compat(stat, focal_pos, apos)
         else:
             compat = 1.0
+        compats[name] = float(compat)
         raw[name] = max(float(volume_term * compat), 1e-4)
-    den = sum(raw.values())
+
+    if not focal_player:
+        kept = list(outs)
+    else:
+        stat_u = str(stat).upper()
+        # Positional floor keeps only plausible role-family transfers.  A second
+        # relative-score floor prevents a tiny same-family role from remaining
+        # merely because its broad position label matches.
+        compat_floor = {
+            "REB": 0.50, "OREB": 0.55, "DREB": 0.50,
+            "AST": 0.45, "TOV": 0.45,
+            "3PA": 0.50, "3P_PCT": 0.50, "3P_SHARE": 0.50,
+            "FGA": 0.40, "PTS": 0.40, "FTA": 0.40, "2P_PCT": 0.40,
+        }.get(stat_u, 0.40)
+        mx = max(raw.values()) if raw else 0.0
+        rel_floor = 0.38 * mx
+        kept = [
+            n for n in outs
+            if compats.get(n, 0.0) >= compat_floor and raw.get(n, 0.0) >= rel_floor
+        ]
+        # Never return an empty relevant state: retain the single strongest OUT.
+        if not kept and raw:
+            kept = [max(raw, key=raw.get)]
+
+    selected_raw = {n: raw[n] for n in kept}
+    den = sum(selected_raw.values())
     if den <= 0:
-        return {n: 1.0 / len(outs) for n in outs}
-    return {n: float(v / den) for n, v in raw.items()}
+        relevance = {n: 1.0 / len(kept) for n in kept}
+    else:
+        relevance = {n: float(v / den) for n, v in selected_raw.items()}
+    excluded = [n for n in outs if n not in kept]
+    return relevance, raw, excluded
 
 def availability_similarity_weight_maps(
     player_db: pd.DataFrame,
@@ -385,7 +426,7 @@ def availability_similarity_weight_maps(
 
     maps, audits, score_maps = {}, [], {}
     for stat in stats:
-        relevance = _absence_relevance(
+        relevance, relevance_raw, relevance_excluded = _absence_relevance(
             player_db, team_abbr, outs, stat, current_pool=current_pool, focal_player=focal_player
         )
         scores = {}
@@ -393,16 +434,18 @@ def availability_similarity_weight_maps(
             played = presence.get(str(gid), set())
             gdate = dates.get(str(gid))
             s = 0.0
-            for name, rel in relevance.items():
-                start = starts.get(name)
-                # Before a player joined this team, their non-appearance is NOT an
-                # injury-state match. Their relevance remains in the denominator,
-                # so a highly relevant mid-season arrival appropriately lowers the
-                # similarity of pre-arrival games rather than deleting all history.
-                roster_eligible = start is not None and pd.notna(gdate) and gdate >= start
-                absent = roster_eligible and _norm_name(name) not in played
+            eligible_rel = {
+                name: rel for name, rel in relevance.items()
+                if starts.get(name) is not None and pd.notna(gdate) and gdate >= starts.get(name)
+            }
+            rel_den = sum(eligible_rel.values())
+            if rel_den <= 0:
+                scores[str(gid)] = 0.0
+                continue
+            for name, rel in eligible_rel.items():
+                absent = _norm_name(name) not in played
                 if absent:
-                    s += rel
+                    s += rel / rel_den
             scores[str(gid)] = float(np.clip(s, 0.0, 1.0))
 
         arr = np.asarray(list(scores.values()), dtype=float)
@@ -424,6 +467,8 @@ def availability_similarity_weight_maps(
             "Stat": stat,
             "Focal player": focal_player or "TEAM",
             "Confirmed OUT state": ", ".join(outs),
+            "Relevant OUT state": ", ".join(relevance.keys()) if relevance else "—",
+            "Excluded low-relevance OUT": ", ".join(relevance_excluded) if relevance_excluded else "—",
             "Eligible games": int(len(scores)),
             "Exact-state games": int(exact),
             "Evidence mass": evidence,
@@ -433,6 +478,7 @@ def availability_similarity_weight_maps(
             "Max similarity": float(np.max(arr)) if len(arr) else 0.0,
             "Top near-state games": ", ".join(f"{gid}:{sc:.2f}" for gid, sc in top),
             "Relevance": ", ".join(f"{n}:{w:.2f}" for n, w in sorted(relevance.items(), key=lambda kv: kv[1], reverse=True)),
+            "Raw relevance": ", ".join(f"{n}:{w:.3f}" for n, w in sorted(relevance_raw.items(), key=lambda kv: kv[1], reverse=True)),
             "Shrink K": float(k),
             "Maturity games": float(maturity_games),
         })

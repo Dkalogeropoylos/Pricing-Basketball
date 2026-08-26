@@ -684,14 +684,22 @@ def _simulate_offense(
     z_tov: np.ndarray,
     z_reb: np.ndarray,
 ) -> Dict[str, np.ndarray]:
-    """Simulate one offense using a conditional event chain.
+    """Simulate one offense with an approximately possession-consistent event chain.
 
-    v2.11 key change:
-        possessions -> TOV -> total FGA -> 3P share -> 3PA/2PA
+    v2.16 key change:
+        possessions -> TOV + FT-possession share -> initial shot endings
+        -> offensive-rebound recycling -> total FGA -> 3P share -> makes
 
-    3PA and 2PA are no longer independent Poisson draws. This guarantees the
-    shot mix is coherent and prevents arbitrary redistribution between the two
-    attempt markets.
+    The old v2.15 chain used ``FGA_LIVE`` directly on (POSS-TOV) and then also
+    generated FTA and OREB downstream.  Because the historical possession
+    estimator already contains ``-OREB + 0.44*FTA``, that construction could
+    systematically produce too few FGA for the stated pace.  The new chain
+    uses the same possession identity in expectation:
+
+        POSS ~= FGA - OREB + TOV + 0.44*FTA
+
+    A small residual ``ctx.fga`` elasticity is retained, but strongly shrunk so
+    matchup/roster evidence can nudge shot volume without becoming a second pace.
     """
     poss_i = np.maximum(poss.astype(int), 1)
 
@@ -700,39 +708,54 @@ def _simulate_offense(
         0.03, 0.30,
     )
     tov = rng.binomial(poss_i, tov_rate)
-    live = np.maximum(poss_i - tov, 1)
 
-    # Total field-goal opportunity conditional on a possession surviving TOV.
-    fga_live = float(profile.get(
-        "fga_live",
-        profile.get("three_pa_live", 0.35) + profile.get("two_pa_live", 0.55),
+    # Free throws consume possession mass in the same 0.44 convention used by
+    # the historical possession estimator.  Draw them before FGA so the two
+    # opportunity channels reconcile rather than overlap.
+    fta = rng.poisson(np.clip(
+        poss * profile["fta_pp"] * ctx.fta * np.exp(0.12 * z_foul - 0.5 * 0.12**2),
+        0.001, None,
     ))
-    fga_mean = np.clip(live * fga_live * ctx.fga, 0.001, None)
-    fga = rng.poisson(fga_mean)
 
-    # Allocate FGA to 3PA vs 2PA. Style noise moves the SHARE, not total FGA.
     base_share = float(profile.get(
         "three_share",
         profile.get("three_pa_live", 0.35) /
         max(profile.get("three_pa_live", 0.35) + profile.get("two_pa_live", 0.55), 1e-9),
     ))
     base_share = float(np.clip(base_share * ctx.three_share, 0.08, 0.72))
-    # Logit-normal perturbation keeps the share inside (0,1) and preserves the
-    # central share much better than separate 3PA/2PA Poisson multipliers.
     logit = np.log(base_share / max(1.0 - base_share, 1e-9))
     p3_share = 1.0 / (1.0 + np.exp(-(logit + 0.18 * z_style)))
     p3_share = np.clip(p3_share, 0.06, 0.75)
-    a3 = rng.binomial(fga, p3_share)
-    a2 = fga - a3
-
-    fta = rng.poisson(np.clip(
-        poss * profile["fta_pp"] * ctx.fta * np.exp(0.12 * z_foul - 0.5 * 0.12**2),
-        0.001, None,
-    ))
 
     p3 = np.clip(profile["three_pct"] * ctx.three_pct + 0.03 * z_shoot, 0.10, 0.60)
     p2 = np.clip(profile["two_pct"] * ctx.two_pct + 0.025 * z_shoot, 0.25, 0.75)
     pft = np.clip(profile["ft_pct"] + 0.01 * z_shoot, 0.45, 0.98)
+
+    oreb_share = np.clip(
+        profile.get("oreb_per_miss", 0.25)
+        * ctx.oreb
+        * np.exp(0.10 * z_reb - 0.5 * 0.10**2),
+        0.08, 0.45,
+    )
+
+    # Possessions that can terminate in an initial field-goal attempt after
+    # turnovers and the free-throw possession component are removed.
+    initial_shot_endings = np.maximum(
+        poss.astype(float) - tov.astype(float) - 0.44 * fta.astype(float),
+        0.25,
+    )
+    miss_rate = np.clip(p3_share * (1.0 - p3) + (1.0 - p3_share) * (1.0 - p2), 0.20, 0.80)
+    recycle_prob = np.clip(miss_rate * oreb_share, 0.01, 0.32)
+    recycle_factor = 1.0 / np.maximum(1.0 - recycle_prob, 0.68)
+
+    # Residual FGA context only: FGA is now primarily an identity consequence of
+    # pace/TOV/FTA/OREB, not an independent full-strength opportunity multiplier.
+    fga_residual = float(np.clip(ctx.fga, 0.90, 1.10)) ** 0.35
+    fga_mean = np.clip(initial_shot_endings * recycle_factor * fga_residual, 0.001, None)
+    fga = rng.poisson(fga_mean)
+
+    a3 = rng.binomial(fga, p3_share)
+    a2 = fga - a3
 
     m3 = rng.binomial(a3, p3)
     m2 = rng.binomial(a2, p2)
@@ -743,16 +766,6 @@ def _simulate_offense(
     misses3 = np.maximum(a3 - m3, 0)
     misses2 = np.maximum(a2 - m2, 0)
     misses = misses3 + misses2
-
-    # Current box-score data supports OREB per total miss. A 2P/3P split is NOT
-    # invented here; it should only be activated when play-by-play attribution
-    # is actually available, otherwise it would create pseudo-information.
-    oreb_share = np.clip(
-        profile.get("oreb_per_miss", 0.25)
-        * ctx.oreb
-        * np.exp(0.10 * z_reb - 0.5 * 0.10**2),
-        0.08, 0.45,
-    )
     oreb = rng.binomial(misses, oreb_share)
 
     assist_per_make = float(np.clip(profile.get("assist_per_make", 0.62), 0.25, 0.92))

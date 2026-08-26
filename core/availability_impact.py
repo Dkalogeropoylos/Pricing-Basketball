@@ -25,6 +25,215 @@ def _safe_div(a: float, b: float, default: float = np.nan) -> float:
     return float(a) / float(b) if np.isfinite(b) and float(b) > 0 else default
 
 
+def _broad_position_from_row(row) -> str:
+    raw = str(row.get("POSITION_GROUP", "") or "").strip().upper()
+    if raw in {"G", "F", "C"}:
+        return raw
+    raw = str(row.get("POSITION_ABBR", raw) or "").upper().replace(" ", "")
+    if "C" in raw and "F" not in raw and "G" not in raw:
+        return "C"
+    if "F" in raw:
+        return "F"
+    if "G" in raw:
+        return "G"
+    if "C" in raw:
+        return "C"
+    return ""
+
+
+def _event_position_priority(stat: str, source_pos: str, target_pos: str) -> float:
+    """Stat-specific role-family routing prior for vacated opportunities.
+
+    This is deliberately separate from the generic minute-replacement matrix.
+    Minutes answer *who is on the floor*; this prior answers *which replacement
+    roles should inherit this particular event*.
+    """
+    s = str(stat).upper()
+    a, b = str(source_pos or ""), str(target_pos or "")
+    if not a or not b:
+        return 0.35
+    if a == b:
+        return 1.0
+    pair = {a, b}
+    if s == "AST":
+        if pair == {"G", "F"}: return 0.58
+        if pair == {"F", "C"}: return 0.24
+        return 0.08
+    if s == "REB":
+        if pair == {"F", "C"}: return 0.92
+        if pair == {"G", "F"}: return 0.28
+        return 0.10
+    if s == "FG3A":
+        if pair == {"G", "F"}: return 0.82
+        if pair == {"F", "C"}: return 0.30
+        return 0.08
+    if s in {"FGA", "FTA"}:
+        if pair == {"G", "F"}: return 0.76
+        if pair == {"F", "C"}: return 0.72
+        return 0.20
+    return 0.35
+
+
+def _estimate_possessions_local(df: pd.DataFrame) -> pd.Series:
+    return (
+        pd.to_numeric(df.get("FGA", 0), errors="coerce").fillna(0.0)
+        - pd.to_numeric(df.get("OREB", 0), errors="coerce").fillna(0.0)
+        + pd.to_numeric(df.get("TOV", 0), errors="coerce").fillna(0.0)
+        + 0.44 * pd.to_numeric(df.get("FTA", 0), errors="coerce").fillna(0.0)
+    )
+
+
+def _opponent_structural_rates(rows: pd.DataFrame) -> dict:
+    """Opponent offensive outcomes used for current defensive-roster bridge."""
+    if rows is None or rows.empty:
+        return {}
+    x = rows.copy()
+    for c in ["PTS","FGA","FGM","FG3A","FG3M","FTA","TOV","OREB","AST"]:
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
+    poss = float(_estimate_possessions_local(x).sum())
+    if poss <= 0:
+        return {}
+    fga = float(x["FGA"].sum())
+    fgm = float(x["FGM"].sum())
+    a3 = float(x["FG3A"].sum())
+    m3 = float(x["FG3M"].sum())
+    a2 = max(fga - a3, 0.0)
+    m2 = max(fgm - m3, 0.0)
+    misses = max(fga - fgm, 0.0)
+    return {
+        "games": int(len(x)),
+        "poss": poss,
+        "PTS100": 100.0 * float(x["PTS"].sum()) / poss,
+        "3P_SHARE": a3 / fga if fga > 0 else np.nan,
+        "FTA": float(x["FTA"].sum()) / poss,
+        "TOV": float(x["TOV"].sum()) / poss,
+        "OREB": float(x["OREB"].sum()) / misses if misses > 0 else np.nan,
+        "AST": float(x["AST"].sum()) / fgm if fgm > 0 else np.nan,
+        "3P_PCT": m3 / a3 if a3 > 0 else np.nan,
+        "2P_PCT": m2 / a2 if a2 > 0 else np.nan,
+    }
+
+
+def defensive_absence_bridge(
+    player_db: pd.DataFrame,
+    team_db: pd.DataFrame,
+    current_pool: pd.DataFrame,
+    defense_abbr: str,
+    out_players: Iterable[str],
+    exclude_opponent_abbr: str | None = None,
+    on_min_minutes: float = 10.0,
+    k: float = 8.0,
+) -> Tuple[Dict[str, float], pd.DataFrame]:
+    """Conservative current defensive-roster adjustment from individual OUT splits.
+
+    For each confirmed OUT separately, compare what opponents produced when the
+    player logged >= ``on_min_minutes`` to true OFF games after that player's
+    first team appearance.  Games with 0 < MIN < threshold are EXCLUDED from
+    both groups, so an early injury/limited stint is never treated as a normal ON.
+
+    Individual effects are partial-pooled and overlap-protected before they are
+    applied to the opponent offense.  This is intentionally a small correction,
+    not a second opponent sample.
+    """
+    outs = [str(x) for x in out_players if str(x).strip()]
+    neutral = {k: 1.0 for k in ["3P_SHARE","FTA","TOV","OREB","AST","3P_PCT","2P_PCT"]}
+    if not outs or player_db is None or player_db.empty or team_db is None or team_db.empty:
+        return neutral, pd.DataFrame()
+
+    dg = team_db[team_db["TEAM_ABBR"].astype(str).str.upper().eq(str(defense_abbr).upper())].copy()
+    dg["GAME_ID"] = dg["GAME_ID"].astype(str)
+    dg["GAME_DATE"] = pd.to_datetime(dg["GAME_DATE"], errors="coerce")
+    if exclude_opponent_abbr and "OPP_ABBR" in dg.columns:
+        dg = dg[~dg["OPP_ABBR"].astype(str).str.upper().eq(str(exclude_opponent_abbr).upper())].copy()
+
+    # Pair each defensive-team game with the opponent's actual box row.
+    opp_rows = team_db.copy()
+    opp_rows["GAME_ID"] = opp_rows["GAME_ID"].astype(str)
+    paired = dg[["GAME_ID","GAME_DATE"]].merge(opp_rows, on="GAME_ID", how="left", suffixes=("_DEF", ""))
+    paired = paired[~paired["TEAM_ABBR"].astype(str).str.upper().eq(str(defense_abbr).upper())].copy()
+    if paired.empty:
+        return neutral, pd.DataFrame()
+
+    audit_rows = []
+    effects = {k: [] for k in neutral}
+    for name in outs:
+        ph = player_db[
+            player_db["TEAM_ABBR"].astype(str).str.upper().eq(str(defense_abbr).upper())
+            & player_db["PLAYER_NAME"].astype(str).str.casefold().eq(str(name).strip().casefold())
+        ].copy()
+        if ph.empty:
+            continue
+        ph["GAME_ID"] = ph["GAME_ID"].astype(str)
+        ph["GAME_DATE"] = pd.to_datetime(ph["GAME_DATE"], errors="coerce")
+        first = ph["GAME_DATE"].dropna().min()
+        if pd.isna(first):
+            continue
+        minute_map = pd.to_numeric(ph.set_index("GAME_ID")["MIN"], errors="coerce").fillna(0.0).to_dict()
+        eligible = paired[paired["GAME_DATE_DEF"] >= first].copy()
+        if eligible.empty:
+            continue
+        eligible["_MIN"] = eligible["GAME_ID"].map(lambda gid: float(minute_map.get(str(gid), 0.0)))
+        on = eligible[eligible["_MIN"] >= float(on_min_minutes)].copy()
+        off = eligible[eligible["_MIN"] <= 1e-9].copy()
+        limited = eligible[(eligible["_MIN"] > 1e-9) & (eligible["_MIN"] < float(on_min_minutes))].copy()
+        all_clean = pd.concat([on, off], ignore_index=True)
+        if on.empty or off.empty or all_clean.empty:
+            continue
+        onr, offr, baser = _opponent_structural_rates(on), _opponent_structural_rates(off), _opponent_structural_rates(all_clean)
+        n_on, n_off = len(on), len(off)
+        harmonic = (2.0 * n_on * n_off / max(n_on + n_off, 1.0))
+        maturity = float(np.clip(min(n_on, n_off) / 3.0, 0.0, 1.0))
+        conf = float(np.clip((harmonic / (harmonic + float(k))) * maturity, 0.0, 1.0))
+        audit_rows.append({
+            "Player": name, "ON min threshold": float(on_min_minutes),
+            "ON games": int(n_on), "OFF games": int(n_off), "Limited 0<MIN<threshold excluded": int(len(limited)),
+            "Opp PTS/100 ON": onr.get("PTS100", np.nan), "Opp PTS/100 OFF": offr.get("PTS100", np.nan),
+            "OFF-ON PTS/100": offr.get("PTS100", np.nan) - onr.get("PTS100", np.nan),
+            "Split confidence": conf,
+        })
+        for stat in neutral:
+            b = baser.get(stat, np.nan); o = offr.get(stat, np.nan); onv = onr.get(stat, np.nan)
+            if not (np.isfinite(b) and b > 0 and np.isfinite(o)):
+                continue
+            ratio = float(np.clip(o / b, 0.82, 1.18))
+            effects[stat].append((name, ratio, conf, onv, o, b))
+
+    caps = {
+        "3P_SHARE": (0.95,1.05), "FTA": (0.94,1.06), "TOV": (0.94,1.06),
+        "OREB": (0.93,1.07), "AST": (0.95,1.05),
+        "3P_PCT": (0.97,1.03), "2P_PCT": (0.97,1.03),
+    }
+    strength = {"3P_PCT":0.18, "2P_PCT":0.18, "3P_SHARE":0.30, "FTA":0.32, "TOV":0.36, "OREB":0.36, "AST":0.30}
+    mods = dict(neutral)
+    detail_rows = []
+    for stat, vals in effects.items():
+        vals = [v for v in vals if v[2] > 0]
+        if not vals:
+            continue
+        total_c = sum(v[2] for v in vals)
+        avg_log = sum(v[2] * np.log(max(v[1], 1e-6)) for v in vals) / max(total_c, 1e-9)
+        agg_conf = 1.0 - float(np.prod([1.0 - min(v[2], 0.95) for v in vals]))
+        severity = float(np.clip(np.sqrt(total_c / max(max(v[2] for v in vals), 1e-9)), 1.0, 1.35))
+        exponent = float(strength[stat] * agg_conf * severity)
+        lo, hi = caps[stat]
+        mod = float(np.clip(np.exp(avg_log * exponent), lo, hi))
+        mods[stat] = mod
+        detail_rows.append({
+            "Player": "COMBINED", "Stat": stat, "Current-OFF modifier": mod,
+            "Aggregate confidence": agg_conf, "Overlap severity": severity, "Applied exponent": exponent,
+            "Contributors": ", ".join(v[0] for v in vals),
+        })
+        for name, ratio, conf, onv, offv, basev in vals:
+            detail_rows.append({
+                "Player": name, "Stat": stat, "OFF / tenure-baseline ratio": ratio,
+                "Split confidence": conf, "ON rate": onv, "OFF rate": offv, "Tenure clean baseline": basev,
+            })
+
+    audit = pd.concat([pd.DataFrame(audit_rows), pd.DataFrame(detail_rows)], ignore_index=True, sort=False)
+    return mods, audit
+
+
 def _weighted_bucket_rate(bucket: pd.DataFrame, stat: str) -> float:
     if bucket is None or bucket.empty or stat not in bucket.columns:
         return np.nan
@@ -392,6 +601,10 @@ def build_rotation_state_impact(
     }
     event_state_key = {"FGA":"FGA", "FG3A":"3PA", "FTA":"FTA", "AST":"AST", "REB":"REB"}
     replacement_matrix = out_only_board.attrs.get("redistribution_matrix", {}) or {}
+    pos_map = {}
+    if pool is not None and not pool.empty:
+        for _, _r in pool.iterrows():
+            pos_map[str(_r.get("PLAYER_NAME", ""))] = _broad_position_from_row(_r)
 
     def _out_stage_adjust(base_by, reference_by, stage_current_board):
         """Redistribute each OUT player's vacated events through the SAME
@@ -426,11 +639,20 @@ def build_rotation_state_impact(
                     if n in out_set or n == focal:
                         continue
                     replace_w = max(float(matrix_row.get(n, 0.0)), 0.0)
-                    # Ability is secondary: minute replacement identity is the
-                    # main routing signal; event propensity only breaks ties.
                     contrib = max(float(base_by.get(n, {}).get(stat, 0.0)), 0.0)
                     ability = max(contrib / max(mins, 1.0), 0.005)
-                    raw_w[n] = (max(replace_w, 0.002) ** 0.80) * (ability ** 0.20)
+                    # v2.16: minute replacement is no longer the only routing
+                    # signal.  A stat-specific role-family priority prevents,
+                    # for example, creator AST from flowing mechanically to a
+                    # frontcourt minute replacement.
+                    role_priority = _event_position_priority(
+                        stat, pos_map.get(focal, ""), pos_map.get(n, "")
+                    )
+                    raw_w[n] = (
+                        max(replace_w, 0.002) ** 0.55
+                        * max(role_priority, 0.03) ** 0.30
+                        * ability ** 0.15
+                    )
                 den = sum(raw_w.values())
                 if den <= 0:
                     continue
