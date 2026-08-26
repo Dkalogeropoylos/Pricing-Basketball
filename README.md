@@ -1,67 +1,67 @@
-# Basketball Pricing Engine v2.12.0 — cumulative patch over v2.11.0
+# Basketball Pricing Engine v2.14.0 — cumulative patch over v2.12
 
-## Τι διορθώνει
+Η v2.14 **αντικαθιστά την v2.13**. Αν έχεις ακόμα v2.12, δεν χρειάζεται να περάσεις πρώτα v2.13.
 
-### 1) Confirmed OUT που πριν μπορούσε να μην κουνάει το team line
-Το exact historical OUT-state παραμένει το πρώτο layer. Αν όμως υπάρχουν 0 ή πολύ λίγα πραγματικά games στο ίδιο state (π.χ. Bonner μόλις έφυγε και η Phoenix δεν έχει παίξει χωρίς αυτή), το μοντέλο **δεν μένει πλέον ουδέτερο**.
+## Τι αλλάζει
 
-Χτίζει τρία 200-minute counterfactual rotations:
-- **healthy**: οι selected OUT επιστρέφουν, χωρίς minute restrictions,
-- **OUT-only**: οι selected OUT είναι 0', χωρίς minute restrictions,
-- **current**: OUT state + shared projected-minute restrictions.
+### 1) Opponent allowed: stat-specific, learned from WNBA history
+Δεν υπάρχει πλέον ένα γενικό hand-tuned `ratio^0.35` ή ένα default 50% opponent weight.
 
-Από τη διαφορά των roster compositions βγαίνει ένα **shrunk roster-state modifier** για FGA, 3P share, FTA, TOV, OREB, AST, PF, DREB, STL, BLK και μικρή shooter-mix efficiency διόρθωση.
+Για κάθε structural stat το engine κατασκευάζει pregame historical observations:
+- own offensive prior,
+- opponent-allowed prior,
+- league prior,
+- actual next-game outcome.
 
-Overlap guard: όσο αυξάνει το exact-state historical confidence, το synthetic OUT fallback μικραίνει αυτόματα.
+Μετά μαθαίνει ξεχωριστή elasticity για:
+`FGA_LIVE`, `3P_SHARE`, `FTA`, `TOV`, `OREB_PER_MISS`, `AST_PER_MAKE`, `PF`, `3P_PCT`, `2P_PCT`.
 
-### 2) Shared minute restriction / return
-Στο Game Setup υπάρχει νέο **Shared minute overrides / restrictions**. Χρησιμοποίησέ το για κάτι σαν Plum 22–24'. Αυτό γράφεται στο shared game context και επηρεάζει:
-- Team Markets,
-- 200-minute player rotation,
-- Player Props.
+Η slope shrinkάρεται με sample size + standard error + actual RMSE gain. Υπάρχει μόνο μικρό structural floor ώστε ο opponent να μην γίνεται ποτέ τελείως αόρατος από noisy early-season data.
 
-Τα local player-tab minute overrides παραμένουν μόνο scenario overrides.
+### 2) 3PM / shooting percentages
+- Το shrinkage prior για 3P%, 2P%, FT% βγαίνει πλέον από **το loaded WNBA league sample**, όχι από fixed 34.0% / 51.0% / 78.5%.
+- Το opponent shooting effect παραμένει πιο shrinked από το shot-selection effect, γιατί raw opponent FG% είναι noisy.
+- Το existing roster shooter-mix modifier παραμένει και συνεργάζεται με OUT/minute restrictions.
 
-### 3) 3PA / 2PA
-Παραμένει η σωστή αλυσίδα:
-`possessions -> TOV -> FGA -> 3P share -> 3PA / 2PA`.
+### 3) Home / away
+Δεν υπάρχει hard-coded rule τύπου `away = worse shooting`.
 
-Αλλά το opponent 3P-share context δεν είναι πλέον ένα φοβικό +/-6% multiplier. Το μοντέλο εφαρμόζει το **opponent defensive deviation from league** πάνω στο offensive 3P share σε logit space. Έτσι μια πραγματικά ακραία άμυνα στο shot profile μπορεί να μετακινήσει ουσιαστικά το share, χωρίς να αντικαθιστά το offensive identity.
+Το location modifier:
+- υπολογίζει team home/away split,
+- το shrinkάρει προς το WNBA-wide home/away split,
+- μένει πολύ μικρό για tactical stats (FGA / 3P share),
+- επιτρέπεται να επηρεάσει λίγο περισσότερο shooting efficiency / foul-related stats μόνο αν το data το δείχνει.
 
-### 4) FTA
-Το FTA/poss χρησιμοποιεί πλέον πραγματικό offense-defense log-rate blend. Μια ομάδα που τραβάει πολλές βολές δεν μένει σχεδόν αμετακίνητη όταν παίζει με opponent που suppresses FTA.
+Το location μπαίνει πλέον και στα `3P_PCT` / `2P_PCT`, αλλά μόνο data-driven και με μικρό cap.
 
-### 5) Player Props όταν δεν υπάρχουν exact OUT games
-Τα exact joint OUT games παραμένουν primary. Αν δεν υπάρχουν, το μοντέλο χρησιμοποιεί capped **vacated-opportunity redistribution** για usage / 3PA role / FTA role / creation / rebound role.
+### 4) Minutes / confirmed OUT
+Η v2.13 minutes διόρθωση περιλαμβάνεται ολόκληρη:
+- πρώτα επιλέγεται η πραγματική 8-10ish recent rotation αντί να μοιράζονται 200' σε όλο το roster,
+- DNPs μετρούν ως 0 στα recent team-game minutes,
+- confirmed OUT απελευθερώνει τα healthy projected minutes,
+- τα minutes πηγαίνουν μέσω learned teammate replacement matrix,
+- position είναι fallback prior, όχι hard rule.
 
-Τα projected minutes είναι ήδη ξεχωριστό layer, άρα το fallback δεν ξαναμετρά απλώς τα ίδια χαμένα λεπτά. Όσο αυξάνει exact-state confidence, το role fallback shrinkάρει προς 1.00.
+v2.14 ενισχύει το positional fallback και διαβάζει combo/provider positions πιο αξιόπιστα. Σε sparse history:
+`same position > adjacent G/F or F/C >>> G/C`.
+Αν υπάρχει πραγματικό historical small-ball/replacement evidence, αυτό υπερισχύει.
 
 ## GitHub upload
-Από το zip:
-
-Στο `Pricing-Basketball/core/` ανέβασε/αντικατάστησε:
-- `availability.py`
+Μέσα στο `Pricing-Basketball/core/` αντικατέστησε μαζί:
+- `minutes_engine.py`
+- `redistribution.py`
 - `matchup.py`
-- `availability_impact.py` **(ΝΕΟ)**
+- `team_model.py`
 
-Στο root `Pricing-Basketball/` αντικατάστησε:
+Στο root του repository αντικατέστησε:
 - `streamlit_app.py`
 
-Το `tests/v212_smoke.py` είναι προαιρετικό.
+Το `tests/v214_smoke.py` είναι μόνο για test και δεν απαιτείται για Streamlit.
 
-**ΠΡΟΣΟΧΗ:** τα core files πρέπει να μπουν μέσα στο `/core`, όχι στο root.
+## Audit που πρέπει να κοιτάξουμε πρώτο
+1. `Opponent-elasticity calibration audit`
+2. `Location correction` — πρέπει συνήθως να είναι πολύ κοντά στο 1.00
+3. `Full rotation minute audit`
+4. `Confirmed OUT minute replacement`
+5. `Learned replacement weights`
 
-## A/B test που πρέπει να κάνουμε
-1. WSH @ PHX χωρίς OUT/restriction.
-2. Bonner = OUT.
-3. Bonner = OUT + Plum shared minute override (π.χ. το πραγματικό restriction που θέλεις να χρησιμοποιήσεις).
-
-Στο Model Audit κοίτα:
-- Exact OUT-state audit,
-- Roster-state bridge,
-- Shot architecture,
-- Final 3P-share context modifier,
-- Final FTA context modifier,
-- Player sparse-OUT fallback audit.
-
-Το σημαντικό δεν είναι απλώς να αλλάξει το line· πρέπει να φαίνεται **γιατί** άλλαξε και η ίδια απουσία να εμφανίζεται μία φορά ως historical evidence + μόνο το residual fallback που δεν καλύπτεται από αυτό.

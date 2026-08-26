@@ -27,6 +27,7 @@ from core.matchup import (
     team_matchup_modifiers,
     position_environment,
     block_position_susceptibility_modifier,
+    fit_opponent_elasticities,
 )
 from core.minutes_engine import (
     project_team_minutes, rotation_regime_for_team, rotation_similarity_weights,
@@ -50,11 +51,16 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.12.0")
+st.title("🏀 Basketball Pricing Engine v2.14.0")
 st.caption(
-    "Shared OUT + minute-restriction state • roster-aware fallback when exact OUT games do not exist • "
-    "offense/defense 3P-share + FTA blending • non-overlap H2H • BLK v3 • coupled team markets"
+    "Role-aware 8–10 player rotations + learned OUT-minute replacement • shared minute restrictions • "
+    "league-calibrated opponent elasticity • possession-first pace • non-overlap H2H • BLK v3"
 )
+
+
+@st.cache_data(show_spinner=False)
+def cached_opponent_elasticities(team_logs: pd.DataFrame):
+    return fit_opponent_elasticities(team_logs)
 
 
 def get_secret(name):
@@ -879,8 +885,13 @@ with tab_team:
         away_opp = st.session_state.get("team_opp_profile_home") or opponent_allowed_profile(
             team_db, setup["home_abbr"], exclude_team_abbr=setup["away_abbr"]
         )
-        home_auto = team_matchup_modifiers(home_opp, own_profile=home_match_profile)
-        away_auto = team_matchup_modifiers(away_opp, own_profile=away_match_profile)
+        opponent_elasticities, opponent_elasticity_audit = cached_opponent_elasticities(team_db)
+        home_auto = team_matchup_modifiers(
+            home_opp, own_profile=home_match_profile, elasticities=opponent_elasticities
+        )
+        away_auto = team_matchup_modifiers(
+            away_opp, own_profile=away_match_profile, elasticities=opponent_elasticities
+        )
 
         # Small location correction with the current H2H opponent excluded as well.
         home_loc, home_loc_audit = team_location_modifiers(
@@ -906,8 +917,8 @@ with tab_team:
                 "DREB": float(np.clip(roster.get("DREB", 1.0) * loc.get("DREB", 1.0), 0.88, 1.12)),
                 "STL": float(np.clip(roster.get("STL", 1.0) * loc.get("STL", 1.0), 0.86, 1.14)),
                 "BLK": float(np.clip(roster.get("BLK", 1.0) * auto.get("BLK", 1.0) * loc.get("BLK", 1.0), 0.82, 1.18)),
-                "3P_PCT": float(np.clip(roster.get("3P_PCT", 1.0) * auto.get("3P_PCT", 1.0), 0.94, 1.06)),
-                "2P_PCT": float(np.clip(roster.get("2P_PCT", 1.0) * auto.get("2P_PCT", 1.0), 0.94, 1.06)),
+                "3P_PCT": float(np.clip(roster.get("3P_PCT", 1.0) * auto.get("3P_PCT", 1.0) * loc.get("3P_PCT", 1.0), 0.92, 1.08)),
+                "2P_PCT": float(np.clip(roster.get("2P_PCT", 1.0) * auto.get("2P_PCT", 1.0) * loc.get("2P_PCT", 1.0), 0.92, 1.08)),
             }
 
 
@@ -928,6 +939,15 @@ with tab_team:
                 "Leave these untouched for full AUTO. FGA and 3P_SHARE replace independent 3PA/2PA multipliers. "
                 "OREB is per miss; AST is per made FG. This keeps the main opportunity layers from being counted twice."
             )
+
+            with st.expander("Opponent-elasticity calibration audit", expanded=False):
+                st.caption(
+                    "Each beta is learned from historical pregame offense-vs-defense interactions. "
+                    "There is no universal opponent weight: the WNBA data decide stat by stat. "
+                    "Shooting efficiency is intentionally the most strongly shrunk because raw opponent FG% is noisy."
+                )
+                if isinstance(opponent_elasticity_audit, pd.DataFrame) and not opponent_elasticity_audit.empty:
+                    st.dataframe(opponent_elasticity_audit.round(4), use_container_width=True, hide_index=True)
 
             def modifier_editor(prefix, team_abbr, mods):
                 cols = st.columns(5)
@@ -1436,20 +1456,32 @@ with tab_player:
                     "OUT/trader/metadata minutes are fixed first; AUTO minutes "
                     "absorb the remaining allocation."
                 )
+                minute_cols = [c for c in [
+                    "Team","Player","Status","In Active Rotation",
+                    "DNP-aware L5 Min","DNP-aware L10 Min",
+                    "Healthy Baseline Min","Auto Baseline Min","OUT Replacement Delta",
+                    "Projected Min","Override Delta","Low Min","High Min","Source","Regime"
+                ] if c in final_minutes.columns]
                 st.dataframe(
-                    final_minutes[[
-                        "Team","Player","Status","Auto Baseline Min",
-                        "Projected Min","Override Delta",
-                        "Low Min","High Min","Source","Regime"
-                    ]].round(2),
-                    use_container_width=True,
-                    hide_index=True,
+                    final_minutes[minute_cols].round(2),
+                    use_container_width=True, hide_index=True,
                 )
                 sums = final_minutes.groupby("Team")["Projected Min"].sum()
                 st.write({
                     team: round(float(total), 2)
                     for team,total in sums.items()
                 })
+
+                st.markdown("#### Confirmed OUT minute replacement")
+                out_impacts = []
+                for team_frame in [away_min, home_min]:
+                    imp = team_frame.attrs.get("out_redistribution_impact")
+                    if isinstance(imp, pd.DataFrame) and not imp.empty:
+                        out_impacts.append(imp)
+                if out_impacts:
+                    st.dataframe(pd.concat(out_impacts, ignore_index=True).round(2), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No confirmed OUT minute redistribution in this scenario.")
 
                 st.markdown("#### Role-aware override impact")
                 impacts = []
@@ -1918,11 +1950,11 @@ with tab_audit:
         tap = st.session_state.get("team_opp_profile_away")
         if thp:
             st.markdown(f"### {setup['home_abbr']} TEAM-MARKET opponent allowed (current H2H excluded)")
-            st.caption("Raw opponent rates are shown here. For 3P_SHARE and FTA, Team Markets recompute the final interaction using the offense's own current profile; see the Team Model audit for the applied context modifier.")
+            st.caption("Raw opponent rates are shown here. Team Markets recompute the final offense-vs-defense interaction for the structural rates using league-calibrated opponent elasticities; the generic modifier column is audit/backward-compatibility only. See the opponent-elasticity audit for the beta actually used.")
             st.dataframe(thp["audit"].round(4), use_container_width=True)
         if tap:
             st.markdown(f"### {setup['away_abbr']} TEAM-MARKET opponent allowed (current H2H excluded)")
-            st.caption("Raw opponent rates are shown here. For 3P_SHARE and FTA, Team Markets recompute the final interaction using the offense's own current profile; see the Team Model audit for the applied context modifier.")
+            st.caption("Raw opponent rates are shown here. Team Markets recompute the final offense-vs-defense interaction for the structural rates using league-calibrated opponent elasticities; the generic modifier column is audit/backward-compatibility only. See the opponent-elasticity audit for the beta actually used.")
             st.dataframe(tap["audit"].round(4), use_container_width=True)
 
     st.write({
@@ -1937,5 +1969,5 @@ with tab_audit:
 
 st.caption(
     "Model-implied fair odds are not yet historically calibrated true odds. "
-    "v2.12 adds roster-state fallback and stronger structural 3P-share/FTA matchup blending; re-backtest before treating model fair odds as calibrated true probabilities."
+    "v2.14 uses data-learned opponent response, data-driven minimal home/away effects, and role/position-aware minute redistribution; re-backtest before treating model fair odds as calibrated true probabilities."
 )
