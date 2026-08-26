@@ -19,6 +19,7 @@ class PlayerContext:
     opp_reb: float = 1.00
     opp_ast: float = 1.00
     opp_3pa: float = 1.00
+    opp_2pa: float = 1.00
     opp_fta: float = 1.00
     # Shooting-efficiency context is deliberately much weaker than volume context.
     opp_three_pct: float = 1.00
@@ -32,7 +33,8 @@ class PlayerContext:
     fta_role: float = 1.00
 
     # H2H context only: recommended range 0.90 - 1.10.
-    h2h_pts: float = 1.00
+    h2h_pts: float = 1.00  # legacy; kept for backward compatibility
+    h2h_2pa: float = 1.00
     h2h_reb: float = 1.00
     h2h_ast: float = 1.00
     h2h_3pa: float = 1.00
@@ -191,7 +193,9 @@ def simulate_player(profile: dict, ctx: PlayerContext, n=50_000, seed=1, opportu
     base = pace * role * opportunity_mult
 
     lam3 = mins * profile["three_pa_pm"] * base * perim * ctx.usage * ctx.three_role * ctx.opp_3pa * ctx.h2h_3pa
-    lam2 = mins * profile["two_pa_pm"] * base * ctx.usage * ctx.opp_pts * ctx.h2h_pts
+    # 2PA volume must use opponent 2PA allowance, not opponent PTS allowance.
+    # PTS is an outcome; 2PA is an opportunity channel.
+    lam2 = mins * profile["two_pa_pm"] * base * ctx.usage * ctx.opp_2pa * ctx.h2h_2pa
     lamft = mins * profile["fta_pm"] * base * foul * ctx.usage * ctx.fta_role * ctx.opp_fta
 
     a3 = rng.poisson(np.clip(lam3, 0.001, None))

@@ -560,10 +560,38 @@ def build_rotation_state_impact(
     restriction_shift = _shifted_minutes(current_board, out_only_board)
     restriction_evidence = 0.80 if restriction_shift >= 0.5 else 0.0
 
+    # Some team stats are extremely concentrated in one or two players. A fixed
+    # +/- cap can make a multi-absence scenario mathematically unable to move
+    # enough (classic example: two rim protectors OUT but BLK can fall at most 12%).
+    # Use the actual healthy contribution share of the confirmed OUT players only
+    # to relax the LOWER cap for concentration-sensitive defensive stats. This is
+    # a guard rail, not an extra boost, and it cannot move a stat unless the
+    # synthetic healthy->OUT ratio already points in that direction.
+    concentration_stat = {"BLK": "BLK", "DREB": "DREB", "OREB": "OREB"}
+    def _out_healthy_share(team_stat: str) -> float:
+        pstat = concentration_stat.get(team_stat)
+        if not pstat:
+            return 0.0
+        total = sum(float(healthy_by.get(n, {}).get(pstat, 0.0) or 0.0) for n in names)
+        lost = sum(
+            max(float(healthy_by.get(n, {}).get(pstat, 0.0) or 0.0)
+                - float(out_by.get(n, {}).get(pstat, 0.0) or 0.0), 0.0)
+            for n in out_players
+        )
+        return float(np.clip(_safe_div(lost, total, 0.0), 0.0, 1.0))
+
     mods = {}
     rows = []
     for stat, power in TEAM_STAT_POWER.items():
         lo, hi = TEAM_CAPS[stat]
+        lost_share = _out_healthy_share(stat)
+        base_lo = lo
+        if stat == "BLK" and lost_share > 0:
+            lo = max(0.72, lo - 0.30 * lost_share)
+        elif stat == "DREB" and lost_share > 0:
+            lo = max(0.88, lo - 0.14 * lost_share)
+        elif stat == "OREB" and lost_share > 0:
+            lo = max(0.86, lo - 0.12 * lost_share)
         stat_conf = _state_conf(stat)
         # Historical exact/near-state evidence already lives inside the team
         # buckets. The synthetic bridge fills only the residual information gap.
@@ -584,6 +612,9 @@ def build_rotation_state_impact(
             "OUT bridge strength": power * out_evidence,
             "Restriction raw ratio": r_rest,
             "Restriction bridge strength": power * restriction_evidence,
+            "OUT healthy stat share": lost_share,
+            "Base lower cap": base_lo,
+            "Adaptive lower cap": lo,
             "Applied roster-state modifier": final,
         })
 
