@@ -23,7 +23,7 @@ from core.pricing import (
 )
 from core.matchup import (
     opponent_allowed_profile,
-    player_matchup_modifiers,
+    player_matchup_modifiers, player_h2h_modifiers,
     team_matchup_modifiers,
     position_environment,
     block_position_susceptibility_modifier,
@@ -53,10 +53,10 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.16.0")
+st.title("🏀 Basketball Pricing Engine v2.16.1 — stabilization")
 st.caption(
-    "Relevant-state player samples • stat-specific role routing • defensive OUT bridge • "
-    "possession-consistent FGA chain • 50k cached sims • non-overlap Old/G6–10/L5"
+    "v2.16 core + 2PA-position fix • tiny rotation-aware player H2H • adaptive multi-OUT rim-protection cap • "
+    "exact bookmaker-line comparison • 50k cached sims • non-overlap Old/G6–10/L5"
 )
 
 
@@ -112,7 +112,10 @@ def _render_player_deep_analysis_impl(board, detail_store, target_ev, reference_
             detail["plog"]["OPP_ABBR"].astype(str).str.upper()
             == str(detail["opp_abbr"]).upper()
         ]
-        st.markdown("**H2H — zero extra weight**")
+        st.markdown("**H2H — tiny rotation/minute-aware opportunity layer (max 5% blend weight)**")
+        h2h_audit = detail.get("h2h_audit")
+        if isinstance(h2h_audit, pd.DataFrame) and not h2h_audit.empty:
+            st.dataframe(h2h_audit.round(4), use_container_width=True, hide_index=True)
         if h2h.empty:
             st.caption("No same-season H2H.")
         else:
@@ -1282,7 +1285,75 @@ with tab_team:
                         use_container_width=True, hide_index=True,
                     )
 
-            st.caption("No bookmaker input is required. Compare the market later against Model line / Fair / Play-from columns above.")
+
+            st.markdown("### Exact bookmaker-line comparison / arb audit")
+            st.caption(
+                "Upload a CSV after the model is frozen. Two-way rows: Scope,Market,Line,Over Odds,Under Odds. "
+                "MOST rows: Scope=MOST, Market, Away Odds,Tie Odds,Home Odds. The app prices the EXACT bookmaker line "
+                "from the current simulation. 'Book arb' is a real same-book overround check; model-vs-book EV is NOT an executable arbitrage by itself."
+            )
+            bm_file = st.file_uploader("Bookmaker market CSV", type=["csv"], key="team_book_csv")
+            if bm_file is not None:
+                try:
+                    bm = pd.read_csv(bm_file)
+                    bm.columns = [str(c).strip() for c in bm.columns]
+                    comp_rows = []
+                    sim_by_scope = {
+                        "TOTAL": total_sim,
+                        str(setup["away_abbr"]).upper(): away_sim,
+                        str(setup["home_abbr"]).upper(): home_sim,
+                    }
+                    for _, br in bm.iterrows():
+                        scope = str(br.get("Scope", "")).strip().upper()
+                        market = str(br.get("Market", "")).strip().upper()
+                        if not market:
+                            continue
+                        if scope == "MOST":
+                            if market not in home_sim.columns or market not in away_sim.columns:
+                                continue
+                            pr = most_market_calibrated(
+                                home_sim[market], away_sim[market], team_logs=team_db, market=market,
+                                calibration_strength=0.60,
+                            )
+                            ao = float(br.get("Away Odds", np.nan)); to = float(br.get("Tie Odds", np.nan)); ho = float(br.get("Home Odds", np.nan))
+                            book_sum = sum(1.0/x for x in [ao,to,ho] if np.isfinite(x) and x > 1.0)
+                            comp_rows.append({
+                                "Scope":"MOST","Market":market,"Line":np.nan,
+                                f"Book {setup['away_abbr']}":ao, f"Model fair {setup['away_abbr']}":pr["fair_away"], f"EV {setup['away_abbr']}":pr["p_away"]*ao-1 if np.isfinite(ao) else np.nan,
+                                "Book Tie":to,"Model fair Tie":pr["fair_tie"],"EV Tie":pr["p_tie"]*to-1 if np.isfinite(to) else np.nan,
+                                f"Book {setup['home_abbr']}":ho, f"Model fair {setup['home_abbr']}":pr["fair_home"], f"EV {setup['home_abbr']}":pr["p_home"]*ho-1 if np.isfinite(ho) else np.nan,
+                                "Book implied sum":book_sum,"Actual book arb?": bool(book_sum < 1.0) if book_sum > 0 else False,
+                            })
+                            continue
+
+                        sim_scope = sim_by_scope.get(scope)
+                        if sim_scope is None or market not in sim_scope.columns:
+                            continue
+                        line = float(br.get("Line", np.nan)); oo = float(br.get("Over Odds", np.nan)); uo = float(br.get("Under Odds", np.nan))
+                        if not (np.isfinite(line) and np.isfinite(oo) and np.isfinite(uo)):
+                            continue
+                        pr = price(sim_scope[market].to_numpy(), line, oo, uo)
+                        book_sum = 1.0/oo + 1.0/uo
+                        comp_rows.append({
+                            "Scope":scope,"Market":market,"Line":line,
+                            "Book O":oo,"Model fair O":pr["fair_over"],"Model P O":pr["p_over"],"EV O":pr["ev_over"],"Play O from":required_odds_for_ev(pr["p_over"],pr["p_push"],target_ev),
+                            "Book U":uo,"Model fair U":pr["fair_under"],"Model P U":pr["p_under"],"EV U":pr["ev_under"],"Play U from":required_odds_for_ev(pr["p_under"],pr["p_push"],target_ev),
+                            "Push P":pr["p_push"],"Book implied sum":book_sum,"Actual book arb?":book_sum < 1.0,
+                        })
+                    if comp_rows:
+                        comp_df = pd.DataFrame(comp_rows)
+                        st.dataframe(comp_df.round(4), use_container_width=True, hide_index=True)
+                        st.download_button(
+                            "Download exact model-vs-book comparison CSV",
+                            comp_df.to_csv(index=False).encode("utf-8"),
+                            file_name="model_vs_book_exact.csv", mime="text/csv", key="download_exact_book_compare"
+                        )
+                    else:
+                        st.warning("No valid comparison rows found. Check Scope/team abbreviations and column names.")
+                except Exception as exc:
+                    st.error(f"Could not read bookmaker comparison CSV: {exc}")
+
+            st.caption("No bookmaker input is required for pricing. The upload above is comparison-only and never feeds back into the model.")
 
             with st.expander("Model audit: buckets / location / H2H / conservation"):
                 st.markdown("**Possession identity audit**")
@@ -1868,6 +1939,22 @@ with tab_player:
                         np.clip(shared_pace / max(historical_pace, 1.0), .88, 1.12)
                     )
 
+                    # v2.16.1: restore the originally intended SMALL H2H layer.
+                    # It affects opportunity rates only (2PA/3PA/REB/AST), never
+                    # shooting percentages, and is strongly shrunk by sample,
+                    # current-rotation similarity and minute comparability.
+                    _ph2h = plog[
+                        plog["OPP_ABBR"].astype(str).str.upper().eq(str(opp_abbr).upper())
+                    ].copy()
+                    _ph2h_ids = _ph2h["GAME_ID"].astype(str).tolist() if "GAME_ID" in _ph2h.columns else []
+                    _ph2h_rot = h2h_rotation_similarity(
+                        player_db, pool, team_abbr, manual_context, _ph2h_ids
+                    ) if _ph2h_ids else 0.0
+                    h2h_mods, player_h2h_audit = player_h2h_modifiers(
+                        plog, opp_abbr, profile, float(mr["Projected Min"]),
+                        rotation_similarity=float(_ph2h_rot), max_weight=0.05,
+                    )
+
                     ctx = PlayerContext(
                         projected_minutes=float(mr["Projected Min"]),
                         minutes_sd=float(mr["Minutes SD"]),
@@ -1876,6 +1963,7 @@ with tab_player:
                         opp_reb=float(matchup_mods["REB"]),
                         opp_ast=float(matchup_mods["AST"]),
                         opp_3pa=float(matchup_mods["3PA"]),
+                        opp_2pa=float(matchup_mods.get("2PA",1.0)),
                         opp_fta=float(matchup_mods["FTA"]),
                         opp_three_pct=float(matchup_mods.get("3P_PCT",1.0)),
                         opp_two_pct=float(matchup_mods.get("2P_PCT",1.0)),
@@ -1888,6 +1976,10 @@ with tab_player:
                             role.get("three_role",role.get("three_pa",1.0))
                         ) * fallback["three_role"],
                         fta_role=float(role.get("fta_role",1.0)) * fallback["fta_role"],
+                        h2h_2pa=float(h2h_mods.get("2PA",1.0)),
+                        h2h_3pa=float(h2h_mods.get("3PA",1.0)),
+                        h2h_reb=float(h2h_mods.get("REB",1.0)),
+                        h2h_ast=float(h2h_mods.get("AST",1.0)),
                     )
 
                     seed = (abs(hash(str(pid))) % 100000) + 1000
@@ -1923,6 +2015,7 @@ with tab_player:
                         "matchup_audit":matchup_audit,
                         "same_role_audit":same_role_audit,
                         "availability_fallback_audit":fallback_audit,
+                        "h2h_audit":player_h2h_audit,
                         "ctx":ctx,
                         "plog":plog,
                         "opp_abbr":opp_abbr,
