@@ -56,10 +56,11 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.17 — structural calibration")
+st.title("🏀 Basketball Pricing Engine v2.17.1 — structural + adaptive player role-state")
 st.caption(
-    "v2.17: walk-forward learned 3P_SHARE / FTA / TOV / AST structural rates • no fixed opponent/H2H weights "
-    "for those four markets • current roster/location layers preserved • non-overlap Old/G6–10/L5"
+    "v2.17.1: v2.17 team structural calibration + evidence-weighted player role-state. "
+    "Per-minute 2PA/3PA/FTA/REB/AST rates can move through time only when a walk-forward local-level "
+    "state-space model beats the static alternative; shooting skill and trader minutes remain separate."
 )
 
 
@@ -105,6 +106,17 @@ def _render_player_deep_analysis_impl(board, detail_store, target_ev, reference_
         })
         st.markdown("**Non-overlapping sample audit**")
         st.dataframe(detail["profile_audit"], use_container_width=True)
+        st.markdown("**Adaptive player role-state audit (walk-forward state-space)**")
+        rsa = detail.get("role_state_audit")
+        if isinstance(rsa, pd.DataFrame) and not rsa.empty:
+            st.dataframe(rsa.round(4), use_container_width=True, hide_index=True)
+            st.caption(
+                "This layer changes opportunity rates only. q is selected from the player's own history by "
+                "one-step-ahead predictive likelihood; Akaike model averaging shrinks back to the static state "
+                "when the extra dynamic parameter does not earn predictive support."
+            )
+        else:
+            st.caption("Neutral: insufficient history for adaptive role-state inference.")
         st.markdown("**Opponent / position audit**")
         st.dataframe(detail["matchup_audit"].round(4), use_container_width=True)
         st.markdown("**Confirmed-OUT exact/near-state player-role audit**")
@@ -2064,6 +2076,7 @@ with tab_player:
                     detail_store[pname] = {
                         "sim":sim,
                         "profile_audit":audit,
+                        "role_state_audit":profile.get("_role_state_audit"),
                         "matchup_audit":matchup_audit,
                         "same_role_audit":same_role_audit,
                         "availability_fallback_audit":fallback_audit,
