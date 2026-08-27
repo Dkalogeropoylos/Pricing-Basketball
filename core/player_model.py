@@ -103,6 +103,7 @@ def build_player_profile(
     cfg: WeightConfig,
     game_weights: Optional[Dict[str, float]] = None,
     game_weights_by_stat: Optional[Dict[str, Dict[str, float]]] = None,
+    exclude_opponent_abbr: Optional[str] = None,
 ) -> Tuple[dict, pd.DataFrame]:
     """
     Outer Old/G6-10/L5 weights remain non-overlapping. Availability similarity
@@ -114,7 +115,24 @@ def build_player_profile(
     ``game_weights_by_stat`` is supplied, it wins for the mapped feature only.
     """
     x = df.sort_values("GAME_DATE").copy()
-    buckets = split_non_overlapping(x)
+
+    # v2.17.2 disjoint player H2H: split the real timeline FIRST, then remove
+    # current-opponent rows from opportunity buckets.  Those rows are reserved
+    # for the explicit empirical-Bayes H2H layer later in the pipeline, so one
+    # Phoenix game cannot both move the adaptive role-state and then be counted
+    # again as matchup-specific H2H evidence.  Shooting skill still uses the
+    # full sample because H2H never changes 3P%/2P%/FT% directly.
+    raw_buckets = split_non_overlapping(x)
+    if exclude_opponent_abbr and "OPP_ABBR" in x.columns:
+        opp = str(exclude_opponent_abbr).upper()
+        buckets = {
+            k: v[~v["OPP_ABBR"].astype(str).str.upper().eq(opp)].copy()
+            for k, v in raw_buckets.items()
+        }
+        role_x = x[~x["OPP_ABBR"].astype(str).str.upper().eq(opp)].copy()
+    else:
+        buckets = raw_buckets
+        role_x = x
     weights = active_weights(buckets, cfg)
     by = game_weights_by_stat or {}
 
@@ -159,7 +177,7 @@ def build_player_profile(
     for key in ("two_pa_pm", "three_pa_pm", "fta_pm", "reb_pm", "ast_pm"):
         stat_key = feature_stat[key]
         wm = by.get(stat_key, game_weights)
-        rs = adaptive_role_state(x, key, profile[key], game_weights=wm)
+        rs = adaptive_role_state(role_x, key, profile[key], game_weights=wm)
         if np.isfinite(rs.applied_rate) and rs.applied_rate > 0:
             profile[key] = rs.applied_rate
         role_state_results.append(rs)
@@ -177,6 +195,8 @@ def build_player_profile(
     audit = []
     for k in ("old", "mid", "l5"):
         row = {"bucket": k, "weight": weights[k], **audit_feats.get(k, {"games": 0})}
+        row["raw_bucket_games"] = int(len(raw_buckets.get(k, [])))
+        row["H2H_excluded"] = int(len(raw_buckets.get(k, [])) - len(buckets.get(k, [])))
         # Transparent effective sample sizes under each stat-specific map.
         for stat_key in ("FGA", "3PA", "FTA", "REB", "AST"):
             sf = bucket_features(k, stat_key)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import numpy as np
 import pandas as pd
 
@@ -273,20 +274,147 @@ def player_matchup_modifiers(overall_profile, position_vs_opp=None, position_lea
 
 
 
+def _player_game_counts(row: pd.Series) -> dict:
+    fga = float(pd.to_numeric(pd.Series([row.get("FGA", 0)]), errors="coerce").fillna(0.0).iloc[0])
+    a3 = float(pd.to_numeric(pd.Series([row.get("FG3A", 0)]), errors="coerce").fillna(0.0).iloc[0])
+    return {
+        "2PA": max(fga - a3, 0.0),
+        "3PA": max(a3, 0.0),
+        "REB": float(pd.to_numeric(pd.Series([row.get("REB", 0)]), errors="coerce").fillna(0.0).iloc[0]),
+        "AST": float(pd.to_numeric(pd.Series([row.get("AST", 0)]), errors="coerce").fillna(0.0).iloc[0]),
+    }
+
+
+def fit_player_h2h_prior_minutes(player_logs: pd.DataFrame):
+    """Learn stat-specific H2H pooling strength from repeat matchups.
+
+    A Gamma-Poisson empirical-Bayes view is used.  For a live player/opponent
+    pairing, the non-H2H player rate is the prior mean and previous H2H minutes
+    are additional exposure.  The prior-equivalent minutes K are selected from
+    historical *next-game* predictive likelihood across repeated player/opponent
+    matchups.  K=inf (ignore H2H) is always a candidate, so the data can decide
+    that a stat has no repeat-matchup value.
+
+    This replaces the old universal 5% cap.  Rotation/minute similarity is NOT
+    fitted here; it is factual live relevance and reduces effective H2H exposure
+    downstream.
+    """
+    neutral = {k: np.inf for k in ("2PA", "3PA", "REB", "AST")}
+    if player_logs is None or player_logs.empty:
+        return neutral, pd.DataFrame()
+    required = {"PLAYER_ID", "OPP_ABBR", "GAME_DATE", "MIN"}
+    if not required.issubset(set(player_logs.columns)):
+        return neutral, pd.DataFrame([{"Active": False, "Reason": "missing player/opponent/minute columns"}])
+
+    x = player_logs.copy()
+    x["GAME_DATE"] = pd.to_datetime(x["GAME_DATE"], errors="coerce")
+    if "GAME_ID" not in x.columns:
+        x["GAME_ID"] = np.arange(len(x)).astype(str)
+    x = x.dropna(subset=["GAME_DATE"]).sort_values(["GAME_DATE", "GAME_ID", "PLAYER_ID"]).reset_index(drop=True)
+
+    stats = ("2PA", "3PA", "REB", "AST")
+    events = {st: [] for st in stats}
+    total_exp = {}
+    total_counts = {}
+    pair_exp = {}
+    pair_counts = {}
+
+    for _, row in x.iterrows():
+        pid = str(row.get("PLAYER_ID"))
+        opp = str(row.get("OPP_ABBR", "")).upper()
+        mins = float(pd.to_numeric(pd.Series([row.get("MIN", 0)]), errors="coerce").fillna(0.0).iloc[0])
+        if not np.isfinite(mins) or mins < 4.0 or not opp:
+            continue
+        counts = _player_game_counts(row)
+        pk = (pid, opp)
+        texp = float(total_exp.get(pid, 0.0))
+        hexp = float(pair_exp.get(pk, 0.0))
+        nonexp = max(texp - hexp, 0.0)
+
+        # Only prior H2H can predict the current H2H game; no future leakage.
+        if hexp > 0 and nonexp > 0:
+            for st in stats:
+                tc = float(total_counts.get((pid, st), 0.0))
+                hc = float(pair_counts.get((pid, opp, st), 0.0))
+                nonc = max(tc - hc, 0.0)
+                b = nonc / nonexp if nonexp > 0 else np.nan
+                c = float(counts[st])
+                if np.isfinite(b) and b > 1e-6 and np.isfinite(c):
+                    events[st].append((b, hc, hexp, c, mins))
+
+        total_exp[pid] = texp + mins
+        pair_exp[pk] = hexp + mins
+        for st in stats:
+            c = float(counts[st])
+            total_counts[(pid, st)] = float(total_counts.get((pid, st), 0.0)) + c
+            pair_counts[(pid, opp, st)] = float(pair_counts.get((pid, opp, st), 0.0)) + c
+
+    result, rows = {}, []
+    for st in stats:
+        ev = events[st]
+        if len(ev) < 40:
+            result[st] = np.inf
+            rows.append({"Stat": st, "Active": False, "Calibration events": len(ev), "Prior minutes K": np.inf, "Reason": "insufficient repeat-matchup events"})
+            continue
+
+        b = np.asarray([z[0] for z in ev], float)
+        hc = np.asarray([z[1] for z in ev], float)
+        he = np.asarray([z[2] for z in ev], float)
+        actual = np.asarray([z[3] for z in ev], float)
+        mins = np.asarray([z[4] for z in ev], float)
+        logfact = np.asarray([math.lgamma(float(c) + 1.0) for c in actual], float)
+
+        # Data-scaled grid in equivalent player-minutes; inf = no H2H layer.
+        med_h = max(float(np.median(he[he > 0])) if np.any(he > 0) else 30.0, 10.0)
+        finite_grid = med_h * np.logspace(-1.0, 1.6, 28)
+        grid = list(finite_grid) + [np.inf]
+
+        def nll(k):
+            if np.isinf(k):
+                rate = b
+            else:
+                rate = (hc + float(k) * b) / np.maximum(he + float(k), 1e-9)
+            lam = np.clip(mins * rate, 1e-9, None)
+            return float(np.sum(lam - actual * np.log(lam) + logfact))
+
+        scores = np.asarray([nll(k) for k in grid], float)
+        j = int(np.argmin(scores))
+        best_k = float(grid[j])
+        base_nll = float(scores[-1])
+        best_nll = float(scores[j])
+        active = bool(np.isfinite(best_k) and best_nll < base_nll)
+        if not active:
+            best_k = np.inf
+            best_nll = base_nll
+        result[st] = best_k
+        rows.append({
+            "Stat": st, "Active": active, "Calibration events": len(ev),
+            "Prior minutes K": best_k, "No-H2H NLL": base_nll,
+            "Best H2H NLL": best_nll,
+            "NLL gain": (base_nll - best_nll),
+            "Reason": "repeat-matchup predictive gain" if active else "H2H did not improve next-game likelihood",
+        })
+    return result, pd.DataFrame(rows)
+
+
 def player_h2h_modifiers(
     player_log: pd.DataFrame,
     opponent_abbr: str,
     profile: dict,
     projected_minutes: float,
     rotation_similarity: float = 1.0,
-    max_weight: float = 0.05,
+    prior_minutes_by_stat: dict | None = None,
+    max_weight: float | None = None,
 ):
-    """Tiny, rotation/minute-aware same-season H2H opportunity correction.
+    """Disjoint empirical-Bayes same-season H2H opportunity correction.
 
-    H2H is deliberately NOT a second sample and never changes shooting skill.
-    It only nudges 2PA/3PA/REB/AST opportunity rates in log space. The maximum
-    blend weight is 5%, and it shrinks further for sparse games, dissimilar
-    rotations and H2Hs played at very different minutes.
+    v2.17.2 assumes ``profile`` was built with current-opponent H2H rows
+    excluded from opportunity buckets / adaptive role-state.  H2H is therefore
+    genuinely additional matchup evidence rather than the same games counted
+    twice.  Each stat uses a league-learned prior-equivalent minute mass K.
+    No fixed 5% blend cap and no raw-ratio clipping are used.
+
+    ``max_weight`` is accepted only for backward API compatibility and ignored.
     """
     neutral = {"2PA": 1.0, "3PA": 1.0, "REB": 1.0, "AST": 1.0}
     if player_log is None or player_log.empty:
@@ -295,25 +423,28 @@ def player_h2h_modifiers(
         player_log["OPP_ABBR"].astype(str).str.upper().eq(str(opponent_abbr).upper())
     ].copy()
     if h.empty:
-        return neutral, pd.DataFrame([{"H2H games": 0, "Applied H2H weight": 0.0}])
+        return neutral, pd.DataFrame([{"H2H games": 0, "Posterior H2H weight": 0.0}])
 
     mins = pd.to_numeric(h.get("MIN", 0), errors="coerce").fillna(0.0)
     h = h[mins > 0].copy()
     if h.empty:
-        return neutral, pd.DataFrame([{"H2H games": 0, "Applied H2H weight": 0.0}])
-    mins = pd.to_numeric(h["MIN"], errors="coerce").fillna(0.0)
-    total_min = float(mins.sum())
-    if total_min <= 0:
-        return neutral, pd.DataFrame([{"H2H games": 0, "Applied H2H weight": 0.0}])
+        return neutral, pd.DataFrame([{"H2H games": 0, "Posterior H2H weight": 0.0}])
+    mins = pd.to_numeric(h["MIN"], errors="coerce").fillna(0.0).to_numpy(float)
+    if float(np.sum(mins)) <= 0:
+        return neutral, pd.DataFrame([{"H2H games": 0, "Posterior H2H weight": 0.0}])
 
-    fga = float(pd.to_numeric(h.get("FGA", 0), errors="coerce").fillna(0.0).sum())
-    a3 = float(pd.to_numeric(h.get("FG3A", 0), errors="coerce").fillna(0.0).sum())
-    a2 = max(fga - a3, 0.0)
-    rates = {
-        "2PA": a2 / total_min,
-        "3PA": a3 / total_min,
-        "REB": float(pd.to_numeric(h.get("REB", 0), errors="coerce").fillna(0.0).sum()) / total_min,
-        "AST": float(pd.to_numeric(h.get("AST", 0), errors="coerce").fillna(0.0).sum()) / total_min,
+    # Similar minutes + similar current rotation become effective H2H exposure.
+    rot = float(np.clip(rotation_similarity, 0.0, 1.0))
+    minute_rel = np.exp(-np.abs(mins - float(projected_minutes)) / 10.0)
+    rel = rot * minute_rel
+
+    fga = pd.to_numeric(h.get("FGA", 0), errors="coerce").fillna(0.0).to_numpy(float)
+    a3 = pd.to_numeric(h.get("FG3A", 0), errors="coerce").fillna(0.0).to_numpy(float)
+    stat_counts = {
+        "2PA": np.maximum(fga - a3, 0.0),
+        "3PA": np.maximum(a3, 0.0),
+        "REB": pd.to_numeric(h.get("REB", 0), errors="coerce").fillna(0.0).to_numpy(float),
+        "AST": pd.to_numeric(h.get("AST", 0), errors="coerce").fillna(0.0).to_numpy(float),
     }
     base = {
         "2PA": float(profile.get("two_pa_pm", np.nan)),
@@ -321,33 +452,45 @@ def player_h2h_modifiers(
         "REB": float(profile.get("reb_pm", np.nan)),
         "AST": float(profile.get("ast_pm", np.nan)),
     }
-    n = int(len(h))
-    rot = float(np.clip(rotation_similarity, 0.0, 1.0))
-    minute_sim = float(np.mean(np.exp(-np.abs(mins.to_numpy(dtype=float) - float(projected_minutes)) / 10.0)))
-    maturity = float(n / (n + 2.0))
-    weight = float(min(float(max_weight), float(max_weight) * maturity * rot * minute_sim))
+    # Backward-compatible fallback for older callers/tests. Production v2.17.2
+    # passes the learned K map, so this branch is not used by the live app.
+    legacy_mode = prior_minutes_by_stat is None and max_weight is not None
+    kmap = prior_minutes_by_stat or {k: np.inf for k in neutral}
 
-    out = dict(neutral)
-    rows = []
-    for stat in ("2PA", "3PA", "REB", "AST"):
-        b = base[stat]
-        hv = rates[stat]
-        ratio = (hv / b) if np.isfinite(b) and b > 0 and np.isfinite(hv) else 1.0
-        ratio = float(np.clip(ratio, 0.70, 1.30))
-        mod = float(np.exp(weight * np.log(max(ratio, 1e-9)))) if weight > 0 else 1.0
-        out[stat] = float(np.clip(mod, 0.97, 1.03))
+    out, rows = dict(neutral), []
+    for st in ("2PA", "3PA", "REB", "AST"):
+        b = base[st]
+        cw = float(np.sum(stat_counts[st] * rel))
+        mw = float(np.sum(mins * rel))
+        raw_rate = (cw / mw) if mw > 0 else np.nan
+        k = float(kmap.get(st, np.inf))
+        if legacy_mode:
+            raw_ratio = (raw_rate / b) if np.isfinite(raw_rate) and np.isfinite(b) and b > 0 else 1.0
+            raw_ratio = float(np.clip(raw_ratio, 0.70, 1.30))
+            maturity = float(len(h) / (len(h) + 2.0))
+            mean_min_rel = float(np.mean(minute_rel)) if len(minute_rel) else 0.0
+            w = float(min(float(max_weight), float(max_weight) * maturity * rot * mean_min_rel))
+            mod = float(np.clip(np.exp(w * np.log(max(raw_ratio, 1e-9))), 0.97, 1.03))
+            post = b * mod if np.isfinite(b) else b
+        elif not (np.isfinite(b) and b > 0 and mw > 0) or np.isinf(k):
+            post = b
+            w = 0.0
+            mod = 1.0
+        else:
+            post = (cw + k * b) / (mw + k)
+            w = mw / (mw + k)
+            mod = float(post / b) if b > 0 else 1.0
+        out[st] = float(mod if np.isfinite(mod) and mod > 0 else 1.0)
         rows.append({
-            "Stat": stat,
-            "H2H games": n,
-            "H2H rate/min": hv,
-            "Baseline rate/min": b,
-            "Raw ratio": ratio,
-            "Rotation similarity": rot,
-            "Minute similarity": minute_sim,
-            "Applied H2H weight": weight,
-            "Final H2H modifier": out[stat],
+            "Stat": st, "H2H games": int(len(h)),
+            "H2H raw rate/min": raw_rate, "Non-H2H baseline rate/min": b,
+            "Rotation similarity": rot, "Effective H2H minutes": mw,
+            "Learned prior minutes K": (np.nan if legacy_mode else k), "Posterior H2H weight": w,
+            "Applied H2H weight": w,
+            "Posterior rate/min": post, "Final H2H modifier": out[st],
         })
     return out, pd.DataFrame(rows)
+
 
 def _logit(p: float) -> float:
     p = float(np.clip(p, 1e-5, 1 - 1e-5))
