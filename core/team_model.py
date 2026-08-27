@@ -552,6 +552,7 @@ def h2h_profile_blend(
     base_profile: dict,
     rotation_similarity: float = 1.0,
     max_weight: float = 0.10,
+    skip_features: Optional[set[str]] = None,
 ) -> Tuple[dict, pd.DataFrame]:
     """Blend a DISJOINT same-season H2H sample into structural team rates.
 
@@ -599,8 +600,21 @@ def h2h_profile_blend(
         ("stl_per_opp_tov", "stl_per_opp_tov"),
         ("blk_rate_pp", "blk_pp"),
     ]
+    skip = set(skip_features or set())
     rows = []
     for target_key, h2h_key in mapping:
+        if target_key in skip:
+            rows.append({
+                "Feature": target_key,
+                "Base non-H2H": float(base_profile.get(target_key, np.nan)),
+                "H2H value": float(hfeat.get(h2h_key, np.nan)),
+                "H2H games": n,
+                "Rotation similarity": sim,
+                "Applied H2H weight": 0.0,
+                "Final": float(base_profile.get(target_key, np.nan)),
+                "Reason": "handled by v2.17 walk-forward structural model",
+            })
+            continue
         b = float(base_profile.get(target_key, np.nan))
         hv = float(hfeat.get(h2h_key, np.nan))
         if not (np.isfinite(b) and b > 0 and np.isfinite(hv) and hv > 0 and w > 0):
@@ -712,10 +726,14 @@ def _simulate_offense(
     # Free throws consume possession mass in the same 0.44 convention used by
     # the historical possession estimator.  Draw them before FGA so the two
     # opportunity channels reconcile rather than overlap.
-    fta = rng.poisson(np.clip(
-        poss * profile["fta_pp"] * ctx.fta * np.exp(0.12 * z_foul - 0.5 * 0.12**2),
-        0.001, None,
-    ))
+    # v2.17: structural FTA rate may move materially when the walk-forward
+    # model finds a real matchup signal.  Bound the RATE by physical historical
+    # plausibility here rather than clipping the learned matchup modifier upstream.
+    fta_rate = np.clip(
+        profile["fta_pp"] * ctx.fta * np.exp(0.12 * z_foul - 0.5 * 0.12**2),
+        0.05, 0.55,
+    )
+    fta = rng.poisson(np.clip(poss * fta_rate, 0.001, None))
 
     base_share = float(profile.get(
         "three_share",
