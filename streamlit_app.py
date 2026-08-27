@@ -27,10 +27,13 @@ from core.matchup import (
     team_matchup_modifiers,
     position_environment,
     block_position_susceptibility_modifier,
-    fit_opponent_elasticities,
+    fit_opponent_elasticities, fit_player_h2h_prior_minutes,
 )
 from core.structural_calibration import (
     fit_structural_rate_models, predict_structural_modifiers, coefficient_audit,
+)
+from core.shooting_efficiency import (
+    fit_shooting_efficiency_models, predict_shooting_efficiency_modifiers,
 )
 from core.minutes_engine import (
     project_team_minutes, rotation_regime_for_team, rotation_similarity_weights,
@@ -56,11 +59,11 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.17.1 — structural + adaptive player role-state")
+st.title("🏀 Basketball Pricing Engine v2.17.2 — disjoint H2H + shooting efficiency")
 st.caption(
-    "v2.17.1: v2.17 team structural calibration + evidence-weighted player role-state. "
-    "Per-minute 2PA/3PA/FTA/REB/AST rates can move through time only when a walk-forward local-level "
-    "state-space model beats the static alternative; shooting skill and trader minutes remain separate."
+    "v2.17.2: player H2H is fully disjoint from adaptive role-state and uses league-learned empirical-Bayes "
+    "prior minutes instead of a universal 5% cap. Team 3P%/2P% use attempt-weighted held-out binomial "
+    "offense-vs-defense calibration; v2.17 possession/shot-allocation structure remains unchanged."
 )
 
 
@@ -72,6 +75,16 @@ def cached_opponent_elasticities(team_logs: pd.DataFrame):
 @st.cache_data(show_spinner=False)
 def cached_structural_rate_models(team_logs: pd.DataFrame):
     return fit_structural_rate_models(team_logs)
+
+
+@st.cache_data(show_spinner=False)
+def cached_shooting_efficiency_models(team_logs: pd.DataFrame):
+    return fit_shooting_efficiency_models(team_logs)
+
+
+@st.cache_data(show_spinner=False)
+def cached_player_h2h_prior_minutes(player_logs: pd.DataFrame):
+    return fit_player_h2h_prior_minutes(player_logs)
 
 
 def _render_player_deep_analysis_impl(board, detail_store, target_ev, reference_odds):
@@ -132,7 +145,11 @@ def _render_player_deep_analysis_impl(board, detail_store, target_ev, reference_
             detail["plog"]["OPP_ABBR"].astype(str).str.upper()
             == str(detail["opp_abbr"]).upper()
         ]
-        st.markdown("**H2H — tiny rotation/minute-aware opportunity layer (max 5% blend weight)**")
+        st.markdown("**H2H — disjoint empirical-Bayes opportunity layer**")
+        h2h_cal = detail.get("h2h_calibration_audit")
+        if isinstance(h2h_cal, pd.DataFrame) and not h2h_cal.empty:
+            st.caption("League-wide next-H2H predictive calibration; K is prior-equivalent player minutes. K=∞ means the stat did not earn a repeat-matchup layer.")
+            st.dataframe(h2h_cal.round(4), use_container_width=True, hide_index=True)
         h2h_audit = detail.get("h2h_audit")
         if isinstance(h2h_audit, pd.DataFrame) and not h2h_audit.empty:
             st.dataframe(h2h_audit.round(4), use_container_width=True, hide_index=True)
@@ -1055,6 +1072,19 @@ with tab_team:
             home_auto[_k] = float(home_struct.get(_k, home_auto.get(_k, 1.0)))
             away_auto[_k] = float(away_struct.get(_k, away_auto.get(_k, 1.0)))
 
+        # v2.17.2 team shooting efficiency.  Attempts/shot mix stay exactly in
+        # the v2.17 structural chain; only conditional make probabilities move.
+        shooting_models, shooting_model_audit = cached_shooting_efficiency_models(team_db)
+        home_shoot, home_shoot_audit = predict_shooting_efficiency_modifiers(
+            team_db, setup["home_abbr"], setup["away_abbr"], home_match_profile, shooting_models
+        )
+        away_shoot, away_shoot_audit = predict_shooting_efficiency_modifiers(
+            team_db, setup["away_abbr"], setup["home_abbr"], away_match_profile, shooting_models
+        )
+        for _k in ("3P_PCT", "2P_PCT"):
+            home_auto[_k] = float(home_shoot.get(_k, home_auto.get(_k, 1.0)))
+            away_auto[_k] = float(away_shoot.get(_k, away_auto.get(_k, 1.0)))
+
         # Small location correction with the current H2H opponent excluded as well.
         home_loc, home_loc_audit = team_location_modifiers(
             home_log, True, league_team_logs=team_db,
@@ -1154,11 +1184,24 @@ with tab_team:
                 st.markdown(f"**{setup['home_abbr']} current structural prediction**")
                 st.dataframe(home_struct_audit.round(4), use_container_width=True, hide_index=True)
 
+            with st.expander("v2.17.2 shooting-efficiency calibration audit", expanded=False):
+                st.caption(
+                    "3P% and 2P% are fit as Binomial makes|attempts. Own-offense and opponent-defense shrinkage masses "
+                    "plus the defensive response beta are selected from chronological data; the layer activates only if it "
+                    "beats an own-offense-only model on later held-out games. This does not change FGA or shot share."
+                )
+                if isinstance(shooting_model_audit, pd.DataFrame) and not shooting_model_audit.empty:
+                    st.dataframe(shooting_model_audit.round(4), use_container_width=True, hide_index=True)
+                st.markdown(f"**{setup['away_abbr']} current shooting prediction**")
+                st.dataframe(away_shoot_audit.round(4), use_container_width=True, hide_index=True)
+                st.markdown(f"**{setup['home_abbr']} current shooting prediction**")
+                st.dataframe(home_shoot_audit.round(4), use_container_width=True, hide_index=True)
+
             with st.expander("Opponent-elasticity calibration audit", expanded=False):
                 st.caption(
                     "Legacy audit for the remaining generic opponent layers. In v2.17 its 3P_SHARE / FTA / TOV / AST "
                     "rows are NOT used in the simulator; those four are replaced by the structural-rate model above. "
-                    "Shooting efficiency remains intentionally strongly shrunk because raw opponent FG% is noisy."
+                    "3P%/2P% rows are now audit-only as well; v2.17.2 replaces them with the held-out Binomial shooting layer."
                 )
                 if isinstance(opponent_elasticity_audit, pd.DataFrame) and not opponent_elasticity_audit.empty:
                     st.dataframe(opponent_elasticity_audit.round(4), use_container_width=True, hide_index=True)
@@ -1873,6 +1916,7 @@ with tab_player:
             ):
                 board_rows = []
                 detail_store = {}
+                player_h2h_prior_minutes, player_h2h_calibration_audit = cached_player_h2h_prior_minutes(player_db)
 
                 for pname in selected_names:
                     mr = final_minutes[
@@ -1944,7 +1988,8 @@ with tab_player:
                         )
 
                     profile,audit = build_player_profile(
-                        plog,cfg,game_weights_by_stat=role_game_weights_by_stat
+                        plog,cfg,game_weights_by_stat=role_game_weights_by_stat,
+                        exclude_opponent_abbr=opp_abbr,
                     )
 
                     player_conf_by_stat = confidence_by_stat(same_role_audit)
@@ -2003,10 +2048,9 @@ with tab_player:
                         np.clip(shared_pace / max(historical_pace, 1.0), .88, 1.12)
                     )
 
-                    # v2.16.1: restore the originally intended SMALL H2H layer.
-                    # It affects opportunity rates only (2PA/3PA/REB/AST), never
-                    # shooting percentages, and is strongly shrunk by sample,
-                    # current-rotation similarity and minute comparability.
+                    # v2.17.2: H2H opportunity evidence is disjoint from the
+                    # profile above and pooled by a league-learned empirical-Bayes
+                    # prior-minute mass.  No universal 5% cap is used.
                     _ph2h = plog[
                         plog["OPP_ABBR"].astype(str).str.upper().eq(str(opp_abbr).upper())
                     ].copy()
@@ -2016,7 +2060,8 @@ with tab_player:
                     ) if _ph2h_ids else 0.0
                     h2h_mods, player_h2h_audit = player_h2h_modifiers(
                         plog, opp_abbr, profile, float(mr["Projected Min"]),
-                        rotation_similarity=float(_ph2h_rot), max_weight=0.05,
+                        rotation_similarity=float(_ph2h_rot),
+                        prior_minutes_by_stat=player_h2h_prior_minutes,
                     )
 
                     ctx = PlayerContext(
@@ -2081,6 +2126,7 @@ with tab_player:
                         "same_role_audit":same_role_audit,
                         "availability_fallback_audit":fallback_audit,
                         "h2h_audit":player_h2h_audit,
+                        "h2h_calibration_audit":player_h2h_calibration_audit,
                         "ctx":ctx,
                         "plog":plog,
                         "opp_abbr":opp_abbr,
