@@ -4,6 +4,7 @@ from typing import Dict, Tuple, Optional
 import numpy as np
 import pandas as pd
 from core.buckets import WeightConfig, split_non_overlapping, active_weights, weighted_average_feature
+from core.player_role_state import adaptive_role_state, role_state_table
 
 
 @dataclass
@@ -145,6 +146,24 @@ def build_player_profile(
     for key, stat_key in feature_stat.items():
         feats = {k: bucket_features(k, stat_key) for k in buckets}
         profile[key] = weighted_average_feature(feats, weights, key)
+
+    # v2.17.1 adaptive player-role state.  The existing non-overlapping bucket
+    # profile remains the prior/base.  A local-level state-space model estimates
+    # whether the player's own per-minute opportunity state has moved through
+    # time.  The process variance is selected by walk-forward predictive
+    # likelihood and model-averaged against q=0, so there is no fixed L5 boost
+    # and no automatic role-change switch.  Availability-similarity weights, if
+    # present, are reused as information weights so the same OUT state is not
+    # counted twice.
+    role_state_results = []
+    for key in ("two_pa_pm", "three_pa_pm", "fta_pm", "reb_pm", "ast_pm"):
+        stat_key = feature_stat[key]
+        wm = by.get(stat_key, game_weights)
+        rs = adaptive_role_state(x, key, profile[key], game_weights=wm)
+        if np.isfinite(rs.applied_rate) and rs.applied_rate > 0:
+            profile[key] = rs.applied_rate
+        role_state_results.append(rs)
+    profile["_role_state_audit"] = role_state_table(role_state_results)
 
     # Shooting ability intentionally uses the larger unweighted sample. A same-role
     # split changes opportunities/role first; it does not declare a hot L5 as true skill.
