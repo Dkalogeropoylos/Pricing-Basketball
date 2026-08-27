@@ -6,6 +6,7 @@ LEAGUES = {
         "fallback_provider": "nba_api",
         "league_id": "10",
         "enabled": True,
+        "assist_stat_rule": "made_field_goal_only",
     },
     "NBA": {
         "code": "NBA",
@@ -14,6 +15,7 @@ LEAGUES = {
         "fallback_provider": None,
         "league_id": "00",
         "enabled": True,
+        "assist_stat_rule": "made_field_goal_only",
     },
     "EuroLeague": {
         "code": "EUROLEAGUE",
@@ -22,6 +24,7 @@ LEAGUES = {
         "fallback_provider": None,
         "competition_code": "E",
         "enabled": False,
+        "assist_stat_rule": "fiba_scoring_includes_ft_after_shooting_foul",
     },
     "EuroCup": {
         "code": "EUROCUP",
@@ -30,5 +33,6 @@ LEAGUES = {
         "fallback_provider": None,
         "competition_code": "U",
         "enabled": False,
+        "assist_stat_rule": "fiba_scoring_includes_ft_after_shooting_foul",
     },
 }
