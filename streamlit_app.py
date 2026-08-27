@@ -29,6 +29,9 @@ from core.matchup import (
     block_position_susceptibility_modifier,
     fit_opponent_elasticities,
 )
+from core.structural_calibration import (
+    fit_structural_rate_models, predict_structural_modifiers, coefficient_audit,
+)
 from core.minutes_engine import (
     project_team_minutes, rotation_regime_for_team, rotation_similarity_weights,
     residual_rotation_similarity_weights, h2h_rotation_similarity,
@@ -53,16 +56,21 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.16.1 — stabilization")
+st.title("🏀 Basketball Pricing Engine v2.17 — structural calibration")
 st.caption(
-    "v2.16 core + 2PA-position fix • tiny rotation-aware player H2H • adaptive multi-OUT rim-protection cap • "
-    "exact bookmaker-line comparison • 50k cached sims • non-overlap Old/G6–10/L5"
+    "v2.17: walk-forward learned 3P_SHARE / FTA / TOV / AST structural rates • no fixed opponent/H2H weights "
+    "for those four markets • current roster/location layers preserved • non-overlap Old/G6–10/L5"
 )
 
 
 @st.cache_data(show_spinner=False)
 def cached_opponent_elasticities(team_logs: pd.DataFrame):
     return fit_opponent_elasticities(team_logs)
+
+
+@st.cache_data(show_spinner=False)
+def cached_structural_rate_models(team_logs: pd.DataFrame):
+    return fit_structural_rate_models(team_logs)
 
 
 def _render_player_deep_analysis_impl(board, detail_store, target_ev, reference_odds):
@@ -929,13 +937,17 @@ with tab_team:
         away_h2h_sim = h2h_rotation_similarity(
             player_db, pool, setup["away_abbr"], manual_context, away_h2h_ids
         )
+        # v2.17: 3P share / FTA / TOV / AST H2H are learned jointly from
+        # historical repeat-matchup residuals, so the old fixed H2H blend is
+        # skipped for those four rates to avoid double counting.
+        _structural_h2h_skip = {"three_share", "fta_pp", "tov_pp", "assist_per_make"}
         home_profile, home_h2h_audit = h2h_profile_blend(
             team_db, setup["home_abbr"], setup["away_abbr"], home_profile,
-            rotation_similarity=home_h2h_sim,
+            rotation_similarity=home_h2h_sim, skip_features=_structural_h2h_skip,
         )
         away_profile, away_h2h_audit = h2h_profile_blend(
             team_db, setup["away_abbr"], setup["home_abbr"], away_profile,
-            rotation_similarity=away_h2h_sim,
+            rotation_similarity=away_h2h_sim, skip_features=_structural_h2h_skip,
         )
 
         # v2.12 roster-state bridge. Exact historical OUT matching remains the
@@ -1013,6 +1025,24 @@ with tab_team:
             away_opp, own_profile=away_match_profile, elasticities=opponent_elasticities
         )
 
+        # v2.17 structural layer.  These four modifiers replace the old fixed
+        # recent/opponent/H2H response for the main possession-allocation rates.
+        # Coefficients and ridge regularization are chosen from walk-forward WNBA
+        # history; the learned model activates only if it beats the existing
+        # Old/G6-10/L5 baseline out of sample.
+        structural_models, structural_model_audit = cached_structural_rate_models(team_db)
+        home_struct, home_struct_audit = predict_structural_modifiers(
+            team_db, setup["home_abbr"], setup["away_abbr"], structural_models,
+            home_cfg, h2h_rotation_similarity=home_h2h_sim,
+        )
+        away_struct, away_struct_audit = predict_structural_modifiers(
+            team_db, setup["away_abbr"], setup["home_abbr"], structural_models,
+            away_cfg, h2h_rotation_similarity=away_h2h_sim,
+        )
+        for _k in ("3P_SHARE", "FTA", "TOV", "AST"):
+            home_auto[_k] = float(home_struct.get(_k, home_auto.get(_k, 1.0)))
+            away_auto[_k] = float(away_struct.get(_k, away_auto.get(_k, 1.0)))
+
         # Small location correction with the current H2H opponent excluded as well.
         home_loc, home_loc_audit = team_location_modifiers(
             home_log, True, league_team_logs=team_db,
@@ -1029,11 +1059,15 @@ with tab_team:
             # -> CURRENT opponent defensive roster -> small location.
             return {
                 "FGA": float(np.clip(roster.get("FGA", 1.0) * auto.get("FGA", 1.0) * loc.get("FGA", 1.0), 0.90, 1.10)),
-                "3P_SHARE": float(np.clip(roster.get("3P_SHARE", 1.0) * auto.get("3P_SHARE", 1.0) * opp_def_out.get("3P_SHARE",1.0) * loc.get("3P_SHARE", 1.0), 0.84, 1.16)),
-                "FTA": float(np.clip(roster.get("FTA", 1.0) * auto.get("FTA", 1.0) * opp_def_out.get("FTA",1.0) * loc.get("FTA", 1.0), 0.80, 1.20)),
-                "TOV": float(np.clip(roster.get("TOV", 1.0) * auto.get("TOV", 1.0) * opp_def_out.get("TOV",1.0) * loc.get("TOV", 1.0), 0.82, 1.18)),
+                # v2.17: do not re-shrink the learned structural response with
+                # another hand-picked matchup cap.  Physical probability/rate
+                # bounds live inside the simulator; roster/defensive-OUT/location
+                # layers remain explicit and auditable here.
+                "3P_SHARE": float(roster.get("3P_SHARE", 1.0) * auto.get("3P_SHARE", 1.0) * opp_def_out.get("3P_SHARE",1.0) * loc.get("3P_SHARE", 1.0)),
+                "FTA": float(roster.get("FTA", 1.0) * auto.get("FTA", 1.0) * opp_def_out.get("FTA",1.0) * loc.get("FTA", 1.0)),
+                "TOV": float(roster.get("TOV", 1.0) * auto.get("TOV", 1.0) * opp_def_out.get("TOV",1.0) * loc.get("TOV", 1.0)),
                 "OREB": float(np.clip(roster.get("OREB", 1.0) * auto.get("OREB", 1.0) * opp_def_out.get("OREB",1.0) * loc.get("OREB", 1.0), 0.82, 1.18)),
-                "AST": float(np.clip(roster.get("AST", 1.0) * auto.get("AST", 1.0) * opp_def_out.get("AST",1.0) * loc.get("AST", 1.0), 0.82, 1.18)),
+                "AST": float(roster.get("AST", 1.0) * auto.get("AST", 1.0) * opp_def_out.get("AST",1.0) * loc.get("AST", 1.0)),
                 "PF": float(np.clip(roster.get("PF", 1.0) * auto.get("PF", 1.0) * loc.get("PF", 1.0), 0.84, 1.16)),
                 "DREB": float(np.clip(roster.get("DREB", 1.0) * loc.get("DREB", 1.0), 0.88, 1.12)),
                 "STL": float(np.clip(roster.get("STL", 1.0) * loc.get("STL", 1.0), 0.86, 1.14)),
@@ -1086,15 +1120,33 @@ with tab_team:
 
         with st.expander("Automatic matchup/location modifiers — optional trader override", expanded=False):
             st.caption(
-                "Leave these untouched for full AUTO. FGA and 3P_SHARE replace independent 3PA/2PA multipliers. "
-                "OREB is per miss; AST is per made FG. This keeps the main opportunity layers from being counted twice."
+                "Leave these untouched for full AUTO. v2.17 learns 3P_SHARE, FTA, TOV and AST-per-made-FG from "
+                "walk-forward WNBA history using disjoint Old/G6-10/L5 + opponent + H2H inputs. FGA remains a "
+                "possession-identity consequence. WNBA/NBA official AST are tied to made field goals; free-throw "
+                "assist credit is a FIBA/EuroLeague statistical rule and is not mixed into WNBA markets."
             )
+
+            with st.expander("v2.17 structural-rate calibration audit", expanded=False):
+                st.caption(
+                    "No fixed opponent or H2H weight is used for 3P_SHARE / FTA / TOV / AST. Ridge strength is "
+                    "chosen by expanding-window validation, and a structural model activates only when it improves "
+                    "out-of-sample RMSE versus the existing Old/G6-10/L5 baseline."
+                )
+                if isinstance(structural_model_audit, pd.DataFrame) and not structural_model_audit.empty:
+                    st.dataframe(structural_model_audit.round(4), use_container_width=True, hide_index=True)
+                _coef = coefficient_audit(structural_models)
+                if isinstance(_coef, pd.DataFrame) and not _coef.empty:
+                    st.dataframe(_coef.round(4), use_container_width=True, hide_index=True)
+                st.markdown(f"**{setup['away_abbr']} current structural prediction**")
+                st.dataframe(away_struct_audit.round(4), use_container_width=True, hide_index=True)
+                st.markdown(f"**{setup['home_abbr']} current structural prediction**")
+                st.dataframe(home_struct_audit.round(4), use_container_width=True, hide_index=True)
 
             with st.expander("Opponent-elasticity calibration audit", expanded=False):
                 st.caption(
-                    "Each beta is learned from historical pregame offense-vs-defense interactions. "
-                    "There is no universal opponent weight: the WNBA data decide stat by stat. "
-                    "Shooting efficiency is intentionally the most strongly shrunk because raw opponent FG% is noisy."
+                    "Legacy audit for the remaining generic opponent layers. In v2.17 its 3P_SHARE / FTA / TOV / AST "
+                    "rows are NOT used in the simulator; those four are replaced by the structural-rate model above. "
+                    "Shooting efficiency remains intentionally strongly shrunk because raw opponent FG% is noisy."
                 )
                 if isinstance(opponent_elasticity_audit, pd.DataFrame) and not opponent_elasticity_audit.empty:
                     st.dataframe(opponent_elasticity_audit.round(4), use_container_width=True, hide_index=True)
