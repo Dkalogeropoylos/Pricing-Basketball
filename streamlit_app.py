@@ -28,13 +28,9 @@ from core.matchup import (
     position_environment,
     block_position_susceptibility_modifier,
     fit_opponent_elasticities, fit_player_h2h_prior_minutes,
-    fit_player_h2h_residual_calibration, player_h2h_residual_history,
 )
 from core.structural_calibration import (
     fit_structural_rate_models, predict_structural_modifiers, coefficient_audit,
-)
-from core.market_prior import (
-    fit_market_margin_calibration, apply_market_margin_prior,
 )
 from core.shooting_efficiency import (
     fit_shooting_efficiency_models, predict_shooting_efficiency_modifiers,
@@ -63,13 +59,11 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.18.2 — continuous residual H2H + OT/DREB fixes")
+st.title("🏀 Basketball Pricing Engine v2.17.2 — disjoint H2H + shooting efficiency")
 st.caption(
-    "v2.18.2 consolidates the v2.18.1 OT/DREB fixes and replaces binary player-H2H activation with continuous predictive shrinkage. "
-    "Team 3P share, FTA, TOV, OREB-per-miss and AST-per-make use one disjoint own state, one opponent-allowed state, "
-    "and a residual H2H term whose opponent strength and H2H prior mass are selected chronologically. "
-    "Fixed team H2H percentage weights are removed. Optional sportsbook handicap conditioning remains numerically inactive "
-    "until a historical model-vs-market calibration file proves out-of-sample improvement."
+    "v2.17.2: player H2H is fully disjoint from adaptive role-state and uses league-learned empirical-Bayes "
+    "prior minutes instead of a universal 5% cap. Team 3P%/2P% use attempt-weighted held-out binomial "
+    "offense-vs-defense calibration; v2.17 possession/shot-allocation structure remains unchanged."
 )
 
 
@@ -90,16 +84,7 @@ def cached_shooting_efficiency_models(team_logs: pd.DataFrame):
 
 @st.cache_data(show_spinner=False)
 def cached_player_h2h_prior_minutes(player_logs: pd.DataFrame):
-    # Legacy cache retained for compatibility/debugging.
     return fit_player_h2h_prior_minutes(player_logs)
-
-
-@st.cache_data(show_spinner=False)
-def cached_player_h2h_residual_calibration(
-    player_logs: pd.DataFrame,
-    team_logs: pd.DataFrame,
-):
-    return fit_player_h2h_residual_calibration(player_logs, team_logs)
 
 
 def _render_player_deep_analysis_impl(board, detail_store, target_ev, reference_odds):
@@ -160,18 +145,14 @@ def _render_player_deep_analysis_impl(board, detail_store, target_ev, reference_
             detail["plog"]["OPP_ABBR"].astype(str).str.upper()
             == str(detail["opp_abbr"]).upper()
         ]
-        st.markdown("**H2H — residualized player×opponent layer**")
+        st.markdown("**H2H — disjoint empirical-Bayes opportunity layer**")
         h2h_cal = detail.get("h2h_calibration_audit")
         if isinstance(h2h_cal, pd.DataFrame) and not h2h_cal.empty:
-            st.caption("League-wide chronological calibration. K is prior expected-event mass for a residual multiplier centered at 1; tau is the learned minute-relevance decay. The later holdout supplies a continuous predictive H2H model weight instead of a binary ON/OFF gate; tau=∞ means no minute-distance penalty.")
+            st.caption("League-wide next-H2H predictive calibration; K is prior-equivalent player minutes. K=∞ means the stat did not earn a repeat-matchup layer.")
             st.dataframe(h2h_cal.round(4), use_container_width=True, hide_index=True)
         h2h_audit = detail.get("h2h_audit")
         if isinstance(h2h_audit, pd.DataFrame) and not h2h_audit.empty:
             st.dataframe(h2h_audit.round(4), use_container_width=True, hide_index=True)
-        h2h_hist = detail.get("h2h_residual_history")
-        if isinstance(h2h_hist, pd.DataFrame) and not h2h_hist.empty:
-            st.caption("Historical H2H no-H2H expectations used for residualization (pregame-only, leave-pair-out opponent context).")
-            st.dataframe(h2h_hist.round(4), use_container_width=True, hide_index=True)
         if h2h.empty:
             st.caption("No same-season H2H.")
         else:
@@ -564,54 +545,30 @@ with tab_game:
         shared = current_game_pace()
         st.success(f"Shared game possessions used by models: **{shared:.2f}**")
 
-        with st.expander("Market total / handicap — calibrated prior + audit"):
+        with st.expander("Market total / handicap — audit only"):
             st.caption(
-                "The sportsbook line is treated as a second forecast, never as truth. Market total remains an audit. "
-                "Home handicap can condition the joint simulation ONLY when a historical calibration CSV shows that a "
-                "model+market convex combination improves a later chronological holdout. Without that file, market weight = 0."
+                "These are NOT fed into pace or projections in v2.6. "
+                "Using the sportsbook total to create the same team projections "
+                "would be circular. Spread/total remain external cross-checks until "
+                "we calibrate a separate market-prior/blowout layer."
             )
-            c0,c1,c2 = st.columns([0.7,1,1])
-            c0.toggle("Handicap available", value=False, key="market_spread_available")
+            c1,c2 = st.columns(2)
             c1.number_input(
-                "Market total (audit only)",
-                min_value=0.0, max_value=250.0, value=0.0, step=0.5, key="market_total_audit",
+                "Market total (optional)",
+                min_value=0.0,
+                max_value=250.0,
+                value=0.0,
+                step=0.5,
+                key="market_total_audit",
             )
             c2.number_input(
-                "Home handicap / spread",
-                min_value=-40.0, max_value=40.0, value=0.0, step=0.5, key="market_spread_audit",
-                help="Sportsbook convention: home -12.5 means expected home margin +12.5.",
+                "Home handicap (optional)",
+                min_value=-40.0,
+                max_value=40.0,
+                value=0.0,
+                step=0.5,
+                key="market_spread_audit",
             )
-            market_hist = st.file_uploader(
-                "Historical handicap calibration CSV (optional)", type=["csv"], key="market_margin_history_csv",
-                help=(
-                    "Required: MODEL_HOME_MARGIN, MARKET_HOME_SPREAD, ACTUAL_HOME_MARGIN. "
-                    "Optional GAME_DATE. The first 70% fits the convex market weight; the later 30% decides whether it activates."
-                ),
-            )
-            _market_cal = None
-            if market_hist is not None:
-                try:
-                    _mh = pd.read_csv(market_hist)
-                    _mh.columns = [str(c).strip().upper() for c in _mh.columns]
-                    _market_cal = fit_market_margin_calibration(_mh)
-                    st.session_state["_market_margin_calibration"] = _market_cal
-                except Exception as _e:
-                    st.warning(f"Could not read market calibration CSV: {_e}")
-                    st.session_state.pop("_market_margin_calibration", None)
-            else:
-                _market_cal = st.session_state.get("_market_margin_calibration")
-            if _market_cal is not None:
-                st.dataframe(pd.DataFrame([{
-                    "Active": _market_cal.active,
-                    "Learned market weight": _market_cal.weight,
-                    "Rows": _market_cal.rows,
-                    "Train rows": _market_cal.train_rows,
-                    "Later holdout rows": _market_cal.holdout_rows,
-                    "Model holdout RMSE": _market_cal.model_holdout_rmse,
-                    "Combined holdout RMSE": _market_cal.combined_holdout_rmse,
-                    "Market holdout RMSE": _market_cal.market_holdout_rmse,
-                    "Reason": _market_cal.reason,
-                }]).round(4), use_container_width=True, hide_index=True)
 
     # ---------------------------------------------------------------
     # SHARED CONFIRMED-OUT STATE — single source of truth for BOTH
@@ -1009,14 +966,10 @@ with tab_team:
         away_h2h_sim = h2h_rotation_similarity(
             player_db, pool, setup["away_abbr"], manual_context, away_h2h_ids
         )
-        # v2.18: fixed percentage H2H weights are removed from Team Markets.
-        # 3P share / FTA / TOV / OREB / DREB-capture / AST can receive H2H only through the
-        # chronologically validated RESIDUAL layer. For unsupported rates H2H is
-        # audit-only until a residual model proves predictive value.
-        _structural_h2h_skip = {
-            "fga_live", "three_share", "fta_pp", "tov_pp", "oreb_per_miss",
-            "assist_per_make", "pf_pp", "dreb_capture", "stl_per_opp_tov", "blk_rate_pp",
-        }
+        # v2.17: 3P share / FTA / TOV / AST H2H are learned jointly from
+        # historical repeat-matchup residuals, so the old fixed H2H blend is
+        # skipped for those four rates to avoid double counting.
+        _structural_h2h_skip = {"three_share", "fta_pp", "tov_pp", "assist_per_make"}
         home_profile, home_h2h_audit = h2h_profile_blend(
             team_db, setup["home_abbr"], setup["away_abbr"], home_profile,
             rotation_similarity=home_h2h_sim, skip_features=_structural_h2h_skip,
@@ -1101,10 +1054,11 @@ with tab_team:
             away_opp, own_profile=away_match_profile, elasticities=opponent_elasticities
         )
 
-        # v2.18.1 structural layer. One own state + one opponent-allowed state
-        # + a repeat-matchup RESIDUAL. Opponent beta and H2H prior K are chosen
-        # on earlier chronological blocks; activation requires improvement on a
-        # genuinely later holdout and no degradation in extreme-opponent games.
+        # v2.17 structural layer.  These four modifiers replace the old fixed
+        # recent/opponent/H2H response for the main possession-allocation rates.
+        # Coefficients and ridge regularization are chosen from walk-forward WNBA
+        # history; the learned model activates only if it beats the existing
+        # Old/G6-10/L5 baseline out of sample.
         structural_models, structural_model_audit = cached_structural_rate_models(team_db)
         home_struct, home_struct_audit = predict_structural_modifiers(
             team_db, setup["home_abbr"], setup["away_abbr"], structural_models,
@@ -1114,12 +1068,7 @@ with tab_team:
             team_db, setup["away_abbr"], setup["home_abbr"], structural_models,
             away_cfg, h2h_rotation_similarity=away_h2h_sim,
         )
-        # FGA is now a possession-identity consequence, not a second generic
-        # opponent multiplier. Remaining shot-volume response comes through
-        # TOV / FTA / OREB and the shared pace state.
-        home_auto["FGA"] = 1.0
-        away_auto["FGA"] = 1.0
-        for _k in ("3P_SHARE", "FTA", "TOV", "OREB", "DREB", "AST"):
+        for _k in ("3P_SHARE", "FTA", "TOV", "AST"):
             home_auto[_k] = float(home_struct.get(_k, home_auto.get(_k, 1.0)))
             away_auto[_k] = float(away_struct.get(_k, away_auto.get(_k, 1.0)))
 
@@ -1162,7 +1111,7 @@ with tab_team:
                 "OREB": float(np.clip(roster.get("OREB", 1.0) * auto.get("OREB", 1.0) * opp_def_out.get("OREB",1.0) * loc.get("OREB", 1.0), 0.82, 1.18)),
                 "AST": float(roster.get("AST", 1.0) * auto.get("AST", 1.0) * opp_def_out.get("AST",1.0) * loc.get("AST", 1.0)),
                 "PF": float(np.clip(roster.get("PF", 1.0) * auto.get("PF", 1.0) * loc.get("PF", 1.0), 0.84, 1.16)),
-                "DREB": float(np.clip(roster.get("DREB", 1.0) * loc.get("DREB", 1.0), 0.88, 1.12)),
+                "DREB": float(np.clip(roster.get("DREB", 1.0) * auto.get("DREB", 1.0) * loc.get("DREB", 1.0), 0.88, 1.12)),
                 "STL": float(np.clip(roster.get("STL", 1.0) * loc.get("STL", 1.0), 0.86, 1.14)),
                 "BLK": float(np.clip(roster.get("BLK", 1.0) * auto.get("BLK", 1.0) * loc.get("BLK", 1.0), 0.82, 1.18)),
                 "3P_PCT": float(np.clip(roster.get("3P_PCT", 1.0) * auto.get("3P_PCT", 1.0) * opp_def_out.get("3P_PCT",1.0) * loc.get("3P_PCT", 1.0), 0.92, 1.08)),
@@ -1213,17 +1162,17 @@ with tab_team:
 
         with st.expander("Automatic matchup/location modifiers — optional trader override", expanded=False):
             st.caption(
-                "Leave these untouched for full AUTO. v2.18 learns opponent response for 3P_SHARE, FTA, TOV, "
-                "OREB-per-miss, DREB-capture and AST-per-made-FG from a single disjoint own state + opponent-allowed state. "
-                "FGA is a possession-identity consequence. H2H can act only as a shrunk residual over that no-H2H expectation."
+                "Leave these untouched for full AUTO. v2.17 learns 3P_SHARE, FTA, TOV and AST-per-made-FG from "
+                "walk-forward WNBA history using disjoint Old/G6-10/L5 + opponent + H2H inputs. FGA remains a "
+                "possession-identity consequence. WNBA/NBA official AST are tied to made field goals; free-throw "
+                "assist credit is a FIBA/EuroLeague statistical rule and is not mixed into WNBA markets."
             )
 
-            with st.expander("v2.18 structural-rate + H2H calibration audit", expanded=False):
+            with st.expander("v2.17 structural-rate calibration audit", expanded=False):
                 st.caption(
-                    "Opponent beta is constrained non-negative and selected chronologically; beta=0 is allowed. "
-                    "H2H prior K is selected from repeat-matchup residuals and K=∞ disables H2H. Activation requires "
-                    "better later-holdout RMSE and no deterioration on extreme opponent contexts. The current tables show "
-                    "the prediction with and without H2H plus the raw-unit H2H delta."
+                    "No fixed opponent or H2H weight is used for 3P_SHARE / FTA / TOV / AST. Ridge strength is "
+                    "chosen by expanding-window validation, and a structural model activates only when it improves "
+                    "out-of-sample RMSE versus the existing Old/G6-10/L5 baseline."
                 )
                 if isinstance(structural_model_audit, pd.DataFrame) and not structural_model_audit.empty:
                     st.dataframe(structural_model_audit.round(4), use_container_width=True, hide_index=True)
@@ -1250,10 +1199,9 @@ with tab_team:
 
             with st.expander("Opponent-elasticity calibration audit", expanded=False):
                 st.caption(
-                    "Legacy audit for the remaining generic opponent layers. In v2.18 its FGA / 3P_SHARE / FTA / TOV / "
-                    "OREB / AST rows are NOT used as generic matchup multipliers: FGA is identity-derived and the other five "
-                    "come from the structural state model above. 3P%/2P% remain audit-only because v2.17.2 uses the held-out "
-                    "Binomial shooting layer."
+                    "Legacy audit for the remaining generic opponent layers. In v2.17 its 3P_SHARE / FTA / TOV / AST "
+                    "rows are NOT used in the simulator; those four are replaced by the structural-rate model above. "
+                    "3P%/2P% rows are now audit-only as well; v2.17.2 replaces them with the held-out Binomial shooting layer."
                 )
                 if isinstance(opponent_elasticity_audit, pd.DataFrame) and not opponent_elasticity_audit.empty:
                     st.dataframe(opponent_elasticity_audit.round(4), use_container_width=True, hide_index=True)
@@ -1314,11 +1262,6 @@ with tab_team:
         home_ctx = make_ctx(home_mod, home_blk_pos)
         away_ctx = make_ctx(away_mod, away_blk_pos)
 
-        _market_cal = st.session_state.get("_market_margin_calibration")
-        _market_spread_on = bool(st.session_state.get("market_spread_available", False))
-        _market_spread = float(st.session_state.get("market_spread_audit", 0.0)) if _market_spread_on else None
-        _market_weight = float(_market_cal.weight) if (_market_cal is not None and _market_cal.active) else 0.0
-
         fingerprint = (
             setup["home_abbr"], setup["away_abbr"], float(shared_pace),
             float(poss_sd), home_regime, away_regime, bool(rotation_similarity_enabled),
@@ -1332,7 +1275,6 @@ with tab_team:
             round(home_blk_pos, 4), round(away_blk_pos, 4),
             tuple(round(home_mod[k], 4) for k in sorted(home_mod)),
             tuple(round(away_mod[k], 4) for k in sorted(away_mod)),
-            _market_spread_on, None if _market_spread is None else round(_market_spread, 3), round(_market_weight, 6),
             int(n),
         )
 
@@ -1352,24 +1294,11 @@ with tab_team:
                 home_profile, away_profile, home_ctx, away_ctx,
                 sn, seed=803, opportunity_mult=high_mult,
             )
-
-            # Optional forecast-combination prior. With no validated history,
-            # calibration weight is exactly zero and these calls are no-ops.
-            home_sim, away_sim, market_prior_audit = apply_market_margin_prior(
-                home_sim, away_sim, _market_spread, _market_cal, seed=1818,
-            )
-            home_low, away_low, _ = apply_market_margin_prior(
-                home_low, away_low, _market_spread, _market_cal, seed=1819,
-            )
-            home_high, away_high, _ = apply_market_margin_prior(
-                home_high, away_high, _market_spread, _market_cal, seed=1820,
-            )
             st.session_state["team_game_sim"] = {
                 "fingerprint": fingerprint,
                 "home": home_sim, "away": away_sim,
                 "home_low": home_low, "away_low": away_low,
                 "home_high": home_high, "away_high": away_high,
-                "market_prior_audit": market_prior_audit,
             }
 
         pack = st.session_state.get("team_game_sim")
@@ -1380,26 +1309,6 @@ with tab_team:
             away_low = pack["away_low"]
             home_high = pack["home_high"]
             away_high = pack["away_high"]
-
-            _mpa = pack.get("market_prior_audit") or {}
-            if _market_spread_on:
-                with st.expander("Market handicap prior audit", expanded=False):
-                    st.caption(
-                        "The handicap never receives a hand-picked weight. If historical calibration is inactive, the current spread "
-                        "has zero numerical effect. When active, exponential tilting reweights whole coherent simulation rows, preserving "
-                        "joint stat relationships rather than editing team stats independently."
-                    )
-                    st.dataframe(pd.DataFrame([{
-                        "Prior active": _mpa.get("active", False),
-                        "Learned market weight": _mpa.get("calibration_weight", 0.0),
-                        "Model home margin before": _mpa.get("model_margin_before", np.nan),
-                        "Market implied home margin": _mpa.get("market_margin", np.nan),
-                        "Blended target margin": _mpa.get("target_blended_margin", np.nan),
-                        "Home margin after": _mpa.get("margin_after", np.nan),
-                        "Game total before": _mpa.get("total_before", np.nan),
-                        "Game total after": _mpa.get("total_after", np.nan),
-                        "Reason": _mpa.get("reason", "inactive"),
-                    }]).round(4), use_container_width=True, hide_index=True)
 
             markets = [
                 "PTS","FGA","FGM","3PA","3PM","2PA","2PM",
@@ -1554,7 +1463,6 @@ with tab_team:
             st.caption("No bookmaker input is required for pricing. The upload above is comparison-only and never feeds back into the model.")
 
             with st.expander("Model audit: buckets / location / H2H / conservation"):
-                st.caption("v2.18.1: pace/count exposure from OT games is converted to a 40-minute regulation equivalent. Opportunity rates (3P share, TOV/POSS, OREB/miss, DREB/chance) remain rate-based rather than mechanically scaled.")
                 st.markdown("**Possession identity audit**")
                 _poss_rows = []
                 for _abbr, _sim in [(setup["away_abbr"], away_sim), (setup["home_abbr"], home_sim)]:
@@ -1877,7 +1785,7 @@ with tab_player:
             ][[
                 "Team","Player","Status","Auto Baseline Min",
                 "Projected Min","Override Delta","Low Min",
-                "High Min","Minutes SD","Minutes SD Method","Source","Starter P",
+                "High Min","Minutes SD","Source","Starter P",
                 "Rotation Similarity","Regime"
             ]].copy()
 
@@ -1897,16 +1805,14 @@ with tab_player:
             with st.expander("Full rotation minute audit"):
                 st.caption(
                     "Each team is constrained to 200 regulation minutes. "
-                    "OUT/trader/metadata minutes are fixed first; AUTO minutes absorb the remaining allocation. "
-                    "Monte-Carlo minute SD is uncertainty around the central estimate, not a downward penalty; "
-                    "TRADER/METADATA overrides keep the historical role-conditioned SD instead of using a 2.25 cap."
+                    "OUT/trader/metadata minutes are fixed first; AUTO minutes "
+                    "absorb the remaining allocation."
                 )
                 minute_cols = [c for c in [
                     "Team","Player","Status","In Active Rotation",
                     "DNP-aware L5 Min","DNP-aware L10 Min",
                     "Healthy Baseline Min","Auto Baseline Min","OUT Replacement Delta",
-                    "Projected Min","Override Delta","Low Min","High Min",
-                    "Minutes SD","Minutes SD Method","Source","Regime"
+                    "Projected Min","Override Delta","Low Min","High Min","Source","Regime"
                 ] if c in final_minutes.columns]
                 st.dataframe(
                     final_minutes[minute_cols].round(2),
@@ -2010,9 +1916,7 @@ with tab_player:
             ):
                 board_rows = []
                 detail_store = {}
-                player_h2h_residual_calibration, player_h2h_calibration_audit = cached_player_h2h_residual_calibration(
-                    player_db, team_db
-                )
+                player_h2h_prior_minutes, player_h2h_calibration_audit = cached_player_h2h_prior_minutes(player_db)
 
                 for pname in selected_names:
                     mr = final_minutes[
@@ -2033,8 +1937,10 @@ with tab_player:
 
                     if team_abbr == setup["away_abbr"]:
                         opp_abbr = setup["home_abbr"]
+                        overall_profile = st.session_state["opp_profile_home"]
                     else:
                         opp_abbr = setup["away_abbr"]
+                        overall_profile = st.session_state["opp_profile_away"]
 
                     plog = clean_player_log(
                         player_db[player_db["PLAYER_ID"] == pid].copy()
@@ -2125,22 +2031,14 @@ with tab_player:
                                 **{f"Applied {k}": v for k, v in fallback.items()},
                             }])
 
-                    # v2.17.3 generic opponent context is leave-pair-out for
-                    # Player Props. The focal team is removed from both the
-                    # opponent-overall and opponent-by-position samples; those
-                    # games are reserved for the explicit H2H residual layer.
-                    overall_profile_player = opponent_allowed_profile(
-                        team_db, opp_abbr, exclude_team_abbr=team_abbr
-                    )
                     pos_group = prow.get("POSITION_GROUP")
                     pvo,plg = {},{}
                     if pos_group:
                         pvo,plg = position_environment(
-                            player_db, opp_abbr, pos_group,
-                            exclude_team_abbr=team_abbr,
+                            player_db,opp_abbr,pos_group
                         )
                     matchup_mods, matchup_audit = player_matchup_modifiers(
-                        overall_profile_player,pvo,plg
+                        overall_profile,pvo,plg
                     )
 
                     historical_pace = player_historical_pace_environment(
@@ -2150,11 +2048,9 @@ with tab_player:
                         np.clip(shared_pace / max(historical_pace, 1.0), .88, 1.12)
                     )
 
-                    # v2.17.3: H2H is not a second generic matchup boost.
-                    # Each old H2H is first compared with the no-H2H expectation
-                    # that existed before that game (player non-pair rate ×
-                    # leave-pair-out opponent context). Only the residual is
-                    # partial-pooled and applied today.
+                    # v2.17.2: H2H opportunity evidence is disjoint from the
+                    # profile above and pooled by a league-learned empirical-Bayes
+                    # prior-minute mass.  No universal 5% cap is used.
                     _ph2h = plog[
                         plog["OPP_ABBR"].astype(str).str.upper().eq(str(opp_abbr).upper())
                     ].copy()
@@ -2162,15 +2058,10 @@ with tab_player:
                     _ph2h_rot = h2h_rotation_similarity(
                         player_db, pool, team_abbr, manual_context, _ph2h_ids
                     ) if _ph2h_ids else 0.0
-                    _ph2h_residual_history = player_h2h_residual_history(
-                        player_db, team_db, pid, team_abbr, opp_abbr, pos_group
-                    )
                     h2h_mods, player_h2h_audit = player_h2h_modifiers(
                         plog, opp_abbr, profile, float(mr["Projected Min"]),
                         rotation_similarity=float(_ph2h_rot),
-                        residual_history=_ph2h_residual_history,
-                        residual_calibration_by_stat=player_h2h_residual_calibration,
-                        current_opponent_modifiers=matchup_mods,
+                        prior_minutes_by_stat=player_h2h_prior_minutes,
                     )
 
                     ctx = PlayerContext(
@@ -2196,7 +2087,6 @@ with tab_player:
                         fta_role=float(role.get("fta_role",1.0)) * fallback["fta_role"],
                         h2h_2pa=float(h2h_mods.get("2PA",1.0)),
                         h2h_3pa=float(h2h_mods.get("3PA",1.0)),
-                        h2h_fta=float(h2h_mods.get("FTA",1.0)),
                         h2h_reb=float(h2h_mods.get("REB",1.0)),
                         h2h_ast=float(h2h_mods.get("AST",1.0)),
                     )
@@ -2237,7 +2127,6 @@ with tab_player:
                         "availability_fallback_audit":fallback_audit,
                         "h2h_audit":player_h2h_audit,
                         "h2h_calibration_audit":player_h2h_calibration_audit,
-                        "h2h_residual_history":_ph2h_residual_history,
                         "ctx":ctx,
                         "plog":plog,
                         "opp_abbr":opp_abbr,
@@ -2290,7 +2179,7 @@ with tab_audit:
 - A 200-minute roster counterfactual supplies only residual fallback, fading separately by stat as near-state confidence rises.
 - Shared projected-minute restrictions/returns are current-state information and affect BOTH team markets and player props.
 - Residual Jaccard removes those selected OUT names first and is only 0.85–1.00, so the same absence is not counted twice.
-- Same-season H2H rows are removed from baseline buckets/opponent profiles. Team structural stats (including DREB capture) use residual H2H; player opportunity H2H (2PA/3PA/FTA/REB/AST) is residualized and continuously shrunk rather than hard-switched off.
+- Same-season H2H rows are removed from baseline buckets, opponent-allowed profiles and location splits before H2H is added back once with a small rotation-aware weight.
 - Team shot generation is conditional: possessions → TOV → FGA → 3P share → 3PA/2PA. Independent 3PA/2PA Poisson draws are gone.
 - 3P share uses offense style plus the opponent's deviation from league in logit space; extreme shot-profile defenses can now move share materially without replacing offensive identity.
 - FTA/poss uses offense/defense log-rate blending, so foul-suppressing defenses can meaningfully pull down a high-FTA offense.
@@ -2309,9 +2198,9 @@ with tab_audit:
 - One shared Confirmed OUT selector in Game Setup feeds BOTH Team Markets and Player Props.
 - Player Props use stat-specific exact/near absence-state partial pooling for per-minute rates. Pre-roster non-appearances are mismatches, never fake OUT games.
 - Vacated opportunities are routed through the learned teammate replacement matrix, so guard creation does not become a generic frontcourt boost; residual fallback shrinks separately for FGA/3PA/FTA/AST/REB.
-- Pace control is fitted from completed WNBA games with a mild ridge prior; OT possessions are converted to a 40-minute regulation equivalent before pace fitting.
+- Pace control is fitted from completed WNBA games with a mild ridge prior.
 - The exact same projected possessions feed Team Markets and Player Props.
-- Market total remains audit-only; handicap conditioning activates only when historical holdout calibration proves a forecast-combination gain.
+- Market total/handicap remain audit-only.
     """)
 
     setup = st.session_state.get("game_setup")
