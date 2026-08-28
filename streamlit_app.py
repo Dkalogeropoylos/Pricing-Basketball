@@ -63,9 +63,9 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.18.0 — calibrated opponent state + residual H2H")
+st.title("🏀 Basketball Pricing Engine v2.18.2 — continuous residual H2H + OT/DREB fixes")
 st.caption(
-    "v2.18.0 bundles the v2.17.3 player residual-H2H/conditional-minutes patch with a new Team-Market state model. "
+    "v2.18.2 consolidates the v2.18.1 OT/DREB fixes and replaces binary player-H2H activation with continuous predictive shrinkage. "
     "Team 3P share, FTA, TOV, OREB-per-miss and AST-per-make use one disjoint own state, one opponent-allowed state, "
     "and a residual H2H term whose opponent strength and H2H prior mass are selected chronologically. "
     "Fixed team H2H percentage weights are removed. Optional sportsbook handicap conditioning remains numerically inactive "
@@ -163,7 +163,7 @@ def _render_player_deep_analysis_impl(board, detail_store, target_ev, reference_
         st.markdown("**H2H — residualized player×opponent layer**")
         h2h_cal = detail.get("h2h_calibration_audit")
         if isinstance(h2h_cal, pd.DataFrame) and not h2h_cal.empty:
-            st.caption("League-wide chronological calibration. K is prior expected-event mass for a residual multiplier centered at 1; tau is the learned minute-relevance decay. K=∞ disables H2H and tau=∞ means no minute-distance penalty.")
+            st.caption("League-wide chronological calibration. K is prior expected-event mass for a residual multiplier centered at 1; tau is the learned minute-relevance decay. The later holdout supplies a continuous predictive H2H model weight instead of a binary ON/OFF gate; tau=∞ means no minute-distance penalty.")
             st.dataframe(h2h_cal.round(4), use_container_width=True, hide_index=True)
         h2h_audit = detail.get("h2h_audit")
         if isinstance(h2h_audit, pd.DataFrame) and not h2h_audit.empty:
@@ -1010,7 +1010,7 @@ with tab_team:
             player_db, pool, setup["away_abbr"], manual_context, away_h2h_ids
         )
         # v2.18: fixed percentage H2H weights are removed from Team Markets.
-        # 3P share / FTA / TOV / OREB / AST can receive H2H only through the
+        # 3P share / FTA / TOV / OREB / DREB-capture / AST can receive H2H only through the
         # chronologically validated RESIDUAL layer. For unsupported rates H2H is
         # audit-only until a residual model proves predictive value.
         _structural_h2h_skip = {
@@ -1101,7 +1101,7 @@ with tab_team:
             away_opp, own_profile=away_match_profile, elasticities=opponent_elasticities
         )
 
-        # v2.18 structural layer. One own state + one opponent-allowed state
+        # v2.18.1 structural layer. One own state + one opponent-allowed state
         # + a repeat-matchup RESIDUAL. Opponent beta and H2H prior K are chosen
         # on earlier chronological blocks; activation requires improvement on a
         # genuinely later holdout and no degradation in extreme-opponent games.
@@ -1119,7 +1119,7 @@ with tab_team:
         # TOV / FTA / OREB and the shared pace state.
         home_auto["FGA"] = 1.0
         away_auto["FGA"] = 1.0
-        for _k in ("3P_SHARE", "FTA", "TOV", "OREB", "AST"):
+        for _k in ("3P_SHARE", "FTA", "TOV", "OREB", "DREB", "AST"):
             home_auto[_k] = float(home_struct.get(_k, home_auto.get(_k, 1.0)))
             away_auto[_k] = float(away_struct.get(_k, away_auto.get(_k, 1.0)))
 
@@ -1214,7 +1214,7 @@ with tab_team:
         with st.expander("Automatic matchup/location modifiers — optional trader override", expanded=False):
             st.caption(
                 "Leave these untouched for full AUTO. v2.18 learns opponent response for 3P_SHARE, FTA, TOV, "
-                "OREB-per-miss and AST-per-made-FG from a single disjoint own state + opponent-allowed state. "
+                "OREB-per-miss, DREB-capture and AST-per-made-FG from a single disjoint own state + opponent-allowed state. "
                 "FGA is a possession-identity consequence. H2H can act only as a shrunk residual over that no-H2H expectation."
             )
 
@@ -1554,6 +1554,7 @@ with tab_team:
             st.caption("No bookmaker input is required for pricing. The upload above is comparison-only and never feeds back into the model.")
 
             with st.expander("Model audit: buckets / location / H2H / conservation"):
+                st.caption("v2.18.1: pace/count exposure from OT games is converted to a 40-minute regulation equivalent. Opportunity rates (3P share, TOV/POSS, OREB/miss, DREB/chance) remain rate-based rather than mechanically scaled.")
                 st.markdown("**Possession identity audit**")
                 _poss_rows = []
                 for _abbr, _sim in [(setup["away_abbr"], away_sim), (setup["home_abbr"], home_sim)]:
@@ -2195,6 +2196,7 @@ with tab_player:
                         fta_role=float(role.get("fta_role",1.0)) * fallback["fta_role"],
                         h2h_2pa=float(h2h_mods.get("2PA",1.0)),
                         h2h_3pa=float(h2h_mods.get("3PA",1.0)),
+                        h2h_fta=float(h2h_mods.get("FTA",1.0)),
                         h2h_reb=float(h2h_mods.get("REB",1.0)),
                         h2h_ast=float(h2h_mods.get("AST",1.0)),
                     )
@@ -2288,7 +2290,7 @@ with tab_audit:
 - A 200-minute roster counterfactual supplies only residual fallback, fading separately by stat as near-state confidence rises.
 - Shared projected-minute restrictions/returns are current-state information and affect BOTH team markets and player props.
 - Residual Jaccard removes those selected OUT names first and is only 0.85–1.00, so the same absence is not counted twice.
-- Same-season H2H rows are removed from baseline buckets, opponent-allowed profiles and location splits before H2H is added back once with a small rotation-aware weight.
+- Same-season H2H rows are removed from baseline buckets/opponent profiles. Team structural stats (including DREB capture) use residual H2H; player opportunity H2H (2PA/3PA/FTA/REB/AST) is residualized and continuously shrunk rather than hard-switched off.
 - Team shot generation is conditional: possessions → TOV → FGA → 3P share → 3PA/2PA. Independent 3PA/2PA Poisson draws are gone.
 - 3P share uses offense style plus the opponent's deviation from league in logit space; extreme shot-profile defenses can now move share materially without replacing offensive identity.
 - FTA/poss uses offense/defense log-rate blending, so foul-suppressing defenses can meaningfully pull down a high-FTA offense.
@@ -2307,9 +2309,9 @@ with tab_audit:
 - One shared Confirmed OUT selector in Game Setup feeds BOTH Team Markets and Player Props.
 - Player Props use stat-specific exact/near absence-state partial pooling for per-minute rates. Pre-roster non-appearances are mismatches, never fake OUT games.
 - Vacated opportunities are routed through the learned teammate replacement matrix, so guard creation does not become a generic frontcourt boost; residual fallback shrinks separately for FGA/3PA/FTA/AST/REB.
-- Pace control is fitted from completed WNBA games with a mild ridge prior.
+- Pace control is fitted from completed WNBA games with a mild ridge prior; OT possessions are converted to a 40-minute regulation equivalent before pace fitting.
 - The exact same projected possessions feed Team Markets and Player Props.
-- Market total/handicap remain audit-only.
+- Market total remains audit-only; handicap conditioning activates only when historical holdout calibration proves a forecast-combination gain.
     """)
 
     setup = st.session_state.get("game_setup")
