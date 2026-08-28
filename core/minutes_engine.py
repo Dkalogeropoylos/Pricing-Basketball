@@ -5,6 +5,8 @@ from typing import Dict, Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from core.exposure import regulation_equivalent_minutes_row
+
 from core.buckets import WeightConfig, split_non_overlapping, active_weights
 from core.redistribution import learn_redistribution_matrix, apply_role_aware_overrides, apply_confirmed_outs
 
@@ -193,10 +195,9 @@ def _weighted_bucket_minutes(
             historical_starter = _truthy_starter(row["STARTER"])
             w *= 1.10 if historical_starter == today_starter else 0.88
 
-        # OT and large blowouts can distort minutes without representing normal
-        # rotation expectations. Downweight rather than delete.
-        if bool(row.get("OT_FLAG", False)):
-            w *= 0.78
+        # OT adds schedule exposure rather than evidence that the normal 40-minute
+        # rotation itself expanded. Normalize historical minutes to a regulation
+        # equivalent instead of applying a fixed arbitrary OT weight penalty.
 
         margin = abs(_team_game_margin(team_db, gid, team_abbr))
         if margin >= 20:
@@ -204,7 +205,9 @@ def _weighted_bucket_minutes(
         elif margin >= 15:
             w *= 0.92
 
-        m = float(row["MIN"])
+        m = float(regulation_equivalent_minutes_row(row))
+        if not np.isfinite(m):
+            continue
         vals.append(m)
         weights.append(max(w, 0.05))
         sims.append(sim)

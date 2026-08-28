@@ -6,6 +6,8 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from core.exposure import regulation_equivalent_factor
+
 from core.buckets import (
     WeightConfig,
     split_non_overlapping,
@@ -124,6 +126,8 @@ def _feat(
     x = df.copy()
     w = _row_weights(x, game_weights)
     poss_rows = estimate_possessions(x).to_numpy(dtype=float)
+    reg_factor = regulation_equivalent_factor(x).to_numpy(dtype=float)
+    poss_rows_reg = poss_rows * reg_factor
     poss = float(np.sum(poss_rows * w))
 
     fga = _weighted_sum(x["FGA"], w)
@@ -143,7 +147,12 @@ def _feat(
     out = {
         "games": int(len(x)),
         "effective_games": float(np.sum(w)),
-        "poss_pg": float(np.average(poss_rows, weights=w)) if len(w) else np.nan,
+        # Pace/count exposure is regulation-equivalent; event rates below keep
+        # their natural raw opportunity denominators.
+        "poss_pg": float(np.average(poss_rows_reg, weights=w)) if len(w) else np.nan,
+        "poss_pg_raw": float(np.average(poss_rows, weights=w)) if len(w) else np.nan,
+        "ot_games": int(np.sum(reg_factor < 0.999999)),
+        "reg_eq_factor_mean": float(np.average(reg_factor, weights=w)) if len(w) else 1.0,
         "three_pa_pp": _safe_div(a3, poss),
         "two_pa_pp": _safe_div(a2, poss),
         "three_pa_live": _safe_div(a3, live_poss),
@@ -537,7 +546,7 @@ def h2h_team_audit(
         return pd.DataFrame()
     cols = [
         c for c in [
-            "GAME_DATE", "GAME_ID", "TEAM_ABBR", "OPP_ABBR", "PTS", "FGA",
+            "GAME_DATE", "GAME_ID", "TEAM_ABBR", "OPP_ABBR", "OT_FLAG", "OT_COUNT", "GAME_LENGTH_MIN", "PTS", "FGA",
             "FG3A", "FG3M", "FTA", "FTM", "OREB", "DREB", "REB", "AST",
             "STL", "BLK", "TOV", "PF",
         ] if c in h.columns

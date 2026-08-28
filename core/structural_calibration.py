@@ -35,7 +35,7 @@ import pandas as pd
 from core.buckets import WeightConfig, split_non_overlapping, active_weights
 
 
-FEATURES = ("3P_SHARE", "FTA", "TOV", "OREB_PER_MISS", "AST_PER_MAKE")
+FEATURES = ("3P_SHARE", "FTA", "TOV", "OREB_PER_MISS", "DREB_CAPTURE", "AST_PER_MAKE")
 
 
 @dataclass
@@ -87,7 +87,7 @@ def _estimate_possessions(df: pd.DataFrame) -> pd.Series:
 
 def _single_game_features(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
-    for c in ["FGA", "FGM", "FG3A", "FTA", "TOV", "AST", "OREB"]:
+    for c in ["FGA", "FGM", "FG3A", "FTA", "TOV", "AST", "OREB", "DREB"]:
         x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
     poss = _estimate_possessions(x).clip(lower=1e-6)
     misses = (x["FGA"] - x["FGM"]).clip(lower=1e-6)
@@ -103,11 +103,41 @@ def _single_game_features(df: pd.DataFrame) -> pd.DataFrame:
         # One official team assist can be credited to at most one made FG.
         "AST_PER_MAKE": x["AST"] / x["FGM"].replace(0, np.nan),
     })
+
+    # Defensive rebounding is conditional on the OPPONENT'S missed shots that
+    # were not recovered offensively. Build the game-paired opportunity rate
+    # here so it can receive the same opponent + residualized-H2H treatment as
+    # the offensive structural rates.
+    own = x[["GAME_ID", "TEAM_ABBR", "OPP_ABBR", "DREB"]].copy()
+    own["GAME_ID"] = own["GAME_ID"].astype(str)
+    own["TEAM_ABBR"] = own["TEAM_ABBR"].astype(str).str.upper()
+    own["OPP_ABBR"] = own["OPP_ABBR"].astype(str).str.upper()
+    opp = x[["GAME_ID", "TEAM_ABBR", "FGA", "FGM", "OREB"]].copy()
+    opp["GAME_ID"] = opp["GAME_ID"].astype(str)
+    opp["TEAM_ABBR"] = opp["TEAM_ABBR"].astype(str).str.upper()
+    opp = opp.rename(columns={
+        "TEAM_ABBR": "OPP_TEAM_ABBR", "FGA": "OPP_FGA",
+        "FGM": "OPP_FGM", "OREB": "OPP_OREB",
+    })
+    paired = own.merge(opp, on="GAME_ID", how="left")
+    paired = paired[paired["OPP_ABBR"].eq(paired["OPP_TEAM_ABBR"])].copy()
+    if not paired.empty:
+        chances = (
+            pd.to_numeric(paired["OPP_FGA"], errors="coerce")
+            - pd.to_numeric(paired["OPP_FGM"], errors="coerce")
+            - pd.to_numeric(paired["OPP_OREB"], errors="coerce")
+        )
+        paired["DREB_CAPTURE"] = pd.to_numeric(paired["DREB"], errors="coerce") / chances.where(chances > 0)
+        cap = paired[["GAME_ID", "TEAM_ABBR", "DREB_CAPTURE"]].drop_duplicates(["GAME_ID", "TEAM_ABBR"])
+        out = out.merge(cap, on=["GAME_ID", "TEAM_ABBR"], how="left")
+    else:
+        out["DREB_CAPTURE"] = np.nan
+
     return out.replace([np.inf, -np.inf], np.nan)
 
 
 def _is_probability(feature: str) -> bool:
-    return feature in {"3P_SHARE", "TOV", "OREB_PER_MISS", "AST_PER_MAKE"}
+    return feature in {"3P_SHARE", "TOV", "OREB_PER_MISS", "DREB_CAPTURE", "AST_PER_MAKE"}
 
 
 def _transform(feature: str, v):
@@ -382,13 +412,14 @@ def predict_structural_modifiers(
     opp_hist = g[g["OPP_ABBR"].eq(opp) & ~g["TEAM_ABBR"].eq(team)].copy()
     raw_h2h = g[g["TEAM_ABBR"].eq(team) & g["OPP_ABBR"].eq(opp)].copy()
 
-    mods = {"3P_SHARE": 1.0, "FTA": 1.0, "TOV": 1.0, "OREB": 1.0, "AST": 1.0}
+    mods = {"3P_SHARE": 1.0, "FTA": 1.0, "TOV": 1.0, "OREB": 1.0, "DREB": 1.0, "AST": 1.0}
     audit = []
     mapping = {
         "3P_SHARE": "3P_SHARE",
         "FTA": "FTA",
         "TOV": "TOV",
         "OREB_PER_MISS": "OREB",
+        "DREB_CAPTURE": "DREB",
         "AST_PER_MAKE": "AST",
     }
 
@@ -435,6 +466,8 @@ def predict_structural_modifiers(
             pred = float(np.clip(pred, 0.05, 0.55)); pred_no_h2h = float(np.clip(pred_no_h2h, 0.05, 0.55))
         elif feature == "OREB_PER_MISS":
             pred = float(np.clip(pred, 0.05, 0.55)); pred_no_h2h = float(np.clip(pred_no_h2h, 0.05, 0.55))
+        elif feature == "DREB_CAPTURE":
+            pred = float(np.clip(pred, 0.70, 0.995)); pred_no_h2h = float(np.clip(pred_no_h2h, 0.70, 0.995))
         elif feature == "AST_PER_MAKE":
             pred = float(np.clip(pred, 0.20, 0.95)); pred_no_h2h = float(np.clip(pred_no_h2h, 0.20, 0.95))
 

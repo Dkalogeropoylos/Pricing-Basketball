@@ -292,13 +292,14 @@ def _player_game_counts(row: pd.Series) -> dict:
     return {
         "2PA": max(fga - a3, 0.0),
         "3PA": max(a3, 0.0),
+        "FTA": float(pd.to_numeric(pd.Series([row.get("FTA", 0)]), errors="coerce").fillna(0.0).iloc[0]),
         "REB": float(pd.to_numeric(pd.Series([row.get("REB", 0)]), errors="coerce").fillna(0.0).iloc[0]),
         "AST": float(pd.to_numeric(pd.Series([row.get("AST", 0)]), errors="coerce").fillna(0.0).iloc[0]),
     }
 
 
 
-_RESIDUAL_H2H_STATS = ("2PA", "3PA", "REB", "AST")
+_RESIDUAL_H2H_STATS = ("2PA", "3PA", "FTA", "REB", "AST")
 
 
 def _historical_generic_matchup_modifiers(
@@ -374,9 +375,11 @@ def _simple_nonpair_player_rates(
 
     fga = float(pd.to_numeric(x.get("FGA", 0), errors="coerce").fillna(0.0).sum())
     a3 = float(pd.to_numeric(x.get("FG3A", 0), errors="coerce").fillna(0.0).sum())
+    fta = float(pd.to_numeric(x["FTA"], errors="coerce").fillna(0.0).sum()) if "FTA" in x.columns else 0.0
     return {
         "2PA": max(fga - a3, 0.0) / mins,
         "3PA": a3 / mins,
+        "FTA": fta / mins,
         "REB": float(pd.to_numeric(x.get("REB", 0), errors="coerce").fillna(0.0).sum()) / mins,
         "AST": float(pd.to_numeric(x.get("AST", 0), errors="coerce").fillna(0.0).sum()) / mins,
     }
@@ -464,7 +467,13 @@ def fit_player_h2h_residual_calibration(
     differ by player/stat/opponent. Minute-relevance decay ``tau`` is learned
     jointly from next-H2H predictive likelihood; ``tau=inf`` means historical
     H2H minutes are not downweighted merely because they differ from today's
-    minutes. ``K=inf`` means the stat earns no H2H layer at all.
+    minutes.
+
+    v2.18.2 removes the old binary held-out activation gate. A finite
+    Gamma-Poisson H2H candidate is always retained when calibration evidence is
+    sufficient, then continuously averaged toward the no-H2H model using the
+    later blocked holdout predictive likelihood. This preserves matchup
+    information without allowing a weak pair sample to dominate.
 
     The walk-forward generic opponent context is computed from cumulative
     sufficient statistics, so calibration is chronological without the very
@@ -472,7 +481,12 @@ def fit_player_h2h_residual_calibration(
     player-game.
     """
     neutral = {
-        st: {"active": False, "prior_events_k": np.inf, "minute_tau": np.inf}
+        st: {
+            "active": False,
+            "prior_events_k": np.inf,
+            "minute_tau": np.inf,
+            "predictive_model_weight": 0.0,
+        }
         for st in _RESIDUAL_H2H_STATS
     }
     if player_logs is None or player_logs.empty or team_logs is None or team_logs.empty:
@@ -506,22 +520,22 @@ def fit_player_h2h_residual_calibration(
     events = {st: [] for st in _RESIDUAL_H2H_STATS}
 
     # Cumulative TEAM sufficient statistics for overall opponent allowance.
-    # Values are [poss, 2PA, 3PA, REB, AST].
-    team_league = np.zeros(5, dtype=float)
+    # Values are [poss, 2PA, 3PA, FTA, REB, AST].
+    team_league = np.zeros(6, dtype=float)
     team_opp = {}
     team_pair = {}
 
     # Cumulative PLAYER sufficient statistics for opponent-by-position.
-    # Values are [minutes, 2PA, 3PA, REB, AST].
+    # Values are [minutes, 2PA, 3PA, FTA, REB, AST].
     pos_league = {}
     pos_opp = {}
     pos_pair = {}
 
-    idx = {"2PA": 1, "3PA": 2, "REB": 3, "AST": 4}
+    idx = {"2PA": 1, "3PA": 2, "FTA": 3, "REB": 4, "AST": 5}
 
     def _arr_get(d, key):
         v = d.get(key)
-        return np.zeros(5, dtype=float) if v is None else v
+        return np.zeros(6, dtype=float) if v is None else v
 
     def _team_row_vec(row):
         fga = float(pd.to_numeric(pd.Series([row.get("FGA", 0)]), errors="coerce").fillna(0.0).iloc[0])
@@ -532,12 +546,12 @@ def fit_player_h2h_residual_calibration(
         poss = max(fga - oreb + tov + 0.44 * fta, 0.0)
         reb = float(pd.to_numeric(pd.Series([row.get("REB", 0)]), errors="coerce").fillna(0.0).iloc[0])
         ast = float(pd.to_numeric(pd.Series([row.get("AST", 0)]), errors="coerce").fillna(0.0).iloc[0])
-        return np.asarray([poss, max(fga - a3, 0.0), max(a3, 0.0), reb, ast], float)
+        return np.asarray([poss, max(fga - a3, 0.0), max(a3, 0.0), max(fta, 0.0), reb, ast], float)
 
     def _player_row_vec(row):
         mins = float(pd.to_numeric(pd.Series([row.get("MIN", 0)]), errors="coerce").fillna(0.0).iloc[0])
         c = _player_game_counts(row)
-        return np.asarray([mins, c["2PA"], c["3PA"], c["REB"], c["AST"]], float)
+        return np.asarray([mins, c["2PA"], c["3PA"], c["FTA"], c["REB"], c["AST"]], float)
 
     def _generic_modifiers(team, opp, pos):
         out = {}
@@ -726,10 +740,11 @@ def fit_player_h2h_residual_calibration(
             })
             continue
 
-        # Chronological blocked validation: select K/tau on the earlier 70%
-        # of repeat-matchup prediction events and require improvement on the
-        # later 30%. This prevents the H2H layer from activating merely because
-        # a two-parameter grid can fit the same events it is judged on.
+        # Chronological blocked validation: select the finite K/tau candidate
+        # on the earlier 70% of repeat-matchup prediction events, then use the
+        # later 30% only to determine a continuous predictive model weight.
+        # The later block therefore shrinks weak H2H evidence without a binary
+        # delete/keep decision.
         split = int(np.floor(0.70 * len(ev)))
         split = min(max(split, 30), len(ev) - 10)
         train_ev = ev[:split]
@@ -786,7 +801,10 @@ def fit_player_h2h_residual_calibration(
             return float(np.sum(lam - yy * np.log(lam) + lf))
 
         train_base_nll = _base_nll(train_ev)
-        best_train = (train_base_nll, np.inf, np.inf)
+        # Select the best *finite* Gamma-Poisson pair model on the earlier
+        # block. The no-H2H model is evaluated separately rather than acting as
+        # a hard switch that can delete matchup information.
+        best_train = (np.inf, np.nan, np.nan)
 
         # Precompute weighted residual evidence once per tau for the training
         # block, then evaluate the K grid vectorially.
@@ -815,26 +833,24 @@ def fit_player_h2h_residual_calibration(
 
         train_best_nll, candidate_k, candidate_tau = best_train
         hold_base_nll = _base_nll(hold_ev)
-        hold_candidate_nll = (
-            _score(hold_ev, candidate_k, candidate_tau)
-            if np.isfinite(candidate_k)
-            else hold_base_nll
-        )
+        hold_candidate_nll = _score(hold_ev, candidate_k, candidate_tau)
 
-        active = bool(
-            np.isfinite(candidate_k)
-            and train_best_nll < train_base_nll - 1e-9
-            and hold_candidate_nll < hold_base_nll - 1e-9
-        )
-        if active:
-            best_k, best_tau = candidate_k, candidate_tau
-        else:
-            best_k, best_tau = np.inf, np.inf
+        # Continuous predictive model averaging. With equal prior model odds,
+        # the later-block predictive likelihood gives the H2H model weight:
+        #   w = L_h2h / (L_h2h + L_noh2h)
+        #     = sigmoid(NLL_noh2h - NLL_h2h).
+        # This is deliberately continuous: a slightly worse holdout shrinks the
+        # H2H layer strongly but does not hard-delete it.
+        heldout_gain = float(hold_base_nll - hold_candidate_nll)
+        z = float(np.clip(heldout_gain, -60.0, 60.0))
+        predictive_weight = float(1.0 / (1.0 + np.exp(-z)))
+        active = bool(np.isfinite(candidate_k) and predictive_weight > 0.0)
 
         result[st] = {
             "active": active,
-            "prior_events_k": float(best_k),
-            "minute_tau": float(best_tau),
+            "prior_events_k": float(candidate_k),
+            "minute_tau": float(candidate_tau),
+            "predictive_model_weight": predictive_weight,
         }
         audit_rows.append({
             "Stat": st,
@@ -842,26 +858,20 @@ def fit_player_h2h_residual_calibration(
             "Calibration events": len(ev),
             "Train events": len(train_ev),
             "Holdout events": len(hold_ev),
-            "Prior residual events K": float(best_k),
-            "Minute relevance tau": float(best_tau),
+            "Prior residual events K": float(candidate_k),
+            "Minute relevance tau": float(candidate_tau),
+            "Predictive H2H model weight": predictive_weight,
             "Train no-H2H NLL": float(train_base_nll),
             "Train best residual H2H NLL": float(train_best_nll),
             "Held-out no-H2H NLL": float(hold_base_nll),
             "Held-out residual H2H NLL": float(hold_candidate_nll),
-            "Held-out NLL gain": float(hold_base_nll - hold_candidate_nll),
-            # Compatibility summary aliases.
+            "Held-out NLL gain": heldout_gain,
+            # Compatibility summary aliases now report the actual finite H2H
+            # candidate even when the holdout prefers the no-H2H model.
             "No-H2H NLL": float(hold_base_nll),
-            "Best residual H2H NLL": float(
-                hold_candidate_nll if active else hold_base_nll
-            ),
-            "NLL gain": float(
-                hold_base_nll - hold_candidate_nll if active else 0.0
-            ),
-            "Reason": (
-                "residual H2H improved later held-out games"
-                if active
-                else "residual H2H failed later held-out validation"
-            ),
+            "Best residual H2H NLL": float(hold_candidate_nll),
+            "NLL gain": heldout_gain,
+            "Reason": "continuous predictive-likelihood shrinkage; no hard H2H drop",
         })
 
     return result, pd.DataFrame(audit_rows)
@@ -998,15 +1008,17 @@ def player_h2h_modifiers(
     (historical non-pair player rate × leave-pair-out generic opponent effect).
     Only the remaining player×opponent residual is shrunk and applied.
 
-    The residual multiplier has a Gamma prior centered at 1.  Its prior mass K
-    (expected events) and minute-relevance decay tau are learned league-wide by
-    chronological next-H2H predictive likelihood.  K=inf disables H2H; tau=inf
-    means no minute-distance penalty.
+    The residual multiplier has a Gamma prior centered at 1. Its prior mass K
+    (expected events) and minute-relevance decay tau are learned league-wide.
+    v2.18.2 then continuously averages the finite H2H model toward neutral 1
+    using later blocked predictive likelihood; a weak holdout therefore shrinks
+    H2H rather than hard-disabling it. ``tau=inf`` means no minute-distance
+    penalty.
 
     The older v2.17.2 prior-minute path is retained for backward compatibility
     when residual inputs are not supplied.
     """
-    neutral = {"2PA": 1.0, "3PA": 1.0, "REB": 1.0, "AST": 1.0}
+    neutral = {"2PA": 1.0, "3PA": 1.0, "FTA": 1.0, "REB": 1.0, "AST": 1.0}
     if player_log is None or player_log.empty:
         return neutral, pd.DataFrame()
 
@@ -1025,6 +1037,7 @@ def player_h2h_modifiers(
     base = {
         "2PA": float(profile.get("two_pa_pm", np.nan)),
         "3PA": float(profile.get("three_pa_pm", np.nan)),
+        "FTA": float(profile.get("fta_pm", np.nan)),
         "REB": float(profile.get("reb_pm", np.nan)),
         "AST": float(profile.get("ast_pm", np.nan)),
     }
@@ -1054,6 +1067,10 @@ def player_h2h_modifiers(
             active = bool(cal.get("active", False))
             k = float(cal.get("prior_events_k", np.inf))
             tau = float(cal.get("minute_tau", np.inf))
+            predictive_model_weight = float(np.clip(
+                cal.get("predictive_model_weight", 1.0 if active else 0.0),
+                0.0, 1.0,
+            ))
 
             obs_col = f"{st}_observed"
             exp_col = f"{st}_expected_events"
@@ -1071,9 +1088,11 @@ def player_h2h_modifiers(
                     & (eligible["MIN"] > 0)
                 ].copy()
 
-            if eligible.empty or not active or np.isinf(k):
+            if eligible.empty or np.isinf(k) or not np.isfinite(k):
                 mod = 1.0
+                full_eb_mod = 1.0
                 post_weight = 0.0
+                applied_effect_weight = 0.0
                 raw_residual = np.nan
                 obs_eff = 0.0
                 exp_eff = 0.0
@@ -1092,11 +1111,18 @@ def player_h2h_modifiers(
                 obs_eff = float(np.sum(obs * rel))
                 exp_eff = float(np.sum(exp_events * rel))
                 raw_residual = (obs_eff / exp_eff) if exp_eff > 0 else np.nan
-                mod = (
+                full_eb_mod = (
                     float((obs_eff + k) / max(exp_eff + k, 1e-9))
                     if exp_eff > 0 else 1.0
                 )
+                # Multiplicative/geometric interpolation is neutral at 1 and
+                # preserves symmetry on the log scale for positive/negative
+                # matchup residuals.
+                mod = float(np.exp(
+                    predictive_model_weight * np.log(max(full_eb_mod, 1e-9))
+                ))
                 post_weight = float(exp_eff / (exp_eff + k)) if exp_eff > 0 else 0.0
+                applied_effect_weight = float(post_weight * predictive_model_weight)
                 mean_min_rel = float(np.mean(minute_rel)) if len(minute_rel) else 0.0
 
             out[st] = float(mod if np.isfinite(mod) and mod > 0 else 1.0)
@@ -1117,8 +1143,11 @@ def player_h2h_modifiers(
                 "Learned minute relevance tau": tau,
                 "Mean minute relevance": mean_min_rel,
                 "Prior residual events K": k,
+                "Predictive H2H model weight": predictive_model_weight,
+                "Posterior H2H evidence weight": post_weight,
                 "Posterior H2H weight": post_weight,
-                "Applied H2H weight": post_weight,
+                "Applied H2H weight": applied_effect_weight,
+                "Full EB residual modifier before model averaging": full_eb_mod,
                 "Current non-H2H baseline rate/min": b,
                 "Current generic opponent modifier": om,
                 "Current no-H2H expected rate/min": current_no_h2h,
@@ -1147,6 +1176,8 @@ def player_h2h_modifiers(
     stat_counts = {
         "2PA": np.maximum(fga - a3, 0.0),
         "3PA": np.maximum(a3, 0.0),
+        "FTA": (pd.to_numeric(h["FTA"], errors="coerce").fillna(0.0).to_numpy(float)
+                if "FTA" in h.columns else np.zeros(len(h), dtype=float)),
         "REB": pd.to_numeric(h.get("REB", 0), errors="coerce").fillna(0.0).to_numpy(float),
         "AST": pd.to_numeric(h.get("AST", 0), errors="coerce").fillna(0.0).to_numpy(float),
     }
