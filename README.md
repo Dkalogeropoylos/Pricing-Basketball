@@ -1,3 +1,5 @@
+> **Latest package version: v2.18.0** — consolidated v2.17.3 Player Props + calibrated Team opponent state / residual H2H / optional validated handicap prior. See `README_v2_18_0_team_state_residual_h2h_market_prior.md`. Older sections below document earlier bases.
+
 # Basketball Pricing Engine v2.15.0 — patch over v2.14
 
 Η v2.15 κρατάει την αρχιτεκτονική της v2.14 (200-minute rotation, learned minute replacement, opponent/position model, shared pace, non-overlapping Old/G6–10/L5) και αλλάζει κυρίως το **availability / role layer** και την ταχύτητα του Player Deep Analysis.
@@ -136,3 +138,13 @@
 ### Σημαντικό
 
 Η v2.15 βελτιώνει το structural model και μειώνει αυθαίρετα injury boosts, αλλά **δεν είναι ακόμα fully fitted/backtested prop model**. Τα fair odds πρέπει να επανελεγχθούν σε walk-forward historical validation πριν χρησιμοποιηθούν ως calibrated true probabilities.
+
+---
+
+## v2.17 structural calibration update
+
+See `README_v2_17_structural_calibration.md`. Team 3P_SHARE, FTA, TOV and AST-per-made-FG now use a walk-forward learned structural layer instead of fixed opponent/H2H weights. The learned layer activates only if it beats the existing Old/G6-10/L5 baseline out of sample.
+
+## v2.17.1 adaptive player role-state
+
+Adds an evidence-weighted local-level state-space correction for player 2PA/3PA/FTA/REB/AST per-minute opportunity rates. The process variance is selected by walk-forward predictive likelihood and model-averaged against the static state; shooting percentages and trader minutes remain separate. See `README_v2_17_1_adaptive_player_role_state.md`.
