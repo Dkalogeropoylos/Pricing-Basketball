@@ -162,14 +162,26 @@ def position_environment(
     player_df: pd.DataFrame,
     opponent_abbr: str,
     position_group: str,
+    exclude_team_abbr: str | None = None,
 ):
-    """Same-position opponent environment for Player Props."""
+    """Same-position opponent environment for Player Props.
+
+    ``exclude_team_abbr`` makes the opponent-by-position sample leave-pair-out:
+    rows from the focal player's current team against this opponent are removed
+    from the opponent-specific sample. The league position baseline remains
+    untouched. This keeps the generic opponent layer disjoint from the explicit
+    player/opponent H2H residual.
+    """
     x = player_df[
         player_df["POSITION_GROUP"].astype(str) == str(position_group)
     ].copy()
     vs = x[
         x["OPP_ABBR"].astype(str).str.upper() == str(opponent_abbr).upper()
     ].copy()
+    if exclude_team_abbr and "TEAM_ABBR" in vs.columns:
+        vs = vs[
+            ~vs["TEAM_ABBR"].astype(str).str.upper().eq(str(exclude_team_abbr).upper())
+        ].copy()
     return _position_summary(vs), _position_summary(x)
 
 
@@ -283,6 +295,576 @@ def _player_game_counts(row: pd.Series) -> dict:
         "REB": float(pd.to_numeric(pd.Series([row.get("REB", 0)]), errors="coerce").fillna(0.0).iloc[0]),
         "AST": float(pd.to_numeric(pd.Series([row.get("AST", 0)]), errors="coerce").fillna(0.0).iloc[0]),
     }
+
+
+
+_RESIDUAL_H2H_STATS = ("2PA", "3PA", "REB", "AST")
+
+
+def _historical_generic_matchup_modifiers(
+    player_logs: pd.DataFrame,
+    team_logs: pd.DataFrame,
+    cutoff_date,
+    team_abbr: str,
+    opponent_abbr: str,
+    position_group: str | None,
+):
+    """Pregame generic opponent modifiers using only information before cutoff.
+
+    The current team is removed from the opponent-specific overall and
+    position samples, so this is a leave-pair-out generic environment.  It is
+    deliberately the same opponent architecture used by live Player Props:
+    overall opponent allowance + relative opponent-by-position deviation.
+    """
+    cutoff = pd.Timestamp(cutoff_date)
+    p = player_logs.copy()
+    t = team_logs.copy()
+    if "GAME_DATE" not in p.columns or "GAME_DATE" not in t.columns:
+        return {k: 1.0 for k in ("PTS", "REB", "AST", "3PA", "2PA", "FTA", "3P_PCT", "2P_PCT")}
+
+    p_dates = pd.to_datetime(p["GAME_DATE"], errors="coerce")
+    t_dates = pd.to_datetime(t["GAME_DATE"], errors="coerce")
+    p_hist = p[p_dates < cutoff].copy()
+    t_hist = t[t_dates < cutoff].copy()
+
+    if t_hist.empty:
+        overall = {"ratios": {}, "modifiers": {}, "rates": {}, "audit": pd.DataFrame()}
+    else:
+        overall = opponent_allowed_profile(
+            t_hist,
+            opponent_abbr,
+            exclude_team_abbr=team_abbr,
+        )
+
+    pvo, plg = {}, {}
+    if position_group is not None and str(position_group).strip() and not p_hist.empty:
+        pvo, plg = position_environment(
+            p_hist,
+            opponent_abbr,
+            str(position_group),
+            exclude_team_abbr=team_abbr,
+        )
+
+    mods, _ = player_matchup_modifiers(overall, pvo, plg)
+    return mods
+
+
+def _simple_nonpair_player_rates(
+    player_history: pd.DataFrame,
+    opponent_abbr: str,
+) -> dict:
+    """Player per-minute opportunity rates before a historical H2H game.
+
+    Pair rows are excluded.  This is used only to construct the historical
+    no-H2H expectation against which matchup residuals are measured; the live
+    player baseline still comes from the full v2.17.1 adaptive role-state.
+    """
+    if player_history is None or player_history.empty:
+        return {k: np.nan for k in _RESIDUAL_H2H_STATS}
+    x = player_history[
+        ~player_history["OPP_ABBR"].astype(str).str.upper().eq(str(opponent_abbr).upper())
+    ].copy()
+    mins = pd.to_numeric(x.get("MIN", 0), errors="coerce").fillna(0.0)
+    x = x[mins > 0].copy()
+    if x.empty:
+        return {k: np.nan for k in _RESIDUAL_H2H_STATS}
+    mins = float(pd.to_numeric(x["MIN"], errors="coerce").fillna(0.0).sum())
+    if mins <= 0:
+        return {k: np.nan for k in _RESIDUAL_H2H_STATS}
+
+    fga = float(pd.to_numeric(x.get("FGA", 0), errors="coerce").fillna(0.0).sum())
+    a3 = float(pd.to_numeric(x.get("FG3A", 0), errors="coerce").fillna(0.0).sum())
+    return {
+        "2PA": max(fga - a3, 0.0) / mins,
+        "3PA": a3 / mins,
+        "REB": float(pd.to_numeric(x.get("REB", 0), errors="coerce").fillna(0.0).sum()) / mins,
+        "AST": float(pd.to_numeric(x.get("AST", 0), errors="coerce").fillna(0.0).sum()) / mins,
+    }
+
+
+def player_h2h_residual_history(
+    league_player_logs: pd.DataFrame,
+    league_team_logs: pd.DataFrame,
+    player_id,
+    team_abbr: str,
+    opponent_abbr: str,
+    position_group: str | None,
+) -> pd.DataFrame:
+    """Build historical *expected* H2H rates before each H2H occurred.
+
+    For every same-season player/opponent game, the no-H2H expectation is:
+
+        historical non-pair player rate
+        × historical leave-pair-out generic opponent modifier.
+
+    Both components use only rows strictly before that H2H date.  This avoids
+    using today's opponent profile to explain an old game and avoids allowing
+    the focal pair's own H2H rows to define the generic opponent environment.
+    """
+    if league_player_logs is None or league_player_logs.empty:
+        return pd.DataFrame()
+    p = league_player_logs.copy()
+    if "GAME_DATE" not in p.columns:
+        return pd.DataFrame()
+    p["GAME_DATE"] = pd.to_datetime(p["GAME_DATE"], errors="coerce")
+    focal = p[p["PLAYER_ID"].astype(str).eq(str(player_id))].copy()
+    focal = focal.dropna(subset=["GAME_DATE"]).sort_values(["GAME_DATE", "GAME_ID"] if "GAME_ID" in focal.columns else ["GAME_DATE"])
+    h = focal[
+        focal["OPP_ABBR"].astype(str).str.upper().eq(str(opponent_abbr).upper())
+    ].copy()
+    if h.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, row in h.iterrows():
+        cutoff = pd.Timestamp(row["GAME_DATE"])
+        prior = focal[focal["GAME_DATE"] < cutoff].copy()
+        base = _simple_nonpair_player_rates(prior, opponent_abbr)
+        hist_team = str(row.get("TEAM_ABBR", team_abbr) or team_abbr).upper()
+        mods = _historical_generic_matchup_modifiers(
+            p,
+            league_team_logs,
+            cutoff,
+            hist_team,
+            opponent_abbr,
+            position_group,
+        )
+        counts = _player_game_counts(row)
+        mins = float(pd.to_numeric(pd.Series([row.get("MIN", 0)]), errors="coerce").fillna(0.0).iloc[0])
+        rec = {
+            "GAME_ID": str(row.get("GAME_ID", "")),
+            "GAME_DATE": cutoff,
+            "TEAM_ABBR": hist_team,
+            "MIN": mins,
+        }
+        for st in _RESIDUAL_H2H_STATS:
+            b = float(base.get(st, np.nan))
+            om = float(mods.get(st, 1.0))
+            exp_rate = b * om if np.isfinite(b) and b > 0 and np.isfinite(om) and om > 0 else np.nan
+            rec[f"{st}_observed"] = float(counts[st])
+            rec[f"{st}_historical_base_pm"] = b
+            rec[f"{st}_historical_opp_mod"] = om
+            rec[f"{st}_expected_pm"] = exp_rate
+            rec[f"{st}_expected_events"] = exp_rate * mins if np.isfinite(exp_rate) and mins > 0 else np.nan
+        rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def fit_player_h2h_residual_calibration(
+    player_logs: pd.DataFrame,
+    team_logs: pd.DataFrame,
+):
+    """Walk-forward calibration for residualized player H2H.
+
+    Model:
+        count ~ Poisson(minutes × baseline × generic_opponent × residual_pair)
+
+    Pair-specific residuals receive a Gamma prior with mean 1. The prior mass
+    ``K`` is measured in expected events, not minutes, because baseline rates
+    differ by player/stat/opponent. Minute-relevance decay ``tau`` is learned
+    jointly from next-H2H predictive likelihood; ``tau=inf`` means historical
+    H2H minutes are not downweighted merely because they differ from today's
+    minutes. ``K=inf`` means the stat earns no H2H layer at all.
+
+    The walk-forward generic opponent context is computed from cumulative
+    sufficient statistics, so calibration is chronological without the very
+    expensive dataframe re-filtering that would otherwise occur for every
+    player-game.
+    """
+    neutral = {
+        st: {"active": False, "prior_events_k": np.inf, "minute_tau": np.inf}
+        for st in _RESIDUAL_H2H_STATS
+    }
+    if player_logs is None or player_logs.empty or team_logs is None or team_logs.empty:
+        return neutral, pd.DataFrame()
+
+    required = {"PLAYER_ID", "TEAM_ABBR", "OPP_ABBR", "GAME_DATE", "MIN"}
+    if not required.issubset(set(player_logs.columns)):
+        return neutral, pd.DataFrame([{
+            "Active": False,
+            "Reason": "missing player/team/opponent/minute columns",
+        }])
+
+    x = player_logs.copy()
+    x["GAME_DATE"] = pd.to_datetime(x["GAME_DATE"], errors="coerce")
+    if "GAME_ID" not in x.columns:
+        x["GAME_ID"] = np.arange(len(x)).astype(str)
+    x = x.dropna(subset=["GAME_DATE"]).sort_values(
+        ["GAME_DATE", "GAME_ID", "PLAYER_ID"]
+    ).reset_index(drop=True)
+
+    t = team_logs.copy()
+    t["GAME_DATE"] = pd.to_datetime(t["GAME_DATE"], errors="coerce")
+    t = t.dropna(subset=["GAME_DATE"]).sort_values(
+        ["GAME_DATE", "GAME_ID"] if "GAME_ID" in t.columns else ["GAME_DATE"]
+    ).reset_index(drop=True)
+
+    # Player prior state used for the no-H2H baseline.
+    total_exp, total_counts = {}, {}
+    pair_exp, pair_counts = {}, {}
+    pair_history = {}
+    events = {st: [] for st in _RESIDUAL_H2H_STATS}
+
+    # Cumulative TEAM sufficient statistics for overall opponent allowance.
+    # Values are [poss, 2PA, 3PA, REB, AST].
+    team_league = np.zeros(5, dtype=float)
+    team_opp = {}
+    team_pair = {}
+
+    # Cumulative PLAYER sufficient statistics for opponent-by-position.
+    # Values are [minutes, 2PA, 3PA, REB, AST].
+    pos_league = {}
+    pos_opp = {}
+    pos_pair = {}
+
+    idx = {"2PA": 1, "3PA": 2, "REB": 3, "AST": 4}
+
+    def _arr_get(d, key):
+        v = d.get(key)
+        return np.zeros(5, dtype=float) if v is None else v
+
+    def _team_row_vec(row):
+        fga = float(pd.to_numeric(pd.Series([row.get("FGA", 0)]), errors="coerce").fillna(0.0).iloc[0])
+        a3 = float(pd.to_numeric(pd.Series([row.get("FG3A", 0)]), errors="coerce").fillna(0.0).iloc[0])
+        oreb = float(pd.to_numeric(pd.Series([row.get("OREB", 0)]), errors="coerce").fillna(0.0).iloc[0])
+        tov = float(pd.to_numeric(pd.Series([row.get("TOV", 0)]), errors="coerce").fillna(0.0).iloc[0])
+        fta = float(pd.to_numeric(pd.Series([row.get("FTA", 0)]), errors="coerce").fillna(0.0).iloc[0])
+        poss = max(fga - oreb + tov + 0.44 * fta, 0.0)
+        reb = float(pd.to_numeric(pd.Series([row.get("REB", 0)]), errors="coerce").fillna(0.0).iloc[0])
+        ast = float(pd.to_numeric(pd.Series([row.get("AST", 0)]), errors="coerce").fillna(0.0).iloc[0])
+        return np.asarray([poss, max(fga - a3, 0.0), max(a3, 0.0), reb, ast], float)
+
+    def _player_row_vec(row):
+        mins = float(pd.to_numeric(pd.Series([row.get("MIN", 0)]), errors="coerce").fillna(0.0).iloc[0])
+        c = _player_game_counts(row)
+        return np.asarray([mins, c["2PA"], c["3PA"], c["REB"], c["AST"]], float)
+
+    def _generic_modifiers(team, opp, pos):
+        out = {}
+        opp_vec = _arr_get(team_opp, opp) - _arr_get(team_pair, (team, opp))
+        for st in _RESIDUAL_H2H_STATS:
+            j = idx[st]
+            lg_rate = (
+                team_league[j] / team_league[0]
+                if team_league[0] > 0 else np.nan
+            )
+            opp_rate = (
+                opp_vec[j] / opp_vec[0]
+                if opp_vec[0] > 0 else np.nan
+            )
+            overall_ratio = (
+                opp_rate / lg_rate
+                if np.isfinite(opp_rate) and np.isfinite(lg_rate) and lg_rate > 0
+                else 1.0
+            )
+
+            position_ratio = None
+            sample_min = 0.0
+            if pos:
+                lgp = _arr_get(pos_league, pos)
+                oppp = (
+                    _arr_get(pos_opp, (pos, opp))
+                    - _arr_get(pos_pair, (pos, team, opp))
+                )
+                sample_min = max(float(oppp[0]), 0.0)
+                lgp_rate = lgp[j] / lgp[0] if lgp[0] > 0 else np.nan
+                oppp_rate = oppp[j] / oppp[0] if oppp[0] > 0 else np.nan
+                if np.isfinite(lgp_rate) and lgp_rate > 0 and np.isfinite(oppp_rate):
+                    position_ratio = oppp_rate / lgp_rate
+
+            mod, _ = combine_overall_and_position(
+                overall_ratio,
+                position_ratio,
+                position_sample_min=sample_min,
+            )
+            out[st] = float(mod)
+        return out
+
+    all_dates = sorted(
+        set(x["GAME_DATE"].dropna().tolist()) | set(t["GAME_DATE"].dropna().tolist())
+    )
+
+    for date in all_dates:
+        px = x[x["GAME_DATE"].eq(date)]
+        pending = []
+
+        # Predict every player row on this date using only earlier dates.
+        for _, row in px.iterrows():
+            pid = str(row.get("PLAYER_ID"))
+            team = str(row.get("TEAM_ABBR", "")).upper()
+            opp = str(row.get("OPP_ABBR", "")).upper()
+            pos = str(row.get("POSITION_GROUP", "") or "")
+            mins = float(pd.to_numeric(
+                pd.Series([row.get("MIN", 0)]), errors="coerce"
+            ).fillna(0.0).iloc[0])
+            if not np.isfinite(mins) or mins < 4.0 or not team or not opp:
+                continue
+
+            counts = _player_game_counts(row)
+            pk = (pid, opp)
+            texp = float(total_exp.get(pid, 0.0))
+            hexp = float(pair_exp.get(pk, 0.0))
+            nonexp = max(texp - hexp, 0.0)
+            prior_pair = pair_history.get(pk, [])
+            mods = _generic_modifiers(team, opp, pos)
+
+            current_expected_rates = {}
+            for st in _RESIDUAL_H2H_STATS:
+                tc = float(total_counts.get((pid, st), 0.0))
+                hc = float(pair_counts.get((pid, opp, st), 0.0))
+                nonc = max(tc - hc, 0.0)
+                b = nonc / nonexp if nonexp > 0 else np.nan
+                om = float(mods.get(st, 1.0))
+                current_expected_rates[st] = (
+                    b * om
+                    if np.isfinite(b) and b > 1e-9 and np.isfinite(om) and om > 0
+                    else np.nan
+                )
+
+            if prior_pair and nonexp > 0:
+                for st in _RESIDUAL_H2H_STATS:
+                    er = current_expected_rates[st]
+                    if not (np.isfinite(er) and er > 0):
+                        continue
+                    prior_entries = [
+                        (
+                            float(z["MIN"]),
+                            float(z[f"{st}_count"]),
+                            float(z[f"{st}_expected_events"]),
+                        )
+                        for z in prior_pair
+                        if np.isfinite(z.get(f"{st}_expected_events", np.nan))
+                        and float(z.get(f"{st}_expected_events", 0.0)) > 0
+                    ]
+                    if not prior_entries:
+                        continue
+                    events[st].append({
+                        "current_minutes": mins,
+                        "current_expected_rate": er,
+                        "actual": float(counts[st]),
+                        "prior": prior_entries,
+                    })
+
+            pending.append({
+                "row": row,
+                "pid": pid,
+                "team": team,
+                "opp": opp,
+                "pos": pos,
+                "mins": mins,
+                "counts": counts,
+                "expected_rates": current_expected_rates,
+            })
+
+        # Only after every prediction for the date is frozen do today's rows
+        # become historical information.
+        for item in pending:
+            row = item["row"]
+            pid, team, opp, pos = item["pid"], item["team"], item["opp"], item["pos"]
+            mins, counts = item["mins"], item["counts"]
+            erates = item["expected_rates"]
+            pk = (pid, opp)
+
+            hist_entry = {"MIN": mins}
+            for st in _RESIDUAL_H2H_STATS:
+                er = erates[st]
+                hist_entry[f"{st}_count"] = float(counts[st])
+                hist_entry[f"{st}_expected_events"] = (
+                    er * mins if np.isfinite(er) and er > 0 else np.nan
+                )
+            pair_history.setdefault(pk, []).append(hist_entry)
+
+            total_exp[pid] = float(total_exp.get(pid, 0.0)) + mins
+            pair_exp[pk] = float(pair_exp.get(pk, 0.0)) + mins
+            for st in _RESIDUAL_H2H_STATS:
+                c = float(counts[st])
+                total_counts[(pid, st)] = float(
+                    total_counts.get((pid, st), 0.0)
+                ) + c
+                pair_counts[(pid, opp, st)] = float(
+                    pair_counts.get((pid, opp, st), 0.0)
+                ) + c
+
+            pv = _player_row_vec(row)
+            if pos:
+                pos_league[pos] = _arr_get(pos_league, pos) + pv
+                pos_opp[(pos, opp)] = _arr_get(pos_opp, (pos, opp)) + pv
+                pos_pair[(pos, team, opp)] = (
+                    _arr_get(pos_pair, (pos, team, opp)) + pv
+                )
+
+        # Update team overall opponent allowance after all player predictions
+        # for the date, preserving the same strict pregame cutoff.
+        tx = t[t["GAME_DATE"].eq(date)]
+        for _, row in tx.iterrows():
+            team = str(row.get("TEAM_ABBR", "")).upper()
+            opp = str(row.get("OPP_ABBR", "")).upper()
+            if not team or not opp:
+                continue
+            tv = _team_row_vec(row)
+            team_league += tv
+            team_opp[opp] = _arr_get(team_opp, opp) + tv
+            team_pair[(team, opp)] = _arr_get(team_pair, (team, opp)) + tv
+
+    result, audit_rows = {}, []
+    tau_grid = list(np.logspace(np.log10(4.0), np.log10(40.0), 12)) + [np.inf]
+
+    for st in _RESIDUAL_H2H_STATS:
+        ev = events[st]
+        if len(ev) < 40:
+            result[st] = dict(neutral[st])
+            audit_rows.append({
+                "Stat": st,
+                "Active": False,
+                "Calibration events": len(ev),
+                "Prior residual events K": np.inf,
+                "Minute relevance tau": np.inf,
+                "No-H2H NLL": np.nan,
+                "Best residual H2H NLL": np.nan,
+                "NLL gain": 0.0,
+                "Reason": "insufficient repeat-matchup residual events",
+            })
+            continue
+
+        # Chronological blocked validation: select K/tau on the earlier 70%
+        # of repeat-matchup prediction events and require improvement on the
+        # later 30%. This prevents the H2H layer from activating merely because
+        # a two-parameter grid can fit the same events it is judged on.
+        split = int(np.floor(0.70 * len(ev)))
+        split = min(max(split, 30), len(ev) - 10)
+        train_ev = ev[:split]
+        hold_ev = ev[split:]
+
+        expected_masses = [
+            sum(z[2] for z in e["prior"] if np.isfinite(z[2]) and z[2] > 0)
+            for e in train_ev
+        ]
+        pos_mass = np.asarray([v for v in expected_masses if v > 0], float)
+        med_e = max(
+            float(np.median(pos_mass)) if len(pos_mass) else 4.0,
+            0.5,
+        )
+        finite_k = np.asarray(
+            list(med_e * np.logspace(-1.0, 1.8, 30)),
+            dtype=float,
+        )
+
+        def _arrays(es):
+            cm = np.asarray([float(e["current_minutes"]) for e in es], dtype=float)
+            er = np.asarray([float(e["current_expected_rate"]) for e in es], dtype=float)
+            yy = np.asarray([float(e["actual"]) for e in es], dtype=float)
+            lf = np.asarray([math.lgamma(y + 1.0) for y in yy], dtype=float)
+            base = np.clip(cm * er, 1e-9, None)
+            return cm, yy, lf, base
+
+        def _base_nll(es):
+            _, yy, lf, base = _arrays(es)
+            return float(np.sum(base - yy * np.log(base) + lf))
+
+        def _score(es, k, tau):
+            cm, yy, lf, base = _arrays(es)
+            obs_eff = np.zeros(len(es), dtype=float)
+            exp_eff = np.zeros(len(es), dtype=float)
+            for i, e in enumerate(es):
+                prior = e["prior"]
+                if np.isinf(tau):
+                    obs_eff[i] = sum(float(z[1]) for z in prior)
+                    exp_eff[i] = sum(float(z[2]) for z in prior)
+                else:
+                    tt = max(float(tau), 1e-6)
+                    for pm, pc, pe in prior:
+                        w = float(np.exp(-abs(float(pm) - cm[i]) / tt))
+                        obs_eff[i] += float(pc) * w
+                        exp_eff[i] += float(pe) * w
+            if np.isinf(k):
+                residual = np.ones(len(es), dtype=float)
+            else:
+                residual = (obs_eff + float(k)) / np.maximum(
+                    exp_eff + float(k), 1e-9
+                )
+            lam = np.clip(base * residual, 1e-9, None)
+            return float(np.sum(lam - yy * np.log(lam) + lf))
+
+        train_base_nll = _base_nll(train_ev)
+        best_train = (train_base_nll, np.inf, np.inf)
+
+        # Precompute weighted residual evidence once per tau for the training
+        # block, then evaluate the K grid vectorially.
+        cm_tr, y_tr, lf_tr, base_tr = _arrays(train_ev)
+        for tau in tau_grid:
+            obs_eff = np.zeros(len(train_ev), dtype=float)
+            exp_eff = np.zeros(len(train_ev), dtype=float)
+            for i, e in enumerate(train_ev):
+                prior = e["prior"]
+                if np.isinf(tau):
+                    obs_eff[i] = sum(float(z[1]) for z in prior)
+                    exp_eff[i] = sum(float(z[2]) for z in prior)
+                else:
+                    tt = max(float(tau), 1e-6)
+                    for pm, pc, pe in prior:
+                        w = float(np.exp(-abs(float(pm) - cm_tr[i]) / tt))
+                        obs_eff[i] += float(pc) * w
+                        exp_eff[i] += float(pe) * w
+
+            for k in finite_k:
+                residual = (obs_eff + k) / np.maximum(exp_eff + k, 1e-9)
+                lam = np.clip(base_tr * residual, 1e-9, None)
+                score = float(np.sum(lam - y_tr * np.log(lam) + lf_tr))
+                if score < best_train[0]:
+                    best_train = (score, float(k), float(tau))
+
+        train_best_nll, candidate_k, candidate_tau = best_train
+        hold_base_nll = _base_nll(hold_ev)
+        hold_candidate_nll = (
+            _score(hold_ev, candidate_k, candidate_tau)
+            if np.isfinite(candidate_k)
+            else hold_base_nll
+        )
+
+        active = bool(
+            np.isfinite(candidate_k)
+            and train_best_nll < train_base_nll - 1e-9
+            and hold_candidate_nll < hold_base_nll - 1e-9
+        )
+        if active:
+            best_k, best_tau = candidate_k, candidate_tau
+        else:
+            best_k, best_tau = np.inf, np.inf
+
+        result[st] = {
+            "active": active,
+            "prior_events_k": float(best_k),
+            "minute_tau": float(best_tau),
+        }
+        audit_rows.append({
+            "Stat": st,
+            "Active": active,
+            "Calibration events": len(ev),
+            "Train events": len(train_ev),
+            "Holdout events": len(hold_ev),
+            "Prior residual events K": float(best_k),
+            "Minute relevance tau": float(best_tau),
+            "Train no-H2H NLL": float(train_base_nll),
+            "Train best residual H2H NLL": float(train_best_nll),
+            "Held-out no-H2H NLL": float(hold_base_nll),
+            "Held-out residual H2H NLL": float(hold_candidate_nll),
+            "Held-out NLL gain": float(hold_base_nll - hold_candidate_nll),
+            # Compatibility summary aliases.
+            "No-H2H NLL": float(hold_base_nll),
+            "Best residual H2H NLL": float(
+                hold_candidate_nll if active else hold_base_nll
+            ),
+            "NLL gain": float(
+                hold_base_nll - hold_candidate_nll if active else 0.0
+            ),
+            "Reason": (
+                "residual H2H improved later held-out games"
+                if active
+                else "residual H2H failed later held-out validation"
+            ),
+        })
+
+    return result, pd.DataFrame(audit_rows)
 
 
 def fit_player_h2h_prior_minutes(player_logs: pd.DataFrame):
@@ -405,36 +987,158 @@ def player_h2h_modifiers(
     rotation_similarity: float = 1.0,
     prior_minutes_by_stat: dict | None = None,
     max_weight: float | None = None,
+    residual_history: pd.DataFrame | None = None,
+    residual_calibration_by_stat: dict | None = None,
+    current_opponent_modifiers: dict | None = None,
 ):
-    """Disjoint empirical-Bayes same-season H2H opportunity correction.
+    """Same-season H2H opportunity correction.
 
-    v2.17.2 assumes ``profile`` was built with current-opponent H2H rows
-    excluded from opportunity buckets / adaptive role-state.  H2H is therefore
-    genuinely additional matchup evidence rather than the same games counted
-    twice.  Each stat uses a league-learned prior-equivalent minute mass K.
-    No fixed 5% blend cap and no raw-ratio clipping are used.
+    v2.17.3 production mode is *residualized*: historical H2H counts are
+    compared with what the no-H2H model would have expected at the time
+    (historical non-pair player rate × leave-pair-out generic opponent effect).
+    Only the remaining player×opponent residual is shrunk and applied.
 
-    ``max_weight`` is accepted only for backward API compatibility and ignored.
+    The residual multiplier has a Gamma prior centered at 1.  Its prior mass K
+    (expected events) and minute-relevance decay tau are learned league-wide by
+    chronological next-H2H predictive likelihood.  K=inf disables H2H; tau=inf
+    means no minute-distance penalty.
+
+    The older v2.17.2 prior-minute path is retained for backward compatibility
+    when residual inputs are not supplied.
     """
     neutral = {"2PA": 1.0, "3PA": 1.0, "REB": 1.0, "AST": 1.0}
     if player_log is None or player_log.empty:
         return neutral, pd.DataFrame()
+
     h = player_log[
         player_log["OPP_ABBR"].astype(str).str.upper().eq(str(opponent_abbr).upper())
     ].copy()
     if h.empty:
         return neutral, pd.DataFrame([{"H2H games": 0, "Posterior H2H weight": 0.0}])
 
-    mins = pd.to_numeric(h.get("MIN", 0), errors="coerce").fillna(0.0)
-    h = h[mins > 0].copy()
+    mins_s = pd.to_numeric(h.get("MIN", 0), errors="coerce").fillna(0.0)
+    h = h[mins_s > 0].copy()
     if h.empty:
         return neutral, pd.DataFrame([{"H2H games": 0, "Posterior H2H weight": 0.0}])
+
+    rot = float(np.clip(rotation_similarity, 0.0, 1.0))
+    base = {
+        "2PA": float(profile.get("two_pa_pm", np.nan)),
+        "3PA": float(profile.get("three_pa_pm", np.nan)),
+        "REB": float(profile.get("reb_pm", np.nan)),
+        "AST": float(profile.get("ast_pm", np.nan)),
+    }
+
+    # ------------------------------------------------------------------
+    # v2.17.3 production path: residualized H2H.
+    # ------------------------------------------------------------------
+    if (
+        residual_history is not None
+        and isinstance(residual_history, pd.DataFrame)
+        and residual_calibration_by_stat is not None
+    ):
+        rh = residual_history.copy()
+        if rh.empty:
+            return neutral, pd.DataFrame([{
+                "H2H games": int(len(h)),
+                "Residual H2H eligible games": 0,
+                "Posterior H2H weight": 0.0,
+                "Reason": "historical no-H2H expectation unavailable",
+            }])
+
+        out, rows = dict(neutral), []
+        current_opp = current_opponent_modifiers or {}
+
+        for st in _RESIDUAL_H2H_STATS:
+            cal = (residual_calibration_by_stat or {}).get(st, {}) or {}
+            active = bool(cal.get("active", False))
+            k = float(cal.get("prior_events_k", np.inf))
+            tau = float(cal.get("minute_tau", np.inf))
+
+            obs_col = f"{st}_observed"
+            exp_col = f"{st}_expected_events"
+            if obs_col not in rh.columns or exp_col not in rh.columns:
+                eligible = pd.DataFrame()
+            else:
+                eligible = rh.copy()
+                eligible[obs_col] = pd.to_numeric(eligible[obs_col], errors="coerce")
+                eligible[exp_col] = pd.to_numeric(eligible[exp_col], errors="coerce")
+                eligible["MIN"] = pd.to_numeric(eligible.get("MIN", 0), errors="coerce")
+                eligible = eligible[
+                    eligible[obs_col].notna()
+                    & eligible[exp_col].notna()
+                    & (eligible[exp_col] > 0)
+                    & (eligible["MIN"] > 0)
+                ].copy()
+
+            if eligible.empty or not active or np.isinf(k):
+                mod = 1.0
+                post_weight = 0.0
+                raw_residual = np.nan
+                obs_eff = 0.0
+                exp_eff = 0.0
+                mean_min_rel = 0.0
+            else:
+                hm = eligible["MIN"].to_numpy(float)
+                if np.isinf(tau):
+                    minute_rel = np.ones(len(eligible), dtype=float)
+                else:
+                    minute_rel = np.exp(
+                        -np.abs(hm - float(projected_minutes)) / max(float(tau), 1e-6)
+                    )
+                rel = rot * minute_rel
+                obs = eligible[obs_col].to_numpy(float)
+                exp_events = eligible[exp_col].to_numpy(float)
+                obs_eff = float(np.sum(obs * rel))
+                exp_eff = float(np.sum(exp_events * rel))
+                raw_residual = (obs_eff / exp_eff) if exp_eff > 0 else np.nan
+                mod = (
+                    float((obs_eff + k) / max(exp_eff + k, 1e-9))
+                    if exp_eff > 0 else 1.0
+                )
+                post_weight = float(exp_eff / (exp_eff + k)) if exp_eff > 0 else 0.0
+                mean_min_rel = float(np.mean(minute_rel)) if len(minute_rel) else 0.0
+
+            out[st] = float(mod if np.isfinite(mod) and mod > 0 else 1.0)
+            b = float(base.get(st, np.nan))
+            om = float(current_opp.get(st, 1.0))
+            current_no_h2h = (
+                b * om if np.isfinite(b) and b > 0 and np.isfinite(om) and om > 0
+                else np.nan
+            )
+            rows.append({
+                "Stat": st,
+                "H2H games": int(len(h)),
+                "Residual H2H eligible games": int(len(eligible)),
+                "Historical observed events (effective)": obs_eff,
+                "Historical no-H2H expected events (effective)": exp_eff,
+                "Raw H2H residual ratio": raw_residual,
+                "Rotation similarity": rot,
+                "Learned minute relevance tau": tau,
+                "Mean minute relevance": mean_min_rel,
+                "Prior residual events K": k,
+                "Posterior H2H weight": post_weight,
+                "Applied H2H weight": post_weight,
+                "Current non-H2H baseline rate/min": b,
+                "Current generic opponent modifier": om,
+                "Current no-H2H expected rate/min": current_no_h2h,
+                "Final H2H residual modifier": out[st],
+                # compatibility/audit aliases
+                "Final H2H modifier": out[st],
+                "Posterior rate/min": (
+                    current_no_h2h * out[st]
+                    if np.isfinite(current_no_h2h) else np.nan
+                ),
+            })
+        return out, pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------
+    # Legacy v2.17.2 path retained for old tests/callers.
+    # ------------------------------------------------------------------
     mins = pd.to_numeric(h["MIN"], errors="coerce").fillna(0.0).to_numpy(float)
     if float(np.sum(mins)) <= 0:
         return neutral, pd.DataFrame([{"H2H games": 0, "Posterior H2H weight": 0.0}])
 
-    # Similar minutes + similar current rotation become effective H2H exposure.
-    rot = float(np.clip(rotation_similarity, 0.0, 1.0))
     minute_rel = np.exp(-np.abs(mins - float(projected_minutes)) / 10.0)
     rel = rot * minute_rel
 
@@ -446,19 +1150,12 @@ def player_h2h_modifiers(
         "REB": pd.to_numeric(h.get("REB", 0), errors="coerce").fillna(0.0).to_numpy(float),
         "AST": pd.to_numeric(h.get("AST", 0), errors="coerce").fillna(0.0).to_numpy(float),
     }
-    base = {
-        "2PA": float(profile.get("two_pa_pm", np.nan)),
-        "3PA": float(profile.get("three_pa_pm", np.nan)),
-        "REB": float(profile.get("reb_pm", np.nan)),
-        "AST": float(profile.get("ast_pm", np.nan)),
-    }
-    # Backward-compatible fallback for older callers/tests. Production v2.17.2
-    # passes the learned K map, so this branch is not used by the live app.
+
     legacy_mode = prior_minutes_by_stat is None and max_weight is not None
     kmap = prior_minutes_by_stat or {k: np.inf for k in neutral}
 
     out, rows = dict(neutral), []
-    for st in ("2PA", "3PA", "REB", "AST"):
+    for st in _RESIDUAL_H2H_STATS:
         b = base[st]
         cw = float(np.sum(stat_counts[st] * rel))
         mw = float(np.sum(mins * rel))
@@ -485,8 +1182,8 @@ def player_h2h_modifiers(
             "Stat": st, "H2H games": int(len(h)),
             "H2H raw rate/min": raw_rate, "Non-H2H baseline rate/min": b,
             "Rotation similarity": rot, "Effective H2H minutes": mw,
-            "Learned prior minutes K": (np.nan if legacy_mode else k), "Posterior H2H weight": w,
-            "Applied H2H weight": w,
+            "Learned prior minutes K": (np.nan if legacy_mode else k),
+            "Posterior H2H weight": w, "Applied H2H weight": w,
             "Posterior rate/min": post, "Final H2H modifier": out[st],
         })
     return out, pd.DataFrame(rows)

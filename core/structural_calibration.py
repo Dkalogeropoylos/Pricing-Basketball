@@ -1,35 +1,33 @@
 from __future__ import annotations
 
-"""Walk-forward calibration for the main Team-Market structural rates.
+"""Walk-forward, opponent-adjusted Team-Market structural rates (v2.18).
 
-v2.17 replaces fixed opponent/H2H shrinkage for the four most important
-possession-allocation rates with a league-level empirical model:
+The v2.17 ridge model used eight correlated predictors (Own and Opponent
+Old/G6-10/L5 plus two H2H terms).  v2.18 replaces that specification with a
+more transparent decomposition:
 
-    3P_SHARE      : 3PA / FGA
-    FTA_RATE      : FTA / possessions
-    TOV_RATE      : TOV / possessions
-    AST_PER_MAKE  : AST / FGM   (WNBA/NBA official-stat convention)
+    transformed prediction
+      = current own non-H2H state
+      + beta * opponent-allowed deviation from league
+      + shrunk repeat-matchup residual
 
-The model is intentionally league-level rather than team-specific.  Every
-historical team-game is converted into a *pregame* training row using only
-information available before that game:
+where:
+  * Old / G6-10 / L5 remain non-overlapping;
+  * beta >= 0 is selected from chronological validation, and beta=0 is allowed;
+  * H2H is NOT a raw second opponent boost.  It is the residual left after the
+    own + opponent model at the time of each previous H2H;
+  * the H2H prior mass K is selected chronologically, with K=inf explicitly
+    disabling H2H;
+  * the final model must beat the own-state baseline on a genuinely later
+    holdout and must not degrade the extreme-opponent subset.
 
-  - own Old / G6-10 / L5 (non-overlapping), excluding the current opponent;
-  - opponent-allowed Old / G6-10 / L5, excluding the current offense;
-  - prior same-season H2H, kept disjoint from both baselines;
-  - the contemporaneous league baseline.
-
-Coefficients are learned with ridge regression in transformed space.  The ridge
-penalty is selected by expanding-window validation; the learned model is used
-only when its walk-forward RMSE beats the existing Old/G6-10/L5 baseline.
-There is therefore no manually chosen "opponent weight" or "H2H weight" for
-these four rates.
-
-Current-roster/OUT and location modifiers remain separate downstream layers.
+This is deliberately a small model.  It avoids coefficient sign instability
+from highly collinear recency buckets and makes the opponent and H2H
+contributions auditable in basketball units.
 """
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -37,26 +35,45 @@ import pandas as pd
 from core.buckets import WeightConfig, split_non_overlapping, active_weights
 
 
-FEATURES = ("3P_SHARE", "FTA", "TOV", "AST_PER_MAKE")
-X_COLS = (
-    "OWN_OLD", "OWN_MID", "OWN_L5",
-    "OPP_OLD", "OPP_MID", "OPP_L5",
-    "H2H_DEV", "H2H_DEV_LOGN",
-)
+FEATURES = ("3P_SHARE", "FTA", "TOV", "OREB_PER_MISS", "AST_PER_MAKE")
 
 
 @dataclass
 class StructuralModel:
     feature: str
     active: bool
-    beta: np.ndarray
-    x_mean: np.ndarray
-    x_sd: np.ndarray
-    ridge_lambda: float
+    opponent_beta: float
+    h2h_prior_k: float
     rows: int
-    cv_rmse: float
-    baseline_cv_rmse: float
-    coefficients: Dict[str, float]
+    tune_rmse: float
+    baseline_tune_rmse: float
+    holdout_rmse: float
+    baseline_holdout_rmse: float
+    extreme_holdout_rmse: float
+    baseline_extreme_holdout_rmse: float
+    holdout_rows: int
+    extreme_holdout_rows: int
+    training_table: pd.DataFrame = field(repr=False, default_factory=pd.DataFrame)
+
+    # Backward-compatible audit attributes used by older UI/tests.
+    @property
+    def ridge_lambda(self) -> float:
+        return np.nan
+
+    @property
+    def cv_rmse(self) -> float:
+        return self.holdout_rmse
+
+    @property
+    def baseline_cv_rmse(self) -> float:
+        return self.baseline_holdout_rmse
+
+    @property
+    def coefficients(self) -> Dict[str, float]:
+        return {
+            "Opponent beta": float(self.opponent_beta),
+            "H2H prior K": float(self.h2h_prior_k),
+        }
 
 
 def _estimate_possessions(df: pd.DataFrame) -> pd.Series:
@@ -73,6 +90,7 @@ def _single_game_features(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["FGA", "FGM", "FG3A", "FTA", "TOV", "AST", "OREB"]:
         x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
     poss = _estimate_possessions(x).clip(lower=1e-6)
+    misses = (x["FGA"] - x["FGM"]).clip(lower=1e-6)
     out = pd.DataFrame({
         "GAME_DATE": pd.to_datetime(x["GAME_DATE"], errors="coerce"),
         "GAME_ID": x["GAME_ID"].astype(str),
@@ -81,17 +99,15 @@ def _single_game_features(df: pd.DataFrame) -> pd.DataFrame:
         "3P_SHARE": x["FG3A"] / x["FGA"].replace(0, np.nan),
         "FTA": x["FTA"] / poss,
         "TOV": x["TOV"] / poss,
-        # WNBA/NBA official assists are tied to made field goals.  FIBA/
-        # EuroLeague has a different scoring-stat rule for passes leading to
-        # shooting fouls; that requires a league-specific PBP event model and
-        # must NOT be mixed into WNBA box-score AST.
+        "OREB_PER_MISS": x["OREB"] / misses,
+        # One official team assist can be credited to at most one made FG.
         "AST_PER_MAKE": x["AST"] / x["FGM"].replace(0, np.nan),
     })
     return out.replace([np.inf, -np.inf], np.nan)
 
 
 def _is_probability(feature: str) -> bool:
-    return feature in {"3P_SHARE", "TOV", "AST_PER_MAKE"}
+    return feature in {"3P_SHARE", "TOV", "OREB_PER_MISS", "AST_PER_MAKE"}
 
 
 def _transform(feature: str, v):
@@ -117,15 +133,8 @@ def _mean_feature(df: pd.DataFrame, feature: str, default=np.nan) -> float:
     return float(v.mean()) if len(v) else float(default)
 
 
-def _bucket_triplet(df: pd.DataFrame, feature: str, league: float) -> Tuple[float, float, float]:
-    if df is None or df.empty:
-        return float(league), float(league), float(league)
-    b = split_non_overlapping(df.sort_values("GAME_DATE"))
-    return tuple(_mean_feature(b[k], feature, league) for k in ("old", "mid", "l5"))
-
-
 def _cfg_baseline(df: pd.DataFrame, feature: str, league: float, cfg: WeightConfig) -> float:
-    """Existing outer-bucket baseline, used only as the benchmark/denominator."""
+    """Non-overlapping Old/G6-10/L5 state in raw feature space."""
     if df is None or df.empty:
         return float(league)
     buckets = split_non_overlapping(df.sort_values("GAME_DATE"))
@@ -134,46 +143,19 @@ def _cfg_baseline(df: pd.DataFrame, feature: str, league: float, cfg: WeightConf
     for k in ("old", "mid", "l5"):
         v = _mean_feature(buckets[k], feature, np.nan)
         if np.isfinite(v) and weights.get(k, 0.0) > 0:
-            vals.append(v); ws.append(weights[k])
+            vals.append(v)
+            ws.append(weights[k])
     return float(np.average(vals, weights=ws)) if vals else float(league)
 
 
-def _x_from_histories(
-    own_hist: pd.DataFrame,
-    opp_allowed_hist: pd.DataFrame,
-    h2h_hist: pd.DataFrame,
-    feature: str,
-    league: float,
-    h2h_rotation_similarity: float = 1.0,
-) -> np.ndarray:
-    lg_t = float(_transform(feature, [league])[0])
-    own = _bucket_triplet(own_hist, feature, league)
-    opp = _bucket_triplet(opp_allowed_hist, feature, league)
-
-    own_dev = [float(_transform(feature, [v])[0] - lg_t) for v in own]
-    opp_dev = [float(_transform(feature, [v])[0] - lg_t) for v in opp]
-
-    h_n = int(len(h2h_hist)) if h2h_hist is not None else 0
-    h_val = _mean_feature(h2h_hist, feature, league) if h_n else float(league)
-    h_dev = float(_transform(feature, [h_val])[0] - lg_t)
-    # Current rotation similarity is a factual matchup-quality input, not a
-    # fitted coefficient.  The *magnitude* of the H2H response is learned by
-    # the league-wide regression below.
-    h_dev *= float(np.clip(h2h_rotation_similarity, 0.0, 1.0))
-    h_logn = h_dev * float(np.log1p(h_n))
-
-    return np.asarray([*own_dev, *opp_dev, h_dev, h_logn], dtype=float)
-
-
 def _training_table(team_logs: pd.DataFrame, feature: str) -> pd.DataFrame:
+    """One row per team-game with strictly pregame/disjoint states."""
     g = _single_game_features(team_logs).dropna(subset=["GAME_DATE", feature]).copy()
     g = g.sort_values(["GAME_DATE", "GAME_ID", "TEAM_ABBR"]).reset_index(drop=True)
     if g.empty:
         return pd.DataFrame()
 
     records = []
-    # Process by game so neither team row from the target game can leak into the
-    # other side's pregame feature set.
     games = (
         g[["GAME_DATE", "GAME_ID"]]
         .drop_duplicates()
@@ -181,89 +163,141 @@ def _training_table(team_logs: pd.DataFrame, feature: str) -> pd.DataFrame:
         .itertuples(index=False, name=None)
     )
     prior = g.iloc[0:0].copy()
+    stable = WeightConfig.stable()
     for game_date, game_id in games:
         cur = g[(g["GAME_DATE"] == game_date) & (g["GAME_ID"] == game_id)]
         if len(prior) >= 80:
             league = _mean_feature(prior, feature, np.nan)
             if np.isfinite(league):
+                lg_t = float(_transform(feature, [league])[0])
                 for _, r in cur.iterrows():
                     team = str(r["TEAM_ABBR"]).upper()
                     opp = str(r["OPP_ABBR"]).upper()
+                    # Disjoint current-pair removal on BOTH sides.
                     own_hist = prior[prior["TEAM_ABBR"].eq(team) & ~prior["OPP_ABBR"].eq(opp)]
-                    # Outcomes historically ALLOWED by today's opponent, with
-                    # current-offense H2H removed to keep the layer disjoint.
                     opp_hist = prior[prior["OPP_ABBR"].eq(opp) & ~prior["TEAM_ABBR"].eq(team)]
-                    h2h = prior[prior["TEAM_ABBR"].eq(team) & prior["OPP_ABBR"].eq(opp)]
                     if len(own_hist) < 8 or len(opp_hist) < 8:
                         continue
-                    xv = _x_from_histories(own_hist, opp_hist, h2h, feature, league, 1.0)
+                    own = _cfg_baseline(own_hist, feature, league, stable)
+                    opp_allowed = _cfg_baseline(opp_hist, feature, league, stable)
                     actual = float(r[feature])
-                    if not np.isfinite(actual):
+                    if not all(np.isfinite(v) for v in (own, opp_allowed, actual)):
                         continue
-                    y = float(_transform(feature, [actual])[0] - _transform(feature, [league])[0])
-                    stable = _cfg_baseline(own_hist, feature, league, WeightConfig.stable())
-                    base_y = float(_transform(feature, [stable])[0] - _transform(feature, [league])[0])
+                    own_dev = float(_transform(feature, [own])[0] - lg_t)
+                    opp_dev = float(_transform(feature, [opp_allowed])[0] - lg_t)
+                    y = float(_transform(feature, [actual])[0] - lg_t)
                     records.append({
-                        "GAME_DATE": game_date, "GAME_ID": str(game_id),
-                        "TEAM_ABBR": team, "OPP_ABBR": opp,
-                        **{k: float(v) for k, v in zip(X_COLS, xv)},
-                        "Y": y, "BASE_Y": base_y,
+                        "GAME_DATE": game_date,
+                        "GAME_ID": str(game_id),
+                        "TEAM_ABBR": team,
+                        "OPP_ABBR": opp,
+                        "OWN_DEV": own_dev,
+                        "OPP_DEV": opp_dev,
+                        "Y": y,
+                        "BASE_Y": own_dev,
                     })
         prior = pd.concat([prior, cur], ignore_index=True)
-    return pd.DataFrame(records)
+    return pd.DataFrame(records).sort_values(["GAME_DATE", "GAME_ID", "TEAM_ABBR"]).reset_index(drop=True)
 
 
-def _fit_ridge(X: np.ndarray, y: np.ndarray, lam: float):
-    mean = X.mean(axis=0)
-    sd = X.std(axis=0, ddof=0)
-    sd = np.where(sd < 1e-8, 1.0, sd)
-    Z = (X - mean) / sd
-    A = np.column_stack([np.ones(len(Z)), Z])
-    pen = np.eye(A.shape[1]); pen[0, 0] = 0.0
-    beta = np.linalg.pinv(A.T @ A + float(lam) * pen) @ (A.T @ y)
-    return beta, mean, sd
+def _pair_key(row) -> tuple[str, str]:
+    return str(row.TEAM_ABBR), str(row.OPP_ABBR)
 
 
-def _predict(beta, mean, sd, X):
-    Z = (X - mean) / sd
-    A = np.column_stack([np.ones(len(Z)), Z])
-    return A @ beta
+def _h2h_term(resids: list[float], k: float) -> tuple[float, float]:
+    n = len(resids)
+    if n == 0 or not np.isfinite(k):
+        return 0.0, 0.0
+    w = float(n / (n + max(float(k), 1e-9)))
+    return float(w * np.mean(resids)), w
 
 
-def _walk_forward_lambda(df: pd.DataFrame) -> Tuple[float, float, float]:
-    X = df[list(X_COLS)].to_numpy(dtype=float)
+def _sequential_predictions(df: pd.DataFrame, beta: float, k: float) -> tuple[np.ndarray, np.ndarray]:
+    """Pregame predictions; pair residual memory is updated only AFTER a row."""
+    pred = np.empty(len(df), dtype=float)
+    h2h_terms = np.zeros(len(df), dtype=float)
+    pair_resids: Dict[tuple[str, str], list[float]] = {}
+    for i, r in enumerate(df.itertuples(index=False)):
+        key = _pair_key(r)
+        base = float(r.OWN_DEV) + float(beta) * float(r.OPP_DEV)
+        h2h, _ = _h2h_term(pair_resids.get(key, []), k)
+        pred[i] = base + h2h
+        h2h_terms[i] = h2h
+        # Residual is always against the no-H2H expectation.  This prevents a
+        # recursive H2H term from learning its own previous correction.
+        resid = float(r.Y) - base
+        pair_resids.setdefault(key, []).append(resid)
+    return pred, h2h_terms
+
+
+def _rmse(y: np.ndarray, p: np.ndarray) -> float:
+    if len(y) == 0:
+        return np.nan
+    return float(np.sqrt(np.mean(np.square(y - p))))
+
+
+def _select_params(df: pd.DataFrame):
+    """Tune on earlier blocked windows; reserve the last 30% for activation."""
+    n = len(df)
+    if n < 100:
+        return 0.0, np.inf, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0, 0
+
+    hold_start = max(int(n * 0.70), 70)
+    tune_end = hold_start
+    # Two expanding, chronologically later tuning blocks inside the first 70%.
+    starts = sorted(set([max(60, int(tune_end * 0.55)), max(70, int(tune_end * 0.72))]))
+    tune_idx = []
+    block = max(15, int(tune_end * 0.12))
+    for s in starts:
+        e = min(s + block, tune_end)
+        if e > s:
+            tune_idx.extend(range(s, e))
+    tune_idx = np.asarray(sorted(set(tune_idx)), dtype=int)
+    if len(tune_idx) < 20:
+        tune_idx = np.arange(max(60, int(tune_end * 0.60)), tune_end, dtype=int)
+
     y = df["Y"].to_numpy(dtype=float)
     base = df["BASE_Y"].to_numpy(dtype=float)
-    n = len(df)
-    if n < 90:
-        return 1.0, np.nan, np.nan
+    beta_grid = np.round(np.arange(0.0, 2.0001, 0.05), 2)
+    k_grid = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, np.inf]
 
-    # Broad logarithmic grid; the DATA choose the penalty.  No one penalty is
-    # hard-wired into the model.
-    lambdas = np.logspace(-4, 2, 13)
-    starts = sorted(set([int(n * q) for q in (0.55, 0.68, 0.81)]))
-    val_size = max(20, int(n * 0.12))
-    folds = [(s, min(s + val_size, n)) for s in starts if s >= 60 and s < n - 10]
-    if not folds:
-        return 1.0, np.nan, np.nan
+    best = (np.inf, 0.0, np.inf)
+    for beta in beta_grid:
+        for k in k_grid:
+            p, _ = _sequential_predictions(df.iloc[:tune_end], float(beta), float(k))
+            score = _rmse(y[tune_idx], p[tune_idx])
+            # Prefer simpler/no-H2H model on exact ties.
+            complexity = (0 if np.isinf(k) else 1, float(beta))
+            best_complexity = (0 if np.isinf(best[2]) else 1, float(best[1]))
+            if score < best[0] - 1e-12 or (abs(score - best[0]) <= 1e-12 and complexity < best_complexity):
+                best = (score, float(beta), float(k))
 
-    best_lam, best_rmse = None, np.inf
-    all_val_idx = []
-    for lam in lambdas:
-        errs = []
-        for s, e in folds:
-            beta, mean, sd = _fit_ridge(X[:s], y[:s], lam)
-            pred = _predict(beta, mean, sd, X[s:e])
-            errs.extend((y[s:e] - pred).tolist())
-            if lam == lambdas[0]:
-                all_val_idx.extend(range(s, e))
-        rmse = float(np.sqrt(np.mean(np.square(errs)))) if errs else np.inf
-        if rmse < best_rmse:
-            best_rmse, best_lam = rmse, float(lam)
+    tune_rmse, beta, k = best
+    baseline_tune = _rmse(y[tune_idx], base[tune_idx])
 
-    idx = np.asarray(sorted(set(all_val_idx)), dtype=int)
-    baseline_rmse = float(np.sqrt(np.mean((y[idx] - base[idx]) ** 2))) if len(idx) else np.nan
-    return float(best_lam), float(best_rmse), baseline_rmse
+    # Completely later holdout, not used to choose beta/K.
+    pred_all, _ = _sequential_predictions(df, beta, k)
+    hold_idx = np.arange(hold_start, n, dtype=int)
+    hold_rmse = _rmse(y[hold_idx], pred_all[hold_idx])
+    base_hold = _rmse(y[hold_idx], base[hold_idx])
+
+    # Stress-test the tails of opponent context.  A model that wins on average
+    # but breaks against extreme defenses is not activated.
+    opp_abs = np.abs(df["OPP_DEV"].to_numpy(dtype=float)[hold_idx])
+    if len(opp_abs) >= 20:
+        q = float(np.quantile(opp_abs, 0.75))
+        ext_local = np.where(opp_abs >= q)[0]
+        ext_idx = hold_idx[ext_local]
+    else:
+        ext_idx = np.asarray([], dtype=int)
+    ext_rmse = _rmse(y[ext_idx], pred_all[ext_idx]) if len(ext_idx) else np.nan
+    base_ext = _rmse(y[ext_idx], base[ext_idx]) if len(ext_idx) else np.nan
+
+    return (
+        beta, k, tune_rmse, baseline_tune,
+        hold_rmse, base_hold, ext_rmse, base_ext,
+        len(hold_idx), len(ext_idx),
+    )
 
 
 def fit_structural_rate_models(team_logs: pd.DataFrame):
@@ -271,34 +305,65 @@ def fit_structural_rate_models(team_logs: pd.DataFrame):
     audit_rows = []
     for feature in FEATURES:
         df = _training_table(team_logs, feature)
-        if len(df) < 90:
-            model = StructuralModel(feature, False, np.zeros(1 + len(X_COLS)), np.zeros(len(X_COLS)),
-                                    np.ones(len(X_COLS)), 1.0, len(df), np.nan, np.nan, {})
+        if len(df) < 100:
+            model = StructuralModel(
+                feature, False, 0.0, np.inf, len(df),
+                np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0, 0, df,
+            )
             models[feature] = model
-            audit_rows.append({"Feature": feature, "Active": False, "Rows": len(df), "Reason": "insufficient walk-forward rows"})
+            audit_rows.append({
+                "Feature": feature, "Active": False, "Rows": len(df),
+                "Reason": "insufficient chronological rows",
+            })
             continue
 
-        lam, cv_rmse, base_rmse = _walk_forward_lambda(df)
-        X = df[list(X_COLS)].to_numpy(dtype=float)
-        y = df["Y"].to_numpy(dtype=float)
-        beta, mean, sd = _fit_ridge(X, y, lam)
-        # Activate only when the learned structure improves genuinely unseen
-        # games versus the existing stable Old/G6-10/L5 baseline.
-        active = bool(np.isfinite(cv_rmse) and np.isfinite(base_rmse) and cv_rmse < base_rmse)
-        coeff = {"Intercept": float(beta[0])}
-        for j, name in enumerate(X_COLS):
-            # Coefficient in standardized-X space; audit only.
-            coeff[name] = float(beta[j + 1])
-        model = StructuralModel(feature, active, beta, mean, sd, lam, len(df), cv_rmse, base_rmse, coeff)
+        beta, k, tune_rmse, base_tune, hold_rmse, base_hold, ext_rmse, base_ext, hn, en = _select_params(df)
+        overall_ok = bool(np.isfinite(hold_rmse) and np.isfinite(base_hold) and hold_rmse < base_hold)
+        extreme_ok = bool(
+            en < 12
+            or not (np.isfinite(ext_rmse) and np.isfinite(base_ext))
+            or ext_rmse <= base_ext
+        )
+        active = overall_ok and extreme_ok
+        model = StructuralModel(
+            feature, active, beta, k, len(df), tune_rmse, base_tune,
+            hold_rmse, base_hold, ext_rmse, base_ext, hn, en, df,
+        )
         models[feature] = model
         audit_rows.append({
-            "Feature": feature, "Active": active, "Rows": len(df),
-            "Selected ridge lambda": lam, "Walk-forward RMSE": cv_rmse,
-            "Existing baseline RMSE": base_rmse,
-            "Relative RMSE gain": ((base_rmse - cv_rmse) / base_rmse) if np.isfinite(base_rmse) and base_rmse > 0 else np.nan,
-            "Reason": "walk-forward improvement" if active else "no out-of-sample improvement",
+            "Feature": feature,
+            "Active": active,
+            "Rows": len(df),
+            "Opponent beta": beta,
+            "H2H prior K": k,
+            "Tune RMSE": tune_rmse,
+            "Own-only tune RMSE": base_tune,
+            "Later holdout RMSE": hold_rmse,
+            "Own-only holdout RMSE": base_hold,
+            "Extreme-opponent holdout RMSE": ext_rmse,
+            "Own-only extreme RMSE": base_ext,
+            "Holdout rows": hn,
+            "Extreme holdout rows": en,
+            "Reason": (
+                "later holdout + extreme-opponent improvement"
+                if active else
+                ("no later holdout improvement" if not overall_ok else "fails extreme-opponent stress test")
+            ),
         })
     return models, pd.DataFrame(audit_rows)
+
+
+def _current_pair_residuals(model: StructuralModel, team: str, opp: str) -> list[float]:
+    if model.training_table is None or model.training_table.empty:
+        return []
+    h = model.training_table[
+        model.training_table["TEAM_ABBR"].eq(team)
+        & model.training_table["OPP_ABBR"].eq(opp)
+    ]
+    if h.empty:
+        return []
+    base = h["OWN_DEV"].to_numpy(dtype=float) + float(model.opponent_beta) * h["OPP_DEV"].to_numpy(dtype=float)
+    return (h["Y"].to_numpy(dtype=float) - base).tolist()
 
 
 def predict_structural_modifiers(
@@ -309,53 +374,94 @@ def predict_structural_modifiers(
     cfg: WeightConfig,
     h2h_rotation_similarity: float = 1.0,
 ):
-    """Return empirically learned structural modifiers for the current matchup.
-
-    The modifier is learned_prediction / existing non-H2H outer-bucket baseline.
-    Multiplying it by the live profile therefore preserves current availability /
-    roster-similarity adjustments while replacing the fixed recent/opponent/H2H
-    weights with the walk-forward learned structural signal.
-    """
+    """Return current opponent + residualized-H2H modifiers and a full audit."""
     g = _single_game_features(team_logs).dropna(subset=["GAME_DATE"]).copy()
-    team = str(team_abbr).upper(); opp = str(opponent_abbr).upper()
+    team = str(team_abbr).upper()
+    opp = str(opponent_abbr).upper()
     own_hist = g[g["TEAM_ABBR"].eq(team) & ~g["OPP_ABBR"].eq(opp)].copy()
     opp_hist = g[g["OPP_ABBR"].eq(opp) & ~g["TEAM_ABBR"].eq(team)].copy()
-    h2h = g[g["TEAM_ABBR"].eq(team) & g["OPP_ABBR"].eq(opp)].copy()
+    raw_h2h = g[g["TEAM_ABBR"].eq(team) & g["OPP_ABBR"].eq(opp)].copy()
 
-    mods = {"3P_SHARE": 1.0, "FTA": 1.0, "TOV": 1.0, "AST": 1.0}
+    mods = {"3P_SHARE": 1.0, "FTA": 1.0, "TOV": 1.0, "OREB": 1.0, "AST": 1.0}
     audit = []
-    mapping = {"3P_SHARE": "3P_SHARE", "FTA": "FTA", "TOV": "TOV", "AST_PER_MAKE": "AST"}
+    mapping = {
+        "3P_SHARE": "3P_SHARE",
+        "FTA": "FTA",
+        "TOV": "TOV",
+        "OREB_PER_MISS": "OREB",
+        "AST_PER_MAKE": "AST",
+    }
 
     for feature in FEATURES:
         model = models.get(feature)
         league = _mean_feature(g, feature, np.nan)
         baseline = _cfg_baseline(own_hist, feature, league, cfg) if np.isfinite(league) else np.nan
+        opp_state = _cfg_baseline(opp_hist, feature, league, WeightConfig.stable()) if np.isfinite(league) else np.nan
+        pred_no_h2h = baseline
         pred = baseline
-        if model is not None and model.active and np.isfinite(league) and len(own_hist) >= 8 and len(opp_hist) >= 8:
-            xv = _x_from_histories(
-                own_hist, opp_hist, h2h, feature, league,
-                h2h_rotation_similarity=h2h_rotation_similarity,
-            ).reshape(1, -1)
-            dev = float(_predict(model.beta, model.x_mean, model.x_sd, xv)[0])
-            pred = float(_inverse(feature, [_transform(feature, [league])[0] + dev])[0])
-        # Physical simulator bounds only; no matchup-response cap.
-        if feature == "3P_SHARE": pred = float(np.clip(pred, 0.06, 0.75))
-        elif feature == "TOV": pred = float(np.clip(pred, 0.03, 0.30))
-        elif feature == "FTA": pred = float(np.clip(pred, 0.05, 0.55))
-        elif feature == "AST_PER_MAKE": pred = float(np.clip(pred, 0.20, 0.95))
+        h2h_raw_resid = np.nan
+        h2h_weight = 0.0
+        h2h_effect_t = 0.0
+        usable_h2h = 0
+
+        if (
+            model is not None and model.active and np.isfinite(league)
+            and np.isfinite(baseline) and baseline > 0
+            and np.isfinite(opp_state) and opp_state > 0
+            and len(own_hist) >= 8 and len(opp_hist) >= 8
+        ):
+            lg_t = float(_transform(feature, [league])[0])
+            own_t = float(_transform(feature, [baseline])[0])
+            opp_t = float(_transform(feature, [opp_state])[0])
+            no_h2h_t = own_t + float(model.opponent_beta) * (opp_t - lg_t)
+            pred_no_h2h = float(_inverse(feature, [no_h2h_t])[0])
+
+            residuals = _current_pair_residuals(model, team, opp)
+            usable_h2h = len(residuals)
+            if usable_h2h:
+                h2h_raw_resid = float(np.mean(residuals))
+                if np.isfinite(model.h2h_prior_k):
+                    h2h_weight = float(usable_h2h / (usable_h2h + max(model.h2h_prior_k, 1e-9)))
+                    h2h_weight *= float(np.clip(h2h_rotation_similarity, 0.0, 1.0))
+                    h2h_effect_t = h2h_weight * h2h_raw_resid
+            pred = float(_inverse(feature, [no_h2h_t + h2h_effect_t])[0])
+
+        # Physical bounds only.  These are not matchup-strength caps.
+        if feature == "3P_SHARE":
+            pred = float(np.clip(pred, 0.06, 0.75)); pred_no_h2h = float(np.clip(pred_no_h2h, 0.06, 0.75))
+        elif feature == "TOV":
+            pred = float(np.clip(pred, 0.03, 0.30)); pred_no_h2h = float(np.clip(pred_no_h2h, 0.03, 0.30))
+        elif feature == "FTA":
+            pred = float(np.clip(pred, 0.05, 0.55)); pred_no_h2h = float(np.clip(pred_no_h2h, 0.05, 0.55))
+        elif feature == "OREB_PER_MISS":
+            pred = float(np.clip(pred, 0.05, 0.55)); pred_no_h2h = float(np.clip(pred_no_h2h, 0.05, 0.55))
+        elif feature == "AST_PER_MAKE":
+            pred = float(np.clip(pred, 0.20, 0.95)); pred_no_h2h = float(np.clip(pred_no_h2h, 0.20, 0.95))
+
         mod = float(pred / baseline) if np.isfinite(pred) and np.isfinite(baseline) and baseline > 0 else 1.0
         mods[mapping[feature]] = mod
         audit.append({
             "Feature": feature,
             "Model active": bool(model.active) if model else False,
-            "Existing non-H2H baseline": baseline,
-            "Learned current prediction": pred,
-            "Applied modifier": mod,
-            "H2H games": int(len(h2h)),
+            "Own non-H2H state": baseline,
+            "Opponent allowed state": opp_state,
+            "Opponent beta": float(model.opponent_beta) if model else 0.0,
+            "Prediction without H2H": pred_no_h2h,
+            "Raw H2H games": int(len(raw_h2h)),
+            "Usable residual H2H games": usable_h2h,
+            "H2H residual mean (transformed)": h2h_raw_resid,
+            "H2H prior K": float(model.h2h_prior_k) if model else np.inf,
             "H2H rotation similarity": float(h2h_rotation_similarity),
+            "Effective H2H weight": h2h_weight,
+            "H2H transformed delta": h2h_effect_t,
+            "Final learned prediction": pred,
+            "H2H raw-unit delta": (pred - pred_no_h2h) if np.isfinite(pred) and np.isfinite(pred_no_h2h) else np.nan,
+            "Applied modifier": mod,
             "Training rows": int(model.rows) if model else 0,
-            "Walk-forward RMSE": float(model.cv_rmse) if model else np.nan,
-            "Baseline RMSE": float(model.baseline_cv_rmse) if model else np.nan,
+            "Later holdout RMSE": float(model.holdout_rmse) if model else np.nan,
+            "Own-only holdout RMSE": float(model.baseline_holdout_rmse) if model else np.nan,
+            "Extreme holdout RMSE": float(model.extreme_holdout_rmse) if model else np.nan,
+            "Own-only extreme RMSE": float(model.baseline_extreme_holdout_rmse) if model else np.nan,
         })
     return mods, pd.DataFrame(audit)
 
@@ -363,10 +469,24 @@ def predict_structural_modifiers(
 def coefficient_audit(models: Dict[str, StructuralModel]) -> pd.DataFrame:
     rows = []
     for feature, model in models.items():
-        for name, value in model.coefficients.items():
-            rows.append({
-                "Feature": feature, "Term": name, "Coefficient": value,
-                "Active": model.active, "Rows": model.rows,
-                "Ridge lambda": model.ridge_lambda,
-            })
+        rows.extend([
+            {
+                "Feature": feature,
+                "Term": "Opponent beta",
+                "Coefficient": float(model.opponent_beta),
+                "Active": model.active,
+                "Rows": model.rows,
+                "Later holdout RMSE": model.holdout_rmse,
+                "Baseline holdout RMSE": model.baseline_holdout_rmse,
+            },
+            {
+                "Feature": feature,
+                "Term": "H2H prior K",
+                "Coefficient": float(model.h2h_prior_k),
+                "Active": model.active,
+                "Rows": model.rows,
+                "Later holdout RMSE": model.holdout_rmse,
+                "Baseline holdout RMSE": model.baseline_holdout_rmse,
+            },
+        ])
     return pd.DataFrame(rows)

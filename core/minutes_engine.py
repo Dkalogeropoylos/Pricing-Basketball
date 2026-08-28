@@ -23,6 +23,26 @@ class MinutesProjection:
     regime: str
 
 
+def resolve_minutes_sd(raw_sd: float, ratio: float = 1.0, source: str = "AUTO") -> float:
+    """Resolve Monte-Carlo minute uncertainty without moving the central mean.
+
+    The historical role-conditioned SD is the uncertainty estimate. Trader or
+    metadata overrides change the central minute estimate only; they do not
+    mechanically make the player more certain and are therefore *not* capped at
+    2.25 minutes. Auto allocations may scale the historical SD mildly when the
+    200-minute engine materially scales the role. OUT/outside-rotation states
+    have zero simulated minute uncertainty.
+    """
+    src = str(source or "AUTO").upper()
+    if src in {"OUT", "OUTSIDE ROTATION"}:
+        return 0.0
+    base = float(np.clip(float(raw_sd) if np.isfinite(raw_sd) else 2.0, 1.0, 5.5))
+    if src in {"TRADER", "METADATA"}:
+        return base
+    scale = float(np.sqrt(np.clip(float(ratio), 0.6, 1.6)))
+    return float(np.clip(base * scale, 1.0, 5.5))
+
+
 def _truthy_starter(v) -> bool:
     if isinstance(v, bool):
         return v
@@ -675,9 +695,22 @@ def project_team_minutes(
         np.maximum(out["Raw Auto Min"].to_numpy(), 0.5),
         1.0,
     )
-    out["Minutes SD"] = np.clip(
-        out["Raw SD"].to_numpy() * np.sqrt(np.clip(ratio, 0.6, 1.6)),
-        1.0, 5.5
+    out["Minutes SD"] = [
+        resolve_minutes_sd(raw_sd, r, src)
+        for raw_sd, r, src in zip(
+            pd.to_numeric(out["Raw SD"], errors="coerce").fillna(2.0),
+            ratio,
+            out["Source"].astype(str),
+        )
+    ]
+    out["Minutes SD Method"] = np.where(
+        out["Source"].isin(["TRADER", "METADATA"]),
+        "historical conditional SD; override changes mean only",
+        np.where(
+            out["Source"].isin(["OUT", "OUTSIDE ROTATION"]),
+            "none",
+            "historical conditional SD + allocation scale",
+        ),
     )
     out["Low Min"] = np.clip(
         out["Projected Min"] - 1.20 * out["Minutes SD"], 0, 40
@@ -685,23 +718,6 @@ def project_team_minutes(
     out["High Min"] = np.clip(
         out["Projected Min"] + 1.20 * out["Minutes SD"], 0, 40
     )
-
-    fixed_mask = out["Source"].isin(["TRADER", "METADATA"])
-    out.loc[fixed_mask, "Minutes SD"] = np.minimum(
-        out.loc[fixed_mask, "Minutes SD"], 2.25
-    )
-    out.loc[fixed_mask, "Low Min"] = np.clip(
-        out.loc[fixed_mask, "Projected Min"]
-        - 1.20 * out.loc[fixed_mask, "Minutes SD"], 0, 40
-    )
-    out.loc[fixed_mask, "High Min"] = np.clip(
-        out.loc[fixed_mask, "Projected Min"]
-        + 1.20 * out.loc[fixed_mask, "Minutes SD"], 0, 40
-    )
-    out.loc[
-        out["Source"].isin(["OUT", "OUTSIDE ROTATION"]),
-        ["Minutes SD", "Low Min", "High Min"]
-    ] = 0.0
 
     out.attrs["redistribution_matrix"] = matrix
     out.attrs["redistribution_matrix_audit"] = matrix_audit

@@ -554,18 +554,16 @@ def h2h_profile_blend(
     max_weight: float = 0.10,
     skip_features: Optional[set[str]] = None,
 ) -> Tuple[dict, pd.DataFrame]:
-    """Blend a DISJOINT same-season H2H sample into structural team rates.
+    """Legacy disjoint H2H blend retained for compatibility/audit.
 
-    build_team_profile(..., exclude_opponent_abbr=...) must be used for the
-    baseline when this function is used. That guarantees H2H rows do not also
-    live inside Old/G6-10/L5. Shooting percentages are intentionally excluded
-    because two or three games are too noisy for efficiency estimation.
+    v2.18 calls this with every structural feature in ``skip_features`` so no
+    fixed percentage H2H weight reaches production Team Markets. Supported
+    rates receive H2H only through the chronologically validated residual model
+    in ``core.structural_calibration``; unsupported rates keep H2H audit-only.
 
-    Weight:
-        0.20 * N/(N+2) * rotation_similarity, capped at 10%.
-    Same-season H2H is deliberately a small matchup-specific layer because
-    pair samples are sparse; two comparable H2Hs are usually ~6-8%, while
-    even four games cannot become more than 10%.
+    The old 0.20*N/(N+2), capped at 10%, code path is kept only so older tests
+    or external callers do not break. It is not used by the v2.18 Streamlit
+    production path.
     """
     out = dict(base_profile)
     if league_team_logs is None or league_team_logs.empty:
@@ -612,7 +610,7 @@ def h2h_profile_blend(
                 "Rotation similarity": sim,
                 "Applied H2H weight": 0.0,
                 "Final": float(base_profile.get(target_key, np.nan)),
-                "Reason": "handled by v2.17 walk-forward structural model",
+                "Reason": "v2.18 production: fixed H2H weight disabled; residual model or audit-only",
             })
             continue
         b = float(base_profile.get(target_key, np.nan))
