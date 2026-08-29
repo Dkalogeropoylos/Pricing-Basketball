@@ -595,11 +595,7 @@ def build_rotation_state_impact(
         stat_conf = _state_conf(stat)
         # Historical exact/near-state evidence already lives inside the team
         # buckets. The synthetic bridge fills only the residual information gap.
-        # v2.18.3: state confidence already measures how much genuinely similar
-        # historical rotation-role evidence exists. Do not apply the former
-        # universal 0.65 factor on top of the stat-specific TEAM_STAT_POWER; that
-        # was a second shrinkage layer and made large roster changes nearly inert.
-        out_evidence = 1.0 - stat_conf
+        out_evidence = 0.65 * (1.0 - stat_conf)
         r_out = _ratio(out_feat.get(stat, np.nan), healthy_feat.get(stat, np.nan), 1.0)
         r_rest = _ratio(current_feat.get(stat, np.nan), out_feat.get(stat, np.nan), 1.0)
         m_out = _pow_clip(r_out, power * out_evidence, lo, hi)
