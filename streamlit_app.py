@@ -59,12 +59,12 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.18.2 — roster diagnostic")
+st.title("🏀 Basketball Pricing Engine v2.18.3 — rotation-role roster state")
 st.caption(
-    "DIAGNOSTIC ONLY: pricing math is unchanged from v2.18.2 + DREB wiring fix. This build only exposes raw healthy/OUT/current roster composition. "
-    "Player H2H is fully disjoint from adaptive role-state and uses league-learned empirical-Bayes "
-    "prior minutes instead of a universal 5% cap. Team 3P%/2P% use attempt-weighted held-out binomial "
-    "offense-vs-defense calibration; v2.17 possession/shot-allocation structure remains unchanged."
+    "v2.18.3: Team Markets define confirmed-OUT near-state by the resulting regulation-normalized rotation ROLE profile, "
+    "not by injury-list name overlap. 3PA is matched by shooting role across all positions; frontcourt position mix is "
+    "supplementary only for OREB/DREB/BLK. Comparable historical states and the synthetic 200-minute fallback are overlap-protected. "
+    "Player Props remain on the v2.18.2 continuous residual-H2H architecture. DREB wiring fix is retained."
 )
 
 
@@ -898,11 +898,25 @@ with tab_team:
             )
 
         # -----------------------------------------------------------------
-        # INNER historical relevance: exact OUT state + weak residual rotation.
-        # These two layers are deliberately separated to avoid injury overlap.
+        # INNER historical relevance: current rotation-role state.
+        # Historical games are matched to the resulting team profile, not to OUT-name overlap.
         # -----------------------------------------------------------------
         home_out = confirmed_out_players(manual_context, pool, setup["home_abbr"])
         away_out = confirmed_out_players(manual_context, pool, setup["away_abbr"])
+
+        # v2.18.3: build the current confirmed-OUT 200-minute rotations FIRST.
+        # Team near-state matching then compares historical ROLE composition with
+        # this actual current rotation. The preliminary modifiers are discarded;
+        # only the out-only minute boards are used here, so no pricing effect is
+        # applied twice. Explicit minute restrictions remain a separate layer.
+        home_rot_pre = build_rotation_state_impact(
+            player_db, team_db, pool, setup["home_abbr"], setup["home_name"],
+            manual_context, home_out, state_confidence_by_stat={},
+        )
+        away_rot_pre = build_rotation_state_impact(
+            player_db, team_db, pool, setup["away_abbr"], setup["away_name"],
+            manual_context, away_out, state_confidence_by_stat={},
+        )
 
         team_state_stats = [
             "FGA", "3PA", "FTA", "TOV", "OREB", "DREB",
@@ -912,24 +926,30 @@ with tab_team:
             player_db, home_log, setup["home_abbr"], home_out, team_state_stats,
             current_pool=pool, focal_player=None, k=float(availability_k),
             maturity_games=5.0, exclude_opponent_abbr=setup["away_abbr"],
+            team_rotation_board=home_rot_pre.out_only_minutes,
         )
         away_avail_maps, away_avail_audit, away_state_scores = availability_similarity_weight_maps(
             player_db, away_log, setup["away_abbr"], away_out, team_state_stats,
             current_pool=pool, focal_player=None, k=float(availability_k),
             maturity_games=5.0, exclude_opponent_abbr=setup["home_abbr"],
+            team_rotation_board=away_rot_pre.out_only_minutes,
         )
 
+        # Overlap guard: with confirmed OUTs, the v2.18.3 role-state similarity
+        # already compares the complete historical vs current rotation. Applying
+        # residual Jaccard on top would count roster composition twice. Retain the
+        # legacy weak Jaccard only when there is no confirmed-OUT role state.
         home_rot_w = (
             residual_rotation_similarity_weights(
                 player_db, pool, setup["home_abbr"], manual_context,
                 out_players=home_out, residual_strength=0.15,
-            ) if rotation_similarity_enabled else {}
+            ) if rotation_similarity_enabled and not home_out else {}
         )
         away_rot_w = (
             residual_rotation_similarity_weights(
                 player_db, pool, setup["away_abbr"], manual_context,
                 out_players=away_out, residual_strength=0.15,
-            ) if rotation_similarity_enabled else {}
+            ) if rotation_similarity_enabled and not away_out else {}
         )
         home_game_weights_by_stat = combine_stat_weight_maps(home_avail_maps, home_rot_w)
         away_game_weights_by_stat = combine_stat_weight_maps(away_avail_maps, away_rot_w)
@@ -938,7 +958,7 @@ with tab_team:
         away_game_weights = away_game_weights_by_stat.get("FGA", away_rot_w)
 
         # Baseline excludes current-opponent H2H INSIDE the actual Old/G6-10/L5
-        # buckets. Near-state similarity is also INNER-only, once per historical game.
+        # buckets. Rotation-role similarity is INNER-only, once per historical game/stat.
         home_profile, home_audit = build_team_profile(
             home_log, home_cfg,
             league_team_logs=team_db,
@@ -1494,7 +1514,7 @@ with tab_team:
                 st.markdown(f"**{setup['home_abbr']} buckets — {home_regime}**")
                 st.dataframe(home_audit.round(4), use_container_width=True, hide_index=True)
 
-                st.markdown("**Confirmed OUT exact/near-state + residual rotation — overlap audit**")
+                st.markdown("**Confirmed OUT rotation-role near-state — overlap audit**")
                 st.caption(
                     "Availability similarity and residual rotation are both INNER-bucket weights. Each game receives one availability score per stat. "
                     "Selected OUT names are removed from residual Jaccard, so the same absence is not counted twice. "
@@ -1581,7 +1601,15 @@ with tab_team:
                     def _mins(board, label):
                         if board is None or board.empty:
                             return pd.Series(dtype=float, name=label)
-                        return board.set_index("Player")["Projected Min"].astype(float).rename(label)
+                        # Build a fresh Series from raw arrays so pandas does not
+                        # inherit DataFrame.attrs containing nested DataFrames.
+                        # Those attrs make pd.concat's equality check ambiguous.
+                        return pd.Series(
+                            pd.to_numeric(board["Projected Min"], errors="coerce").fillna(0.0).to_numpy(float),
+                            index=board["Player"].astype(str).to_numpy(),
+                            name=label,
+                            dtype=float,
+                        )
                     mins = pd.concat([
                         _mins(impact.healthy_minutes, "Healthy Min"),
                         _mins(impact.out_only_minutes, "OUT-only Min"),
