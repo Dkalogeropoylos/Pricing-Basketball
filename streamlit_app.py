@@ -59,12 +59,11 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.18.3 — rotation-role roster state")
+st.title("🏀 Basketball Pricing Engine v2.17.2 — disjoint H2H + shooting efficiency")
 st.caption(
-    "v2.18.3: Team Markets define confirmed-OUT near-state by the resulting regulation-normalized rotation ROLE profile, "
-    "not by injury-list name overlap. 3PA is matched by shooting role across all positions; frontcourt position mix is "
-    "supplementary only for OREB/DREB/BLK. Comparable historical states and the synthetic 200-minute fallback are overlap-protected. "
-    "Player Props remain on the v2.18.2 continuous residual-H2H architecture. DREB wiring fix is retained."
+    "v2.17.2: player H2H is fully disjoint from adaptive role-state and uses league-learned empirical-Bayes "
+    "prior minutes instead of a universal 5% cap. Team 3P%/2P% use attempt-weighted held-out binomial "
+    "offense-vs-defense calibration; v2.17 possession/shot-allocation structure remains unchanged."
 )
 
 
@@ -898,25 +897,11 @@ with tab_team:
             )
 
         # -----------------------------------------------------------------
-        # INNER historical relevance: current rotation-role state.
-        # Historical games are matched to the resulting team profile, not to OUT-name overlap.
+        # INNER historical relevance: exact OUT state + weak residual rotation.
+        # These two layers are deliberately separated to avoid injury overlap.
         # -----------------------------------------------------------------
         home_out = confirmed_out_players(manual_context, pool, setup["home_abbr"])
         away_out = confirmed_out_players(manual_context, pool, setup["away_abbr"])
-
-        # v2.18.3: build the current confirmed-OUT 200-minute rotations FIRST.
-        # Team near-state matching then compares historical ROLE composition with
-        # this actual current rotation. The preliminary modifiers are discarded;
-        # only the out-only minute boards are used here, so no pricing effect is
-        # applied twice. Explicit minute restrictions remain a separate layer.
-        home_rot_pre = build_rotation_state_impact(
-            player_db, team_db, pool, setup["home_abbr"], setup["home_name"],
-            manual_context, home_out, state_confidence_by_stat={},
-        )
-        away_rot_pre = build_rotation_state_impact(
-            player_db, team_db, pool, setup["away_abbr"], setup["away_name"],
-            manual_context, away_out, state_confidence_by_stat={},
-        )
 
         team_state_stats = [
             "FGA", "3PA", "FTA", "TOV", "OREB", "DREB",
@@ -926,30 +911,24 @@ with tab_team:
             player_db, home_log, setup["home_abbr"], home_out, team_state_stats,
             current_pool=pool, focal_player=None, k=float(availability_k),
             maturity_games=5.0, exclude_opponent_abbr=setup["away_abbr"],
-            team_rotation_board=home_rot_pre.out_only_minutes,
         )
         away_avail_maps, away_avail_audit, away_state_scores = availability_similarity_weight_maps(
             player_db, away_log, setup["away_abbr"], away_out, team_state_stats,
             current_pool=pool, focal_player=None, k=float(availability_k),
             maturity_games=5.0, exclude_opponent_abbr=setup["home_abbr"],
-            team_rotation_board=away_rot_pre.out_only_minutes,
         )
 
-        # Overlap guard: with confirmed OUTs, the v2.18.3 role-state similarity
-        # already compares the complete historical vs current rotation. Applying
-        # residual Jaccard on top would count roster composition twice. Retain the
-        # legacy weak Jaccard only when there is no confirmed-OUT role state.
         home_rot_w = (
             residual_rotation_similarity_weights(
                 player_db, pool, setup["home_abbr"], manual_context,
                 out_players=home_out, residual_strength=0.15,
-            ) if rotation_similarity_enabled and not home_out else {}
+            ) if rotation_similarity_enabled else {}
         )
         away_rot_w = (
             residual_rotation_similarity_weights(
                 player_db, pool, setup["away_abbr"], manual_context,
                 out_players=away_out, residual_strength=0.15,
-            ) if rotation_similarity_enabled and not away_out else {}
+            ) if rotation_similarity_enabled else {}
         )
         home_game_weights_by_stat = combine_stat_weight_maps(home_avail_maps, home_rot_w)
         away_game_weights_by_stat = combine_stat_weight_maps(away_avail_maps, away_rot_w)
@@ -958,7 +937,7 @@ with tab_team:
         away_game_weights = away_game_weights_by_stat.get("FGA", away_rot_w)
 
         # Baseline excludes current-opponent H2H INSIDE the actual Old/G6-10/L5
-        # buckets. Rotation-role similarity is INNER-only, once per historical game/stat.
+        # buckets. Near-state similarity is also INNER-only, once per historical game.
         home_profile, home_audit = build_team_profile(
             home_log, home_cfg,
             league_team_logs=team_db,
@@ -1514,7 +1493,7 @@ with tab_team:
                 st.markdown(f"**{setup['home_abbr']} buckets — {home_regime}**")
                 st.dataframe(home_audit.round(4), use_container_width=True, hide_index=True)
 
-                st.markdown("**Confirmed OUT rotation-role near-state — overlap audit**")
+                st.markdown("**Confirmed OUT exact/near-state + residual rotation — overlap audit**")
                 st.caption(
                     "Availability similarity and residual rotation are both INNER-bucket weights. Each game receives one availability score per stat. "
                     "Selected OUT names are removed from residual Jaccard, so the same absence is not counted twice. "
@@ -1525,101 +1504,6 @@ with tab_team:
                     use_container_width=True, hide_index=True,
                 )
 
-                def _rotation_profile_diag(impact):
-                    """Diagnostic-only view: expose raw 200-minute roster displacement.
-
-                    This does NOT alter any model input, modifier, simulation, or price.
-                    It simply derives 3PA/2PA from the existing synthetic FGA and 3P share
-                    and shows healthy -> OUT-only -> current changes before shrinkage.
-                    """
-                    a = impact.team_audit.copy()
-                    if a is None or a.empty:
-                        return pd.DataFrame(), pd.DataFrame()
-                    a = a.set_index("Stat")
-
-                    def _v(stat, col, default=np.nan):
-                        try:
-                            return float(a.loc[stat, col])
-                        except Exception:
-                            return float(default)
-
-                    states = {
-                        "Healthy": {
-                            "FGA": _v("FGA", "Healthy synthetic"),
-                            "3P_SHARE": _v("3P_SHARE", "Healthy synthetic"),
-                            "FTA": _v("FTA", "Healthy synthetic"),
-                            "TOV": _v("TOV", "Healthy synthetic"),
-                            "OREB/MISS": _v("OREB", "Healthy synthetic"),
-                            "DREB": _v("DREB", "Healthy synthetic"),
-                            "AST/FGM": _v("AST", "Healthy synthetic"),
-                            "BLK": _v("BLK", "Healthy synthetic"),
-                        },
-                        "OUT-only": {
-                            "FGA": _v("FGA", "OUT-only synthetic"),
-                            "3P_SHARE": _v("3P_SHARE", "OUT-only synthetic"),
-                            "FTA": _v("FTA", "OUT-only synthetic"),
-                            "TOV": _v("TOV", "OUT-only synthetic"),
-                            "OREB/MISS": _v("OREB", "OUT-only synthetic"),
-                            "DREB": _v("DREB", "OUT-only synthetic"),
-                            "AST/FGM": _v("AST", "OUT-only synthetic"),
-                            "BLK": _v("BLK", "OUT-only synthetic"),
-                        },
-                        "Current": {
-                            "FGA": _v("FGA", "Current synthetic"),
-                            "3P_SHARE": _v("3P_SHARE", "Current synthetic"),
-                            "FTA": _v("FTA", "Current synthetic"),
-                            "TOV": _v("TOV", "Current synthetic"),
-                            "OREB/MISS": _v("OREB", "Current synthetic"),
-                            "DREB": _v("DREB", "Current synthetic"),
-                            "AST/FGM": _v("AST", "Current synthetic"),
-                            "BLK": _v("BLK", "Current synthetic"),
-                        },
-                    }
-                    for d in states.values():
-                        fga = d.get("FGA", np.nan)
-                        sh = d.get("3P_SHARE", np.nan)
-                        d["3PA (derived)"] = fga * sh if np.isfinite(fga) and np.isfinite(sh) else np.nan
-                        d["2PA (derived)"] = fga * (1.0 - sh) if np.isfinite(fga) and np.isfinite(sh) else np.nan
-
-                    order = ["FGA", "3P_SHARE", "3PA (derived)", "2PA (derived)", "FTA", "TOV", "OREB/MISS", "DREB", "AST/FGM", "BLK"]
-                    rows=[]
-                    for stat in order:
-                        h=states["Healthy"].get(stat, np.nan)
-                        o=states["OUT-only"].get(stat, np.nan)
-                        c=states["Current"].get(stat, np.nan)
-                        rows.append({
-                            "Metric": stat,
-                            "Healthy": h,
-                            "OUT-only": o,
-                            "Current": c,
-                            "OUT vs Healthy Δ": (o-h) if np.isfinite(o) and np.isfinite(h) else np.nan,
-                            "OUT vs Healthy Δ%": (100.0*(o/h-1.0)) if np.isfinite(o) and np.isfinite(h) and abs(h)>1e-9 else np.nan,
-                            "Current vs Healthy Δ%": (100.0*(c/h-1.0)) if np.isfinite(c) and np.isfinite(h) and abs(h)>1e-9 else np.nan,
-                        })
-                    prof = pd.DataFrame(rows)
-
-                    def _mins(board, label):
-                        if board is None or board.empty:
-                            return pd.Series(dtype=float, name=label)
-                        # Build a fresh Series from raw arrays so pandas does not
-                        # inherit DataFrame.attrs containing nested DataFrames.
-                        # Those attrs make pd.concat's equality check ambiguous.
-                        return pd.Series(
-                            pd.to_numeric(board["Projected Min"], errors="coerce").fillna(0.0).to_numpy(float),
-                            index=board["Player"].astype(str).to_numpy(),
-                            name=label,
-                            dtype=float,
-                        )
-                    mins = pd.concat([
-                        _mins(impact.healthy_minutes, "Healthy Min"),
-                        _mins(impact.out_only_minutes, "OUT-only Min"),
-                        _mins(impact.current_minutes, "Current Min"),
-                    ], axis=1).fillna(0.0)
-                    mins["OUT Δ Min"] = mins["OUT-only Min"] - mins["Healthy Min"]
-                    mins["Current Δ Min"] = mins["Current Min"] - mins["Healthy Min"]
-                    mins = mins.reset_index().sort_values(["Current Min","Healthy Min"], ascending=[False,False])
-                    return prof, mins
-
                 st.markdown("**Roster-state bridge — OUT fallback + minute restrictions**")
                 st.caption(
                     "Healthy / OUT-only / current are 200-minute synthetic counterfactuals. The OUT bridge fades separately by stat as "
@@ -1629,11 +1513,6 @@ with tab_team:
                 with ra1:
                     st.caption(setup["away_abbr"])
                     st.dataframe(away_rot_impact.team_audit.round(4), use_container_width=True, hide_index=True)
-                    _away_prof_diag, _away_min_diag = _rotation_profile_diag(away_rot_impact)
-                    st.markdown("**RAW roster-profile diagnostic (pre-shrinkage; no pricing effect)**")
-                    st.dataframe(_away_prof_diag.round(4), use_container_width=True, hide_index=True)
-                    st.markdown("**Healthy → OUT/current minute displacement**")
-                    st.dataframe(_away_min_diag.round(2), use_container_width=True, hide_index=True)
                     st.dataframe(
                         away_rot_impact.current_minutes[["Player","Status","Projected Min","Source"]].round(2),
                         use_container_width=True, hide_index=True,
@@ -1641,11 +1520,6 @@ with tab_team:
                 with ra2:
                     st.caption(setup["home_abbr"])
                     st.dataframe(home_rot_impact.team_audit.round(4), use_container_width=True, hide_index=True)
-                    _home_prof_diag, _home_min_diag = _rotation_profile_diag(home_rot_impact)
-                    st.markdown("**RAW roster-profile diagnostic (pre-shrinkage; no pricing effect)**")
-                    st.dataframe(_home_prof_diag.round(4), use_container_width=True, hide_index=True)
-                    st.markdown("**Healthy → OUT/current minute displacement**")
-                    st.dataframe(_home_min_diag.round(2), use_container_width=True, hide_index=True)
                     st.dataframe(
                         home_rot_impact.current_minutes[["Player","Status","Projected Min","Source"]].round(2),
                         use_container_width=True, hide_index=True,
