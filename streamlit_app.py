@@ -59,9 +59,10 @@ st.set_page_config(
     page_icon="🏀",
     layout="wide",
 )
-st.title("🏀 Basketball Pricing Engine v2.17.2 — disjoint H2H + shooting efficiency")
+st.title("🏀 Basketball Pricing Engine v2.18.2 — roster diagnostic")
 st.caption(
-    "v2.17.2: player H2H is fully disjoint from adaptive role-state and uses league-learned empirical-Bayes "
+    "DIAGNOSTIC ONLY: pricing math is unchanged from v2.18.2 + DREB wiring fix. This build only exposes raw healthy/OUT/current roster composition. "
+    "Player H2H is fully disjoint from adaptive role-state and uses league-learned empirical-Bayes "
     "prior minutes instead of a universal 5% cap. Team 3P%/2P% use attempt-weighted held-out binomial "
     "offense-vs-defense calibration; v2.17 possession/shot-allocation structure remains unchanged."
 )
@@ -1504,6 +1505,93 @@ with tab_team:
                     use_container_width=True, hide_index=True,
                 )
 
+                def _rotation_profile_diag(impact):
+                    """Diagnostic-only view: expose raw 200-minute roster displacement.
+
+                    This does NOT alter any model input, modifier, simulation, or price.
+                    It simply derives 3PA/2PA from the existing synthetic FGA and 3P share
+                    and shows healthy -> OUT-only -> current changes before shrinkage.
+                    """
+                    a = impact.team_audit.copy()
+                    if a is None or a.empty:
+                        return pd.DataFrame(), pd.DataFrame()
+                    a = a.set_index("Stat")
+
+                    def _v(stat, col, default=np.nan):
+                        try:
+                            return float(a.loc[stat, col])
+                        except Exception:
+                            return float(default)
+
+                    states = {
+                        "Healthy": {
+                            "FGA": _v("FGA", "Healthy synthetic"),
+                            "3P_SHARE": _v("3P_SHARE", "Healthy synthetic"),
+                            "FTA": _v("FTA", "Healthy synthetic"),
+                            "TOV": _v("TOV", "Healthy synthetic"),
+                            "OREB/MISS": _v("OREB", "Healthy synthetic"),
+                            "DREB": _v("DREB", "Healthy synthetic"),
+                            "AST/FGM": _v("AST", "Healthy synthetic"),
+                            "BLK": _v("BLK", "Healthy synthetic"),
+                        },
+                        "OUT-only": {
+                            "FGA": _v("FGA", "OUT-only synthetic"),
+                            "3P_SHARE": _v("3P_SHARE", "OUT-only synthetic"),
+                            "FTA": _v("FTA", "OUT-only synthetic"),
+                            "TOV": _v("TOV", "OUT-only synthetic"),
+                            "OREB/MISS": _v("OREB", "OUT-only synthetic"),
+                            "DREB": _v("DREB", "OUT-only synthetic"),
+                            "AST/FGM": _v("AST", "OUT-only synthetic"),
+                            "BLK": _v("BLK", "OUT-only synthetic"),
+                        },
+                        "Current": {
+                            "FGA": _v("FGA", "Current synthetic"),
+                            "3P_SHARE": _v("3P_SHARE", "Current synthetic"),
+                            "FTA": _v("FTA", "Current synthetic"),
+                            "TOV": _v("TOV", "Current synthetic"),
+                            "OREB/MISS": _v("OREB", "Current synthetic"),
+                            "DREB": _v("DREB", "Current synthetic"),
+                            "AST/FGM": _v("AST", "Current synthetic"),
+                            "BLK": _v("BLK", "Current synthetic"),
+                        },
+                    }
+                    for d in states.values():
+                        fga = d.get("FGA", np.nan)
+                        sh = d.get("3P_SHARE", np.nan)
+                        d["3PA (derived)"] = fga * sh if np.isfinite(fga) and np.isfinite(sh) else np.nan
+                        d["2PA (derived)"] = fga * (1.0 - sh) if np.isfinite(fga) and np.isfinite(sh) else np.nan
+
+                    order = ["FGA", "3P_SHARE", "3PA (derived)", "2PA (derived)", "FTA", "TOV", "OREB/MISS", "DREB", "AST/FGM", "BLK"]
+                    rows=[]
+                    for stat in order:
+                        h=states["Healthy"].get(stat, np.nan)
+                        o=states["OUT-only"].get(stat, np.nan)
+                        c=states["Current"].get(stat, np.nan)
+                        rows.append({
+                            "Metric": stat,
+                            "Healthy": h,
+                            "OUT-only": o,
+                            "Current": c,
+                            "OUT vs Healthy Δ": (o-h) if np.isfinite(o) and np.isfinite(h) else np.nan,
+                            "OUT vs Healthy Δ%": (100.0*(o/h-1.0)) if np.isfinite(o) and np.isfinite(h) and abs(h)>1e-9 else np.nan,
+                            "Current vs Healthy Δ%": (100.0*(c/h-1.0)) if np.isfinite(c) and np.isfinite(h) and abs(h)>1e-9 else np.nan,
+                        })
+                    prof = pd.DataFrame(rows)
+
+                    def _mins(board, label):
+                        if board is None or board.empty:
+                            return pd.Series(dtype=float, name=label)
+                        return board.set_index("Player")["Projected Min"].astype(float).rename(label)
+                    mins = pd.concat([
+                        _mins(impact.healthy_minutes, "Healthy Min"),
+                        _mins(impact.out_only_minutes, "OUT-only Min"),
+                        _mins(impact.current_minutes, "Current Min"),
+                    ], axis=1).fillna(0.0)
+                    mins["OUT Δ Min"] = mins["OUT-only Min"] - mins["Healthy Min"]
+                    mins["Current Δ Min"] = mins["Current Min"] - mins["Healthy Min"]
+                    mins = mins.reset_index().sort_values(["Current Min","Healthy Min"], ascending=[False,False])
+                    return prof, mins
+
                 st.markdown("**Roster-state bridge — OUT fallback + minute restrictions**")
                 st.caption(
                     "Healthy / OUT-only / current are 200-minute synthetic counterfactuals. The OUT bridge fades separately by stat as "
@@ -1513,6 +1601,11 @@ with tab_team:
                 with ra1:
                     st.caption(setup["away_abbr"])
                     st.dataframe(away_rot_impact.team_audit.round(4), use_container_width=True, hide_index=True)
+                    _away_prof_diag, _away_min_diag = _rotation_profile_diag(away_rot_impact)
+                    st.markdown("**RAW roster-profile diagnostic (pre-shrinkage; no pricing effect)**")
+                    st.dataframe(_away_prof_diag.round(4), use_container_width=True, hide_index=True)
+                    st.markdown("**Healthy → OUT/current minute displacement**")
+                    st.dataframe(_away_min_diag.round(2), use_container_width=True, hide_index=True)
                     st.dataframe(
                         away_rot_impact.current_minutes[["Player","Status","Projected Min","Source"]].round(2),
                         use_container_width=True, hide_index=True,
@@ -1520,6 +1613,11 @@ with tab_team:
                 with ra2:
                     st.caption(setup["home_abbr"])
                     st.dataframe(home_rot_impact.team_audit.round(4), use_container_width=True, hide_index=True)
+                    _home_prof_diag, _home_min_diag = _rotation_profile_diag(home_rot_impact)
+                    st.markdown("**RAW roster-profile diagnostic (pre-shrinkage; no pricing effect)**")
+                    st.dataframe(_home_prof_diag.round(4), use_container_width=True, hide_index=True)
+                    st.markdown("**Healthy → OUT/current minute displacement**")
+                    st.dataframe(_home_min_diag.round(2), use_container_width=True, hide_index=True)
                     st.dataframe(
                         home_rot_impact.current_minutes[["Player","Status","Projected Min","Source"]].round(2),
                         use_container_width=True, hide_index=True,
