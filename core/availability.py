@@ -379,6 +379,252 @@ def _absence_relevance(
     excluded = [n for n in outs if n not in kept]
     return relevance, raw, excluded
 
+
+# ---------------------------------------------------------------------------
+# v2.18.3 TEAM roster-role state similarity
+# ---------------------------------------------------------------------------
+
+def _player_per_min_rates(player_db: pd.DataFrame, team_abbr: str, source_cols: Iterable[str]) -> Dict[str, Dict[str, float]]:
+    """Current-knowledge per-minute role rates for rotation-composition matching.
+
+    These rates are used ONLY to describe who is on the floor in a historical
+    game versus today's projected 200-minute rotation. Historical game outcomes
+    are not inserted here, so this remains an INNER relevance layer rather than
+    a fourth outcome sample.
+    """
+    cols = tuple(dict.fromkeys(str(c) for c in source_cols))
+    x = player_db[
+        player_db["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())
+    ].copy()
+    if x.empty:
+        return {}
+    x["_MIN"] = pd.to_numeric(x.get("MIN", 0), errors="coerce").fillna(0.0)
+    x = x[x["_MIN"] >= 1.0].copy()
+    if x.empty:
+        return {}
+    out: Dict[str, Dict[str, float]] = {}
+    for name, g in x.groupby("PLAYER_NAME"):
+        den = float(pd.to_numeric(g["_MIN"], errors="coerce").fillna(0.0).sum())
+        if den <= 0:
+            continue
+        row = {}
+        for c in cols:
+            if c not in g.columns:
+                row[c] = 0.0
+            else:
+                row[c] = float(pd.to_numeric(g[c], errors="coerce").fillna(0.0).sum()) / den
+        out[_norm_name(name)] = row
+    return out
+
+
+def _position_soft_mix(player_db: pd.DataFrame, team_abbr: str) -> Dict[str, Dict[str, float]]:
+    """Soft G/F/C membership from the latest listed position for each player.
+
+    Combo labels such as G-F or F-C are split 50/50. Position is deliberately
+    only a supplementary feature for frontcourt-sensitive team stats; 3PA is
+    matched by shooting role, not by position.
+    """
+    x = player_db[
+        player_db["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())
+    ].copy()
+    if x.empty:
+        return {}
+    x["_DATE"] = pd.to_datetime(x.get("GAME_DATE"), errors="coerce")
+    x = x.sort_values("_DATE")
+    out: Dict[str, Dict[str, float]] = {}
+    for name, g in x.groupby("PLAYER_NAME"):
+        r = g.iloc[-1]
+        raw = str(r.get("POSITION_ABBR", "") or r.get("POSITION_GROUP", "") or "").upper().replace(" ", "")
+        groups = []
+        if "G" in raw: groups.append("G")
+        if "F" in raw: groups.append("F")
+        if "C" in raw: groups.append("C")
+        if not groups:
+            broad = _broad_pos_from_row(r)
+            groups = [broad] if broad else []
+        if not groups:
+            out[_norm_name(name)] = {"G": 0.0, "F": 0.0, "C": 0.0}
+        else:
+            w = 1.0 / len(groups)
+            out[_norm_name(name)] = {k: (w if k in groups else 0.0) for k in ("G", "F", "C")}
+    return out
+
+
+def _normalize_rotation_minutes(board: pd.DataFrame, player_col: str, minute_col: str) -> pd.DataFrame:
+    if board is None or board.empty or player_col not in board.columns or minute_col not in board.columns:
+        return pd.DataFrame(columns=["Player", "Projected Min"])
+    q = pd.DataFrame({
+        "Player": board[player_col].astype(str),
+        "Projected Min": pd.to_numeric(board[minute_col], errors="coerce").fillna(0.0),
+    })
+    q = q[q["Projected Min"] > 0].copy()
+    total = float(q["Projected Min"].sum())
+    if total <= 0:
+        return pd.DataFrame(columns=["Player", "Projected Min"])
+    # Regulation-equivalent composition: OT games are rescaled to 200 team minutes.
+    q["Projected Min"] *= 200.0 / total
+    return q
+
+
+def _rotation_signature(
+    board: pd.DataFrame,
+    stat: str,
+    rates: Dict[str, Dict[str, float]],
+    pos_mix: Dict[str, Dict[str, float]],
+) -> Dict[str, float]:
+    """Stat-specific role signature of a 200-minute rotation.
+
+    The signature is intentionally generated from player roles + minutes rather
+    than OUT-name overlap. This lets two different injury lists be close when the
+    remaining team profile is genuinely close, and far when the same number of
+    absences creates a different basketball team.
+    """
+    stat = str(stat).upper()
+    if board is None or board.empty:
+        return {}
+
+    source = {
+        "FGA": "FGA", "3PA": "FG3A", "FTA": "FTA", "TOV": "TOV",
+        "OREB": "OREB", "DREB": "DREB", "AST": "AST", "STL": "STL",
+        "BLK": "BLK", "PF": "PF",
+    }.get(stat, stat)
+
+    contrib, fga_contrib, fgm_contrib = [], [], []
+    pos_tot = {"G": 0.0, "F": 0.0, "C": 0.0}
+    for _, r in board.iterrows():
+        name = _norm_name(r.get("Player", ""))
+        mins = float(r.get("Projected Min", 0.0) or 0.0)
+        pr = rates.get(name, {})
+        contrib.append(max(mins * float(pr.get(source, 0.0) or 0.0), 0.0))
+        fga_contrib.append(max(mins * float(pr.get("FGA", 0.0) or 0.0), 0.0))
+        fgm_contrib.append(max(mins * float(pr.get("FGM", 0.0) or 0.0), 0.0))
+        pm = pos_mix.get(name, {})
+        for k in pos_tot:
+            pos_tot[k] += mins * float(pm.get(k, 0.0) or 0.0)
+
+    total = float(np.sum(contrib))
+    fga = float(np.sum(fga_contrib))
+    fgm = float(np.sum(fgm_contrib))
+    misses = max(fga - fgm, 0.0)
+    hhi = float(np.sum((np.asarray(contrib, dtype=float) / total) ** 2)) if total > 1e-9 else 0.0
+    front = (pos_tot["F"] + pos_tot["C"]) / 200.0
+    center = pos_tot["C"] / 200.0
+
+    # The primitive used by the team engine is mirrored where possible.
+    if stat == "3PA":
+        # All positions may shoot: no positional feature is used here.
+        return {"three_share": total / max(fga, 1e-9), "role_hhi": hhi}
+    if stat == "FGA":
+        return {"fga_200": fga, "role_hhi": hhi}
+    if stat == "FTA":
+        return {"fta_per_fga": total / max(fga, 1e-9), "role_hhi": hhi}
+    if stat == "TOV":
+        return {"tov_200": total, "role_hhi": hhi}
+    if stat == "OREB":
+        return {"oreb_per_miss": total / max(misses, 1e-9), "role_hhi": hhi,
+                "frontcourt_share": front, "center_share": center}
+    if stat == "DREB":
+        return {"dreb_200": total, "role_hhi": hhi,
+                "frontcourt_share": front, "center_share": center}
+    if stat == "AST":
+        return {"ast_per_make": total / max(fgm, 1e-9), "role_hhi": hhi}
+    if stat == "BLK":
+        return {"blk_200": total, "role_hhi": hhi,
+                "frontcourt_share": front, "center_share": center}
+    if stat == "STL":
+        return {"stl_200": total, "role_hhi": hhi}
+    if stat == "PF":
+        return {"pf_200": total, "role_hhi": hhi}
+    return {"level_200": total, "role_hhi": hhi}
+
+
+def _robust_feature_scale(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) < 2:
+        return 1.0
+    q25, q75 = np.percentile(values, [25, 75])
+    scale = float((q75 - q25) / 1.349) if q75 > q25 else 0.0
+    if not np.isfinite(scale) or scale <= 1e-9:
+        scale = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+    if not np.isfinite(scale) or scale <= 1e-9:
+        # Constant historical feature carries no discriminatory information.
+        return np.inf
+    return scale
+
+
+def _team_rotation_role_similarity(
+    player_db: pd.DataFrame,
+    team_log: pd.DataFrame,
+    team_abbr: str,
+    stat: str,
+    current_rotation: pd.DataFrame,
+    exclude_opponent_abbr: str | None = None,
+) -> tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
+    """Gaussian-kernel similarity of historical vs current ROLE composition.
+
+    Feature distances are divided by their historical robust scale and averaged
+    before applying the standard Gaussian kernel exp(-d^2/2). Thus unrelated
+    states decay toward zero instead of many weak OUT-name overlaps accumulating
+    into artificial evidence.
+    """
+    t = team_log.copy()
+    if exclude_opponent_abbr and "OPP_ABBR" in t.columns:
+        t = t[~t["OPP_ABBR"].astype(str).str.upper().eq(str(exclude_opponent_abbr).upper())].copy()
+    if t.empty:
+        return {}, {}, {}
+
+    source_cols = ["FGA", "FGM", "FG3A", "FTA", "TOV", "OREB", "DREB", "AST", "STL", "BLK", "PF"]
+    rates = _player_per_min_rates(player_db, team_abbr, source_cols)
+    pos_mix = _position_soft_mix(player_db, team_abbr)
+    cur = _normalize_rotation_minutes(current_rotation, "Player", "Projected Min")
+    cur_sig = _rotation_signature(cur, stat, rates, pos_mix)
+    if not cur_sig:
+        return {}, {}, {}
+
+    hist_sigs: Dict[str, Dict[str, float]] = {}
+    for gid in t["GAME_ID"].astype(str).tolist():
+        g = player_db[
+            player_db["TEAM_ABBR"].astype(str).str.upper().eq(str(team_abbr).upper())
+            & player_db["GAME_ID"].astype(str).eq(str(gid))
+        ].copy()
+        if g.empty:
+            continue
+        board = _normalize_rotation_minutes(
+            g.rename(columns={"PLAYER_NAME": "Player", "MIN": "Projected Min"}),
+            "Player", "Projected Min",
+        )
+        sig = _rotation_signature(board, stat, rates, pos_mix)
+        if sig:
+            hist_sigs[str(gid)] = sig
+
+    if not hist_sigs:
+        return {}, {}, cur_sig
+
+    features = list(cur_sig.keys())
+    scales = {}
+    for f in features:
+        vals = np.asarray([sig.get(f, np.nan) for sig in hist_sigs.values()], dtype=float)
+        scales[f] = _robust_feature_scale(vals)
+
+    scores, distances = {}, {}
+    for gid, sig in hist_sigs.items():
+        z2 = []
+        for f in features:
+            scale = scales.get(f, np.inf)
+            a, b = sig.get(f, np.nan), cur_sig.get(f, np.nan)
+            if not (np.isfinite(scale) and scale > 0 and np.isfinite(a) and np.isfinite(b)):
+                continue
+            z2.append(((float(a) - float(b)) / float(scale)) ** 2)
+        if not z2:
+            scores[gid] = 0.0
+            distances[gid] = np.inf
+            continue
+        d = float(np.sqrt(np.mean(z2)))
+        distances[gid] = d
+        scores[gid] = float(np.exp(-0.5 * d * d))
+    return scores, distances, cur_sig
+
 def availability_similarity_weight_maps(
     player_db: pd.DataFrame,
     team_log: pd.DataFrame,
@@ -391,6 +637,7 @@ def availability_similarity_weight_maps(
     maturity_games: float = 5.0,
     temperature: float = 1.5,
     exclude_opponent_abbr: str | None = None,
+    team_rotation_board: pd.DataFrame | None = None,
 ):
     """Single-score-per-game near-state weighting, separately by stat.
 
@@ -429,8 +676,21 @@ def availability_similarity_weight_maps(
         relevance, relevance_raw, relevance_excluded = _absence_relevance(
             player_db, team_abbr, outs, stat, current_pool=current_pool, focal_player=focal_player
         )
-        scores = {}
-        for gid in gids:
+
+        # Team Markets v2.18.3: near-state means similar CURRENT ROLE/ROTATION,
+        # not similar injury-list names. Player Props deliberately keep the
+        # existing focal-player absence-state logic.
+        team_role_mode = focal_player is None and team_rotation_board is not None
+        role_distances, current_role_signature = {}, {}
+        if team_role_mode:
+            role_scores, role_distances, current_role_signature = _team_rotation_role_similarity(
+                player_db, t, team_abbr, stat, team_rotation_board,
+                exclude_opponent_abbr=None,  # t was already opponent-filtered above
+            )
+            scores = {str(gid): float(role_scores.get(str(gid), 0.0)) for gid in gids}
+        else:
+            scores = {}
+        for gid in ([] if team_role_mode else gids):
             played = presence.get(str(gid), set())
             gdate = dates.get(str(gid))
             s = 0.0
@@ -455,11 +715,18 @@ def availability_similarity_weight_maps(
         confidence = float(np.clip(empirical_conf * mature, 0.0, 1.0))
         mean_s = float(np.mean(arr)) if len(arr) else 0.0
 
-        # Kernel tilt around the natural mean. Mean weight is normalized to 1,
-        # preserving the outer Old/G6-10/L5 sample weights exactly.
-        raw_w = {gid: float(np.exp(float(temperature) * confidence * (sc - mean_s))) for gid, sc in scores.items()}
-        mean_w = float(np.mean(list(raw_w.values()))) if raw_w else 1.0
-        weights = {gid: float(np.clip(w / max(mean_w, 1e-9), 0.35, 2.85)) for gid, w in raw_w.items()}
+        # Preserve the outer Old/G6-10/L5 weights exactly. In team role mode,
+        # confidence interpolates transparently between neutral weights and
+        # weights proportional to role similarity. Player Props retain the
+        # pre-existing kernel tilt unchanged.
+        if team_role_mode and scores and mean_s > 1e-9:
+            raw_w = {gid: float((1.0 - confidence) + confidence * (sc / mean_s)) for gid, sc in scores.items()}
+            mean_w = float(np.mean(list(raw_w.values()))) if raw_w else 1.0
+            weights = {gid: float(np.clip(w / max(mean_w, 1e-9), 0.35, 2.85)) for gid, w in raw_w.items()}
+        else:
+            raw_w = {gid: float(np.exp(float(temperature) * confidence * (sc - mean_s))) for gid, sc in scores.items()}
+            mean_w = float(np.mean(list(raw_w.values()))) if raw_w else 1.0
+            weights = {gid: float(np.clip(w / max(mean_w, 1e-9), 0.35, 2.85)) for gid, w in raw_w.items()}
 
         exact = sum(1 for v in scores.values() if v >= 0.999999)
         top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:5]
@@ -479,6 +746,9 @@ def availability_similarity_weight_maps(
             "Top near-state games": ", ".join(f"{gid}:{sc:.2f}" for gid, sc in top),
             "Relevance": ", ".join(f"{n}:{w:.2f}" for n, w in sorted(relevance.items(), key=lambda kv: kv[1], reverse=True)),
             "Raw relevance": ", ".join(f"{n}:{w:.3f}" for n, w in sorted(relevance_raw.items(), key=lambda kv: kv[1], reverse=True)),
+            "Similarity basis": "rotation role profile" if team_role_mode else "OUT identity + focal role",
+            "Current role signature": ", ".join(f"{kk}={vv:.3f}" for kk, vv in current_role_signature.items()) if team_role_mode else "—",
+            "Closest robust distance": (min(role_distances.values()) if team_role_mode and role_distances else np.nan),
             "Shrink K": float(k),
             "Maturity games": float(maturity_games),
         })
