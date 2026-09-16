@@ -6,7 +6,6 @@ import pandas as pd
 
 from core.buckets import WeightConfig, split_non_overlapping, active_weights
 from core.team_model import estimate_possessions
-from core.exposure import regulation_equivalent_factor
 
 
 @dataclass
@@ -26,8 +25,7 @@ class PaceProjection:
 
 def _weighted_team_pace(team_log: pd.DataFrame, cfg: WeightConfig) -> float:
     x = team_log.sort_values("GAME_DATE").copy()
-    x["POSS_RAW"] = estimate_possessions(x)
-    x["POSS"] = x["POSS_RAW"] * regulation_equivalent_factor(x)
+    x["POSS"] = estimate_possessions(x)
     buckets = split_non_overlapping(x)
     outer = active_weights(buckets, cfg)
 
@@ -44,8 +42,7 @@ def _weighted_team_pace(team_log: pd.DataFrame, cfg: WeightConfig) -> float:
 
 def _build_pace_calibration(team_db: pd.DataFrame) -> pd.DataFrame:
     x = team_db.sort_values(["GAME_DATE", "GAME_ID", "TEAM_ABBR"]).copy()
-    x["POSS_RAW"] = estimate_possessions(x)
-    x["POSS"] = x["POSS_RAW"] * regulation_equivalent_factor(x)
+    x["POSS"] = estimate_possessions(x)
 
     prior_parts = []
     for team, g in x.groupby("TEAM_ABBR", sort=False):
@@ -75,7 +72,7 @@ def _build_pace_calibration(team_db: pd.DataFrame) -> pd.DataFrame:
 
 def fit_pace_control(team_db: pd.DataFrame):
     cal = _build_pace_calibration(team_db)
-    all_poss = estimate_possessions(team_db) * regulation_equivalent_factor(team_db)
+    all_poss = estimate_possessions(team_db)
     league = float(all_poss.mean())
 
     default = {
@@ -183,7 +180,7 @@ def player_historical_pace_environment(
     player's historical minutes. Uses the same non-overlapping bucket protocol.
     """
     if player_log.empty:
-        return float((estimate_possessions(team_db) * regulation_equivalent_factor(team_db)).mean())
+        return float(estimate_possessions(team_db).mean())
 
     team_rows = team_db[
         team_db["GAME_ID"].astype(str).isin(
@@ -209,10 +206,9 @@ def player_historical_pace_environment(
     ].copy()
 
     if merged.empty:
-        return float((estimate_possessions(team_db) * regulation_equivalent_factor(team_db)).mean())
+        return float(estimate_possessions(team_db).mean())
 
-    merged["POSS_RAW"] = estimate_possessions(merged)
-    merged["POSS"] = merged["POSS_RAW"] * regulation_equivalent_factor(merged)
+    merged["POSS"] = estimate_possessions(merged)
     dates = player_log[["GAME_ID", "GAME_DATE"]].drop_duplicates().copy()
     dates["GAME_ID"] = dates["GAME_ID"].astype(str)
     merged = merged.merge(dates, on="GAME_ID", how="left", suffixes=("", "_P"))

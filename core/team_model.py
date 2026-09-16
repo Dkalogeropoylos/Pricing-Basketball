@@ -6,8 +6,6 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from core.exposure import regulation_equivalent_factor
-
 from core.buckets import (
     WeightConfig,
     split_non_overlapping,
@@ -126,8 +124,6 @@ def _feat(
     x = df.copy()
     w = _row_weights(x, game_weights)
     poss_rows = estimate_possessions(x).to_numpy(dtype=float)
-    reg_factor = regulation_equivalent_factor(x).to_numpy(dtype=float)
-    poss_rows_reg = poss_rows * reg_factor
     poss = float(np.sum(poss_rows * w))
 
     fga = _weighted_sum(x["FGA"], w)
@@ -147,12 +143,7 @@ def _feat(
     out = {
         "games": int(len(x)),
         "effective_games": float(np.sum(w)),
-        # Pace/count exposure is regulation-equivalent; event rates below keep
-        # their natural raw opportunity denominators.
-        "poss_pg": float(np.average(poss_rows_reg, weights=w)) if len(w) else np.nan,
-        "poss_pg_raw": float(np.average(poss_rows, weights=w)) if len(w) else np.nan,
-        "ot_games": int(np.sum(reg_factor < 0.999999)),
-        "reg_eq_factor_mean": float(np.average(reg_factor, weights=w)) if len(w) else 1.0,
+        "poss_pg": float(np.average(poss_rows, weights=w)) if len(w) else np.nan,
         "three_pa_pp": _safe_div(a3, poss),
         "two_pa_pp": _safe_div(a2, poss),
         "three_pa_live": _safe_div(a3, live_poss),
@@ -546,7 +537,7 @@ def h2h_team_audit(
         return pd.DataFrame()
     cols = [
         c for c in [
-            "GAME_DATE", "GAME_ID", "TEAM_ABBR", "OPP_ABBR", "OT_FLAG", "OT_COUNT", "GAME_LENGTH_MIN", "PTS", "FGA",
+            "GAME_DATE", "GAME_ID", "TEAM_ABBR", "OPP_ABBR", "PTS", "FGA",
             "FG3A", "FG3M", "FTA", "FTM", "OREB", "DREB", "REB", "AST",
             "STL", "BLK", "TOV", "PF",
         ] if c in h.columns
@@ -563,16 +554,18 @@ def h2h_profile_blend(
     max_weight: float = 0.10,
     skip_features: Optional[set[str]] = None,
 ) -> Tuple[dict, pd.DataFrame]:
-    """Legacy disjoint H2H blend retained for compatibility/audit.
+    """Blend a DISJOINT same-season H2H sample into structural team rates.
 
-    v2.18 calls this with every structural feature in ``skip_features`` so no
-    fixed percentage H2H weight reaches production Team Markets. Supported
-    rates receive H2H only through the chronologically validated residual model
-    in ``core.structural_calibration``; unsupported rates keep H2H audit-only.
+    build_team_profile(..., exclude_opponent_abbr=...) must be used for the
+    baseline when this function is used. That guarantees H2H rows do not also
+    live inside Old/G6-10/L5. Shooting percentages are intentionally excluded
+    because two or three games are too noisy for efficiency estimation.
 
-    The old 0.20*N/(N+2), capped at 10%, code path is kept only so older tests
-    or external callers do not break. It is not used by the v2.18 Streamlit
-    production path.
+    Weight:
+        0.20 * N/(N+2) * rotation_similarity, capped at 10%.
+    Same-season H2H is deliberately a small matchup-specific layer because
+    pair samples are sparse; two comparable H2Hs are usually ~6-8%, while
+    even four games cannot become more than 10%.
     """
     out = dict(base_profile)
     if league_team_logs is None or league_team_logs.empty:
@@ -619,7 +612,7 @@ def h2h_profile_blend(
                 "Rotation similarity": sim,
                 "Applied H2H weight": 0.0,
                 "Final": float(base_profile.get(target_key, np.nan)),
-                "Reason": "v2.18 production: fixed H2H weight disabled; residual model or audit-only",
+                "Reason": "handled by v2.17 walk-forward structural model",
             })
             continue
         b = float(base_profile.get(target_key, np.nan))
