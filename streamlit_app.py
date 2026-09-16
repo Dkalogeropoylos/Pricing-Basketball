@@ -1097,11 +1097,11 @@ with tab_team:
             home_auto[_k] = float(home_struct.get(_k, home_auto.get(_k, 1.0)))
             away_auto[_k] = float(away_struct.get(_k, away_auto.get(_k, 1.0)))
 
-        # v2.18.2-EB Team Markets only: roster-informed prior + opponent-
-        # residualized historical availability evidence.  The feature-specific
-        # EB K is learned league-wide from repeated availability states; there
-        # is no fixed K=6 in this Team-Market bridge.  The existing player-prop
-        # availability / role-state chain is intentionally untouched.
+        # v2.18.2-LOCAL Team Markets only: roster-informed fallback prior +
+        # opponent/H2H-residualized historical games selected by ACTUAL rotation
+        # similarity.  Total-variation distance compares full minute-share
+        # vectors; kernel bandwidth, recency tau and prior-equivalent K are
+        # learned by chronological WNBA validation.  Player Props are untouched.
         home_bayes_roster_mod, home_bayes_roster_audit = availability_posterior_modifiers(
             player_db=player_db,
             team_abbr=setup["home_abbr"], opponent_abbr=setup["away_abbr"],
@@ -1230,12 +1230,13 @@ with tab_team:
                 if isinstance(_coef, pd.DataFrame) and not _coef.empty:
                     st.dataframe(_coef.round(4), use_container_width=True, hide_index=True)
 
-                st.markdown("**Team availability EB hyperparameters — Team Markets only**")
+                st.markdown("**Team availability local-rotation hyperparameters — Team Markets only**")
                 st.caption(
-                    "K is learned per structural feature from league repeated-state residual variance: "
-                    "K = within-state variance / between-state effect variance. The posterior shrinks "
-                    "toward the 200-minute roster-composition prior, not toward a healthy-team zero effect. "
-                    "Player Props do not use this table."
+                    "Historical games are weighted by total-variation distance between their actual minute-share rotation "
+                    "and today's projected OUT-only 200-minute rotation. Rotation bandwidth, recency tau and prior-equivalent "
+                    "K are selected feature-by-feature by chronological walk-forward validation; local history activates only "
+                    "if it improves a later holdout. The roster-composition estimate is the fallback prior. Player Props do not "
+                    "use this table."
                 )
                 if isinstance(team_avail_hyper_audit, pd.DataFrame) and not team_avail_hyper_audit.empty:
                     st.dataframe(team_avail_hyper_audit.round(4), use_container_width=True, hide_index=True)
