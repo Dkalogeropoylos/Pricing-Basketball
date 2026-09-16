@@ -52,6 +52,9 @@ from core.availability_impact import (
     recent_team_player_names, augment_current_pool, build_rotation_state_impact,
     defensive_absence_bridge,
 )
+from core.team_availability_bayes import (
+    fit_availability_hyperparams, availability_posterior_modifiers,
+)
 
 
 st.set_page_config(
@@ -75,6 +78,15 @@ def cached_opponent_elasticities(team_logs: pd.DataFrame):
 @st.cache_data(show_spinner=False)
 def cached_structural_rate_models(team_logs: pd.DataFrame):
     return fit_structural_rate_models(team_logs)
+
+
+@st.cache_data(show_spinner=False)
+def cached_team_structural_and_availability(player_logs: pd.DataFrame, team_logs: pd.DataFrame):
+    # One expensive structural fit only.  Availability hyperparameters are then
+    # estimated from the already-built leakage-safe structural residual tables.
+    models, model_audit = fit_structural_rate_models(team_logs)
+    hyper, hyper_audit = fit_availability_hyperparams(player_logs, models)
+    return models, model_audit, hyper, hyper_audit
 
 
 @st.cache_data(show_spinner=False)
@@ -932,6 +944,18 @@ with tab_team:
         )
         home_game_weights_by_stat = combine_stat_weight_maps(home_avail_maps, home_rot_w)
         away_game_weights_by_stat = combine_stat_weight_maps(away_avail_maps, away_rot_w)
+
+        # v2.18.2-EB: structural Team-Market availability no longer uses the
+        # fixed-K exact/near-state tilt for these rates.  Their OUT effect is
+        # handled once, downstream, by the roster-informed empirical-Bayes
+        # posterior.  Residual rotation similarity may still remain as a weak
+        # non-injury relevance weight.  Player Props keep the original state
+        # engine completely unchanged.
+        _team_bayes_state_stats = {"3PA", "FTA", "TOV", "OREB", "AST"}
+        for _stat in _team_bayes_state_stats:
+            home_game_weights_by_stat[_stat] = dict(home_rot_w) if home_rot_w else {}
+            away_game_weights_by_stat[_stat] = dict(away_rot_w) if away_rot_w else {}
+
         # Compatibility/audit view only. Team profile itself uses the stat-specific maps above.
         home_game_weights = home_game_weights_by_stat.get("FGA", home_rot_w)
         away_game_weights = away_game_weights_by_stat.get("FGA", away_rot_w)
@@ -1059,7 +1083,8 @@ with tab_team:
         # Coefficients and ridge regularization are chosen from walk-forward WNBA
         # history; the learned model activates only if it beats the existing
         # Old/G6-10/L5 baseline out of sample.
-        structural_models, structural_model_audit = cached_structural_rate_models(team_db)
+        structural_models, structural_model_audit, team_avail_hyper, team_avail_hyper_audit = \
+            cached_team_structural_and_availability(player_db, team_db)
         home_struct, home_struct_audit = predict_structural_modifiers(
             team_db, setup["home_abbr"], setup["away_abbr"], structural_models,
             home_cfg, h2h_rotation_similarity=home_h2h_sim,
@@ -1071,6 +1096,31 @@ with tab_team:
         for _k in ("3P_SHARE", "FTA", "TOV", "AST"):
             home_auto[_k] = float(home_struct.get(_k, home_auto.get(_k, 1.0)))
             away_auto[_k] = float(away_struct.get(_k, away_auto.get(_k, 1.0)))
+
+        # v2.18.2-EB Team Markets only: roster-informed prior + opponent-
+        # residualized historical availability evidence.  The feature-specific
+        # EB K is learned league-wide from repeated availability states; there
+        # is no fixed K=6 in this Team-Market bridge.  The existing player-prop
+        # availability / role-state chain is intentionally untouched.
+        home_bayes_roster_mod, home_bayes_roster_audit = availability_posterior_modifiers(
+            player_db=player_db,
+            team_abbr=setup["home_abbr"], opponent_abbr=setup["away_abbr"],
+            base_profile=home_profile, structural_modifiers=home_struct,
+            structural_models=structural_models,
+            state_scores_by_stat=home_state_scores,
+            rotation_impact=home_rot_impact, hyperparams=team_avail_hyper,
+        )
+        away_bayes_roster_mod, away_bayes_roster_audit = availability_posterior_modifiers(
+            player_db=player_db,
+            team_abbr=setup["away_abbr"], opponent_abbr=setup["home_abbr"],
+            base_profile=away_profile, structural_modifiers=away_struct,
+            structural_models=structural_models,
+            state_scores_by_stat=away_state_scores,
+            rotation_impact=away_rot_impact, hyperparams=team_avail_hyper,
+        )
+        for _k in ("3P_SHARE", "FTA", "TOV", "OREB", "AST"):
+            home_roster_mod[_k] = float(home_bayes_roster_mod.get(_k, 1.0))
+            away_roster_mod[_k] = float(away_bayes_roster_mod.get(_k, 1.0))
 
         # v2.17.2 team shooting efficiency.  Attempts/shot mix stay exactly in
         # the v2.17 structural chain; only conditional make probabilities move.
@@ -1179,6 +1229,23 @@ with tab_team:
                 _coef = coefficient_audit(structural_models)
                 if isinstance(_coef, pd.DataFrame) and not _coef.empty:
                     st.dataframe(_coef.round(4), use_container_width=True, hide_index=True)
+
+                st.markdown("**Team availability EB hyperparameters — Team Markets only**")
+                st.caption(
+                    "K is learned per structural feature from league repeated-state residual variance: "
+                    "K = within-state variance / between-state effect variance. The posterior shrinks "
+                    "toward the 200-minute roster-composition prior, not toward a healthy-team zero effect. "
+                    "Player Props do not use this table."
+                )
+                if isinstance(team_avail_hyper_audit, pd.DataFrame) and not team_avail_hyper_audit.empty:
+                    st.dataframe(team_avail_hyper_audit.round(4), use_container_width=True, hide_index=True)
+                st.markdown(f"**{setup['away_abbr']} availability posterior**")
+                if isinstance(away_bayes_roster_audit, pd.DataFrame) and not away_bayes_roster_audit.empty:
+                    st.dataframe(away_bayes_roster_audit.round(4), use_container_width=True, hide_index=True)
+                st.markdown(f"**{setup['home_abbr']} availability posterior**")
+                if isinstance(home_bayes_roster_audit, pd.DataFrame) and not home_bayes_roster_audit.empty:
+                    st.dataframe(home_bayes_roster_audit.round(4), use_container_width=True, hide_index=True)
+
                 st.markdown(f"**{setup['away_abbr']} current structural prediction**")
                 st.dataframe(away_struct_audit.round(4), use_container_width=True, hide_index=True)
                 st.markdown(f"**{setup['home_abbr']} current structural prediction**")
