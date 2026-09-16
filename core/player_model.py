@@ -39,6 +39,7 @@ class PlayerContext:
     h2h_reb: float = 1.00
     h2h_ast: float = 1.00
     h2h_3pa: float = 1.00
+    h2h_fta: float = 1.00
 
 
 def _safe_div(a, b, default=0.0):
@@ -235,7 +236,7 @@ def simulate_player(profile: dict, ctx: PlayerContext, n=50_000, seed=1, opportu
     # 2PA volume must use opponent 2PA allowance, not opponent PTS allowance.
     # PTS is an outcome; 2PA is an opportunity channel.
     lam2 = mins * profile["two_pa_pm"] * base * ctx.usage * ctx.opp_2pa * ctx.h2h_2pa
-    lamft = mins * profile["fta_pm"] * base * foul * ctx.usage * ctx.fta_role * ctx.opp_fta
+    lamft = mins * profile["fta_pm"] * base * foul * ctx.usage * ctx.fta_role * ctx.opp_fta * ctx.h2h_fta
 
     a3 = rng.poisson(np.clip(lam3, 0.001, None))
     a2 = rng.poisson(np.clip(lam2, 0.001, None))
