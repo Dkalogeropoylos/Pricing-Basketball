@@ -6,6 +6,8 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from core.exposure import regulation_equivalent_factor
+
 from core.buckets import (
     WeightConfig,
     split_non_overlapping,
@@ -124,6 +126,8 @@ def _feat(
     x = df.copy()
     w = _row_weights(x, game_weights)
     poss_rows = estimate_possessions(x).to_numpy(dtype=float)
+    reg_factor = regulation_equivalent_factor(x).to_numpy(dtype=float)
+    poss_rows_reg = poss_rows * reg_factor
     poss = float(np.sum(poss_rows * w))
 
     fga = _weighted_sum(x["FGA"], w)
@@ -143,7 +147,12 @@ def _feat(
     out = {
         "games": int(len(x)),
         "effective_games": float(np.sum(w)),
-        "poss_pg": float(np.average(poss_rows, weights=w)) if len(w) else np.nan,
+        # Pace/count exposure is regulation-equivalent; event rates below keep
+        # their natural raw opportunity denominators.
+        "poss_pg": float(np.average(poss_rows_reg, weights=w)) if len(w) else np.nan,
+        "poss_pg_raw": float(np.average(poss_rows, weights=w)) if len(w) else np.nan,
+        "ot_games": int(np.sum(reg_factor < 0.999999)),
+        "reg_eq_factor_mean": float(np.average(reg_factor, weights=w)) if len(w) else 1.0,
         "three_pa_pp": _safe_div(a3, poss),
         "two_pa_pp": _safe_div(a2, poss),
         "three_pa_live": _safe_div(a3, live_poss),
@@ -537,7 +546,7 @@ def h2h_team_audit(
         return pd.DataFrame()
     cols = [
         c for c in [
-            "GAME_DATE", "GAME_ID", "TEAM_ABBR", "OPP_ABBR", "PTS", "FGA",
+            "GAME_DATE", "GAME_ID", "TEAM_ABBR", "OPP_ABBR", "OT_FLAG", "OT_COUNT", "GAME_LENGTH_MIN", "PTS", "FGA",
             "FG3A", "FG3M", "FTA", "FTM", "OREB", "DREB", "REB", "AST",
             "STL", "BLK", "TOV", "PF",
         ] if c in h.columns
@@ -554,18 +563,16 @@ def h2h_profile_blend(
     max_weight: float = 0.10,
     skip_features: Optional[set[str]] = None,
 ) -> Tuple[dict, pd.DataFrame]:
-    """Blend a DISJOINT same-season H2H sample into structural team rates.
+    """Legacy disjoint H2H blend retained for compatibility/audit.
 
-    build_team_profile(..., exclude_opponent_abbr=...) must be used for the
-    baseline when this function is used. That guarantees H2H rows do not also
-    live inside Old/G6-10/L5. Shooting percentages are intentionally excluded
-    because two or three games are too noisy for efficiency estimation.
+    v2.18 calls this with every structural feature in ``skip_features`` so no
+    fixed percentage H2H weight reaches production Team Markets. Supported
+    rates receive H2H only through the chronologically validated residual model
+    in ``core.structural_calibration``; unsupported rates keep H2H audit-only.
 
-    Weight:
-        0.20 * N/(N+2) * rotation_similarity, capped at 10%.
-    Same-season H2H is deliberately a small matchup-specific layer because
-    pair samples are sparse; two comparable H2Hs are usually ~6-8%, while
-    even four games cannot become more than 10%.
+    The old 0.20*N/(N+2), capped at 10%, code path is kept only so older tests
+    or external callers do not break. It is not used by the v2.18 Streamlit
+    production path.
     """
     out = dict(base_profile)
     if league_team_logs is None or league_team_logs.empty:
@@ -612,7 +619,7 @@ def h2h_profile_blend(
                 "Rotation similarity": sim,
                 "Applied H2H weight": 0.0,
                 "Final": float(base_profile.get(target_key, np.nan)),
-                "Reason": "handled by v2.17 walk-forward structural model",
+                "Reason": "v2.18 production: fixed H2H weight disabled; residual model or audit-only",
             })
             continue
         b = float(base_profile.get(target_key, np.nan))
@@ -697,6 +704,9 @@ def _simulate_offense(
     z_foul: np.ndarray,
     z_tov: np.ndarray,
     z_reb: np.ndarray,
+    *,
+    fga_process: str = "rebound_chain",
+    fta_log_sigma: float = 0.20568078391234368,
 ) -> Dict[str, np.ndarray]:
     """Simulate one offense with an approximately possession-consistent event chain.
 
@@ -729,8 +739,15 @@ def _simulate_offense(
     # v2.17: structural FTA rate may move materially when the walk-forward
     # model finds a real matchup signal.  Bound the RATE by physical historical
     # plausibility here rather than clipping the learned matchup modifier upstream.
+    # Mean-preserving Poisson-lognormal foul-intensity layer.
+    # B3 variance transfer: use the accepted NBA C4/C5 mean-preserving
+    # Poisson-lognormal sigma as the current WNBA trial default. The architecture
+    # is league-agnostic; this numeric sigma can later be re-fit on WNBA history.
+    # E[exp(sigma*z - sigma^2/2)] = 1, so the FTA center is preserved.
+    fta_sigma = float(np.clip(fta_log_sigma, 0.0, 0.60))
     fta_rate = np.clip(
-        profile["fta_pp"] * ctx.fta * np.exp(0.12 * z_foul - 0.5 * 0.12**2),
+        profile["fta_pp"] * ctx.fta
+        * np.exp(fta_sigma * z_foul - 0.5 * fta_sigma**2),
         0.05, 0.55,
     )
     fta = rng.poisson(np.clip(poss * fta_rate, 0.001, None))
@@ -762,29 +779,91 @@ def _simulate_offense(
         poss.astype(float) - tov.astype(float) - 0.44 * fta.astype(float),
         0.25,
     )
-    miss_rate = np.clip(p3_share * (1.0 - p3) + (1.0 - p3_share) * (1.0 - p2), 0.20, 0.80)
-    recycle_prob = np.clip(miss_rate * oreb_share, 0.01, 0.32)
-    recycle_factor = 1.0 / np.maximum(1.0 - recycle_prob, 0.68)
 
-    # Residual FGA context only: FGA is now primarily an identity consequence of
+    # Residual FGA context only: FGA is primarily an identity consequence of
     # pace/TOV/FTA/OREB, not an independent full-strength opportunity multiplier.
     fga_residual = float(np.clip(ctx.fga, 0.90, 1.10)) ** 0.35
-    fga_mean = np.clip(initial_shot_endings * recycle_factor * fga_residual, 0.001, None)
-    fga = rng.poisson(fga_mean)
 
-    a3 = rng.binomial(fga, p3_share)
-    a2 = fga - a3
+    if str(fga_process).lower() == "rebound_chain":
+        # C4 structural variance experiment.
+        #
+        # A possession first creates an initial shot-ending opportunity. A miss
+        # that is offensively rebounded creates exactly one continuation shot
+        # opportunity, which can itself miss and be rebounded again. This is the
+        # direct basketball event-chain interpretation of
+        #
+        #   POSS ~= FGA - OREB + TOV + 0.44*FTA.
+        #
+        # Randomized rounding preserves the expected number of initial shot
+        # endings without adding a full independent Poisson(FGA_mean) redraw.
+        initial_float = np.clip(initial_shot_endings * fga_residual, 0.0, None)
+        initial_floor = np.floor(initial_float).astype(int)
+        initial_frac = np.clip(initial_float - initial_floor, 0.0, 1.0)
+        wave = initial_floor + rng.binomial(1, initial_frac)
 
-    m3 = rng.binomial(a3, p3)
-    m2 = rng.binomial(a2, p2)
-    ftm = rng.binomial(fta, pft)
+        a3 = np.zeros_like(wave, dtype=int)
+        a2 = np.zeros_like(wave, dtype=int)
+        m3 = np.zeros_like(wave, dtype=int)
+        m2 = np.zeros_like(wave, dtype=int)
+        misses3 = np.zeros_like(wave, dtype=int)
+        misses2 = np.zeros_like(wave, dtype=int)
+        oreb = np.zeros_like(wave, dtype=int)
+
+        # With the model's hard OREB/miss cap the continuation probability is
+        # well below one; 20 waves makes truncation probability negligible.
+        for _ in range(20):
+            if not np.any(wave > 0):
+                break
+            w3 = rng.binomial(wave, p3_share)
+            w2 = wave - w3
+            wm3 = rng.binomial(w3, p3)
+            wm2 = rng.binomial(w2, p2)
+            wmiss3 = np.maximum(w3 - wm3, 0)
+            wmiss2 = np.maximum(w2 - wm2, 0)
+            wmiss = wmiss3 + wmiss2
+            woreb = rng.binomial(wmiss, oreb_share)
+
+            a3 += w3
+            a2 += w2
+            m3 += wm3
+            m2 += wm2
+            misses3 += wmiss3
+            misses2 += wmiss2
+            oreb += woreb
+            wave = woreb
+
+        fga = a3 + a2
+        misses = misses3 + misses2
+    else:
+        # Frozen v2.18.2 baseline: expected recycle factor plus a full
+        # Poisson redraw of FGA. Kept unchanged for A/B comparison.
+        miss_rate = np.clip(
+            p3_share * (1.0 - p3) + (1.0 - p3_share) * (1.0 - p2),
+            0.20, 0.80,
+        )
+        recycle_prob = np.clip(miss_rate * oreb_share, 0.01, 0.32)
+        recycle_factor = 1.0 / np.maximum(1.0 - recycle_prob, 0.68)
+        fga_mean = np.clip(
+            initial_shot_endings * recycle_factor * fga_residual,
+            0.001, None,
+        )
+        fga = rng.poisson(fga_mean)
+        a3 = rng.binomial(fga, p3_share)
+        a2 = fga - a3
+        m3 = rng.binomial(a3, p3)
+        m2 = rng.binomial(a2, p2)
+        # Preserve the frozen baseline RNG order exactly: FTM was sampled
+        # before OREB in v2.18.2. This matters for paired A/B reproducibility.
+        ftm = rng.binomial(fta, pft)
+        misses3 = np.maximum(a3 - m3, 0)
+        misses2 = np.maximum(a2 - m2, 0)
+        misses = misses3 + misses2
+        oreb = rng.binomial(misses, oreb_share)
+
+    if str(fga_process).lower() == "rebound_chain":
+        ftm = rng.binomial(fta, pft)
     fgm = m3 + m2
     pts = 3 * m3 + 2 * m2 + ftm
-
-    misses3 = np.maximum(a3 - m3, 0)
-    misses2 = np.maximum(a2 - m2, 0)
-    misses = misses3 + misses2
-    oreb = rng.binomial(misses, oreb_share)
 
     assist_per_make = float(np.clip(profile.get("assist_per_make", 0.62), 0.25, 0.92))
     ast_prob = np.clip(assist_per_make * ctx.ast * (1.0 + 0.07 * z_shoot), 0.20, 0.95)
@@ -823,6 +902,9 @@ def simulate_game(
     n: int = 50_000,
     seed: int = 3,
     opportunity_mult: float = 1.0,
+    *,
+    fga_process: str = "rebound_chain",
+    fta_log_sigma: float = 0.20568078391234368,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Coupled two-team game simulation.
@@ -865,11 +947,13 @@ def simulate_game(
         home_profile, home_ctx, poss, rng,
         blend(z_game_style), blend(z_game_shoot, 0.45), blend(z_game_foul),
         blend(z_game_tov, 0.55), blend(z_game_reb, 0.55),
+        fga_process=fga_process, fta_log_sigma=fta_log_sigma,
     )
     a = _simulate_offense(
         away_profile, away_ctx, poss, rng,
         blend(z_game_style), blend(z_game_shoot, 0.45), blend(z_game_foul),
         blend(z_game_tov, 0.55), blend(z_game_reb, 0.55),
+        fga_process=fga_process, fta_log_sigma=fta_log_sigma,
     )
 
     # Defensive rebound conversion from the OPPONENT'S remaining missed shots.
